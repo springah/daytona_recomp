@@ -409,9 +409,8 @@ protected:
         daytona_debug::SetStage(daytona_debug::AppStage::kPreSetup);
         REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
 
-        REXCVAR_SET(vulkan_readback_memexport, true);
-        REXCVAR_SET(vulkan_readback_resolve, true);
-        REXCVAR_SET(vulkan_force_dxt45_rgba8_decode, true);
+        REXCVAR_SET(d3d12_readback_memexport, true);
+        REXCVAR_SET(d3d12_readback_resolve, true);
     }
 
     void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {

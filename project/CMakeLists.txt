@@ -31,7 +31,7 @@ if(NOT EXISTS "${_SOURCES_CMAKE}")
 endif()
 include("${_SOURCES_CMAKE}")
 
-add_executable(daytona
+add_executable(daytona WIN32
     src/main.cpp
     src/stubs.cpp
     src/keyboard_driver.cpp
@@ -80,7 +80,7 @@ target_compile_options(daytona PRIVATE
 # Force all kernel symbols into the executable (needed for hook registration)
 if(WIN32)
     target_link_options(daytona PRIVATE
-        "LINKER:/WHOLEARCHIVE:$<TARGET_FILE:rex::kernel>"
+        "LINKER:/WHOLEARCHIVE:$<TARGET_LINKER_FILE:rex::kernel>"
     )
 else()
     target_link_options(daytona PRIVATE
