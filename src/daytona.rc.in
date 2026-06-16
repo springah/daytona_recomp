@@ -1,0 +1,26 @@
+// Windows resource script for daytona.exe — embeds the file/product version.
+// Generated from this template by CMake (configure_file) with the project
+// version substituted. (No application icon is bundled yet; add a `1 ICON`
+// line here once a .ico exists.)
+
+1 VERSIONINFO
+FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Daytona USA (Xbox 360 XBLA PC recompilation)"
+      VALUE "FileVersion", "@PROJECT_VERSION@"
+      VALUE "ProductName", "Daytona USA"
+      VALUE "ProductVersion", "@PROJECT_VERSION@"
+      VALUE "OriginalFilename", "daytona.exe"
+      VALUE "InternalName", "daytona"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
