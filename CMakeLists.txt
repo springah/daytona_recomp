@@ -5,7 +5,7 @@
 # to (re)generate it together with the recompiled sources under generated/.
 
 cmake_minimum_required(VERSION 3.25)
-project(daytona VERSION 1.0.0 LANGUAGES C CXX)
+project(daytona VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,7 +23,14 @@ set(DAYTONA_SOURCES
 )
 
 if(WIN32)
-    add_executable(daytona WIN32 ${DAYTONA_SOURCES})
+    # Embed a VERSIONINFO resource so the version shows in the exe's properties.
+    # The .rc is generated with the project version substituted.
+    enable_language(RC)
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/daytona.rc.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/daytona.rc"
+        @ONLY)
+    add_executable(daytona WIN32 ${DAYTONA_SOURCES} "${CMAKE_CURRENT_BINARY_DIR}/daytona.rc")
 else()
     add_executable(daytona ${DAYTONA_SOURCES})
 endif()
@@ -32,6 +39,10 @@ endif()
 # main, and applies platform settings (see generated/rexglue.cmake ->
 # rexglue_configure_target).
 rexglue_setup_target(daytona)
+
+# Version for the window title (see main.cpp OnPreLaunchModule). Passed unquoted
+# and stringized in-source so it survives both the clang-cl and clang++ drivers.
+target_compile_definitions(daytona PRIVATE DAYTONA_VERSION=${PROJECT_VERSION})
 
 # ppc_config.h / ppc_detail.h are daytona's local PPC context detail headers,
 # pulled in when PPC_INCLUDE_DETAIL is set.

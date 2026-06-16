@@ -430,6 +430,15 @@ protected:
 
     void OnPreLaunchModule() override {
         daytona_debug::SetStage(daytona_debug::AppStage::kPreLaunchModule);
+        // Replace the SDK's default window title with the port's own version
+        // (runs after the SDK set its default, before guest code starts).
+        if (auto* wnd = window()) {
+#define DAYTONA_STR2(x) #x
+#define DAYTONA_STR(x) DAYTONA_STR2(x)
+            wnd->SetTitle("Daytona USA v" DAYTONA_STR(DAYTONA_VERSION));
+#undef DAYTONA_STR
+#undef DAYTONA_STR2
+        }
     }
 
     void OnPostLaunchModule(rex::system::XThread* thread) override {
