@@ -18,7 +18,7 @@
                 "CMAKE_CXX_FLAGS": "-march=x86-64-v3",
                 "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
                 "CMAKE_DEFAULT_BUILD_TYPE": "Release",
-                "REXSDK_DIR": "${sourceDir}/thirdparty/rexglue-sdk"
+                "REXSDK_DIR": "${sourceDir}/../rexglue-sdk"
             },
             "condition": {
                 "type": "equals",
@@ -39,7 +39,7 @@
                 "CMAKE_CXX_FLAGS": "-march=x86-64-v3",
                 "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
                 "CMAKE_DEFAULT_BUILD_TYPE": "Release",
-                "REXSDK_DIR": "${sourceDir}/thirdparty/rexglue-sdk"
+                "REXSDK_DIR": "${sourceDir}/../rexglue-sdk"
             },
             "condition": {
                 "type": "equals",

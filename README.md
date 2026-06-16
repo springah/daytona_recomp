@@ -19,7 +19,7 @@ sibling ports (futari, gh, guwange, sdoj, sotn).
 | CMake | 3.25+ | |
 | Ninja | any | `winget install Ninja-build.Ninja` |
 | LLVM / clang | 20+ (validated on 22) | Standalone [LLVM](https://github.com/llvm/llvm-project/releases); daytona builds with the **clang++** (GNU) driver targeting the MSVC ABI |
-| Git + Bash | any | Submodules; `scripts/regen.sh` is a bash script |
+| Git + Bash | any | `scripts/regen.sh` is a bash script |
 
 **Windows:** the clang++ build targets `x86_64-pc-windows-msvc`, so it needs the
 MSVC headers/libs + Windows SDK on `INCLUDE`/`LIB` (a "x64 Native Tools" command
@@ -48,33 +48,31 @@ The package this tree was prepared against: title/media `XA-2845`, media ID
 
 ## Build
 
-### 1. Clone with submodules
+### 1. Clone alongside the shared SDK
 
 ```sh
-git clone --recurse-submodules <repo-url> daytona_recomp
+git clone <repo-url> daytona_recomp
 ```
 
-The `thirdparty/rexglue-sdk` submodule is the shared ReXGlue fork, pinned to
-branch `main` (the same SDK the sibling recomps use). If a clean
-`git submodule update --init --recursive` cannot find the pinned commit, fetch
-the branch from `https://github.com/springah/rexglue-sdk.git`.
+ReXGlue is **not** vendored as a submodule. It lives in the standalone
+[`springah/rexglue-sdk`](https://github.com/springah/rexglue-sdk) fork — the same
+SDK the sibling recomps share — cloned as a sibling directory next to this repo
+and referenced via `REXSDK_DIR` (the preset bakes `../rexglue-sdk`):
 
-> **Windows symlink gotcha:** the SDK's `libmspack` submodule mirrors its sources
-> with git symlinks under `thirdparty/libmspack/cabextract/mspack/`. With
-> `core.symlinks=false` (the Windows default) git checks them out as plain text
-> containing the link target, which breaks the build (`error: expected
-> identifier`). Each must be a one-line `#include "<target>"` wrapper. Enable
-> `git config core.symlinks true` before checkout, or replace each file's
-> contents with `#include "<the path it points to>"`.
+```sh
+# from the parent directory that holds daytona_recomp/
+git clone https://github.com/springah/rexglue-sdk.git rexglue-sdk
+```
+
+(The SDK has its own build prerequisites — see its README, including the Windows
+`libmspack` symlink note.)
 
 ### 2. Build the ReXGlue CLI (for codegen)
 
 ```sh
-cmake -S thirdparty/rexglue-sdk -B thirdparty/rexglue-sdk/build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-cmake --build thirdparty/rexglue-sdk/build --target rexglue
-# -> thirdparty/rexglue-sdk/out/win-amd64/rexglue.exe
+cmake --preset win-amd64 -S ../rexglue-sdk -B ../rexglue-sdk/out/build/win-amd64
+cmake --build ../rexglue-sdk/out/build/win-amd64 --config Release --target rexglue
+# -> ../rexglue-sdk/out/win-amd64/Release/rexglue.exe (regen.sh finds it automatically)
 ```
 
 ### 3. Regenerate the recompiled code
@@ -96,9 +94,10 @@ cmake --preset win-amd64      # or linux-amd64
 cmake --build out/build/win-amd64 --config Release --target daytona
 ```
 
-The preset bakes `REXSDK_DIR=thirdparty/rexglue-sdk`, so the SDK is built from
-source as part of the daytona build. Runtime DLLs (`rexruntime.dll`,
-`TracyClient.dll`) are staged next to `daytona.exe` automatically.
+The preset bakes `REXSDK_DIR=../rexglue-sdk`, so the SDK is built from the
+standalone sibling source tree as part of the daytona build. Runtime DLLs
+(`rexruntime.dll`, `TracyClient.dll`) are staged next to `daytona.exe`
+automatically.
 
 ## Run
 
