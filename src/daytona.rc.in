@@ -1,7 +1,8 @@
-// Windows resource script for daytona.exe — embeds the file/product version.
-// Generated from this template by CMake (configure_file) with the project
-// version substituted. (No application icon is bundled yet; add a `1 ICON`
-// line here once a .ico exists.)
+// Windows resource script for daytona.exe — embeds the application icon and
+// the file/product version. Generated from this template by CMake
+// (configure_file) with the absolute icon path and project version substituted.
+// Resource ID 1 = the icon Windows Explorer / taskbar use for the exe.
+1 ICON "@DAYTONA_ICON_ABS@"
 
 1 VERSIONINFO
 FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0

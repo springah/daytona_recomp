@@ -402,6 +402,14 @@ protected:
         paths.config_path = exe_dir / "daytona.toml";
         paths.cache_root = exe_dir / "cache";
         ini_settings_ = LoadDaytonaIni(exe_dir, paths);
+        // Default the game data root to an "assets" folder next to the
+        // executable when no --game_data_root was provided, so the game runs on
+        // a plain double-click (no launcher .bat needed), matching the sibling
+        // recomps (futari/gh/guwange/sotn). An explicit --game_data_root (cvar
+        // non-empty) still takes precedence.
+        if (paths.game_data_root.empty()) {
+            paths.game_data_root = exe_dir / "assets";
+        }
     }
 
     void OnPreSetup(rex::RuntimeConfig& config) override {
