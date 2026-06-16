@@ -23,7 +23,7 @@ sibling ports (futari, gh, guwange, sdoj, sotn).
 
 **Windows:** the clang++ build targets `x86_64-pc-windows-msvc`, so it needs the
 MSVC headers/libs + Windows SDK on `INCLUDE`/`LIB` (a "x64 Native Tools" command
-prompt sets these, or set them manually as in `update-and-rebuild.bat`).
+prompt sets these, or set them manually).
 
 **Linux:** Clang 20+, GTK3 dev headers (`libgtk-3-dev` / `gtk3`), and X11/XCB
 interop (`libx11-xcb-dev` / `libx11` / `libX11-devel`). The SDK renders via XCB;
@@ -100,11 +100,17 @@ The preset bakes `REXSDK_DIR=thirdparty/rexglue-sdk`, so the SDK is built from
 source as part of the daytona build. Runtime DLLs (`rexruntime.dll`,
 `TracyClient.dll`) are staged next to `daytona.exe` automatically.
 
-On Windows, `update-and-rebuild.bat` wraps steps 1–4 plus packaging.
-
 ## Run
 
-Provide the extracted game directory via `--game_data_root`:
+A packaged build launches on a plain double-click: `daytona.exe` defaults its
+game data root to an `assets/` folder next to the executable, matching the
+sibling recomps. No launcher `.bat` or command-line flag is needed. To assemble
+one, put `daytona.exe` + `rexruntime.dll` + `TracyClient.dll` (+ optional
+`daytona.ini`) next to a copy of the extracted game data renamed to `assets/`.
+
+To run the raw build-output exe (which has no `assets/` beside it), point it at
+the extracted game directory with `--game_data_root`, which always overrides the
+default:
 
 ```bat
 out\build\win-amd64\Release\daytona.exe --game_data_root=extracted
@@ -116,8 +122,8 @@ LD_LIBRARY_PATH="$PWD/thirdparty/rexglue-sdk/out/linux-amd64/Release" \
   out/build/linux-amd64/Release/daytona --game_data_root="$PWD/extracted"
 ```
 
-If `--game_data_root` is omitted, startup exits with
-`[ERROR] --game_data_root was not provided.`
+If neither an `assets/` folder beside the exe nor `--game_data_root` is present,
+startup exits with `[ERROR] --game_data_root was not provided.`
 
 During a healthy run the log prints repeated
 `NtQueryInformationFile(XFileXctdCompressionInformation) unimplemented` messages

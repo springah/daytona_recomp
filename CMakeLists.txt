@@ -5,7 +5,7 @@
 # to (re)generate it together with the recompiled sources under generated/.
 
 cmake_minimum_required(VERSION 3.25)
-project(daytona VERSION 0.1.0 LANGUAGES C CXX)
+project(daytona VERSION 0.1.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,15 +22,21 @@ set(DAYTONA_SOURCES
     src/daytona_debug.cpp
 )
 
-if(WIN32)
-    # Embed a VERSIONINFO resource so the version shows in the exe's properties.
-    # The .rc is generated with the project version substituted.
+# Embed the application icon + VERSIONINFO resource (visible in Explorer /
+# taskbar) via a Windows resource script generated with the absolute .ico path
+# and project version substituted, so the RC compiler resolves the icon
+# regardless of CWD. Guarded on EXISTS so the build still works if the icon is
+# ever removed.
+set(DAYTONA_ICON_ABS "${CMAKE_CURRENT_SOURCE_DIR}/src/daytona.ico")
+if(WIN32 AND EXISTS "${DAYTONA_ICON_ABS}")
     enable_language(RC)
     configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/daytona.rc.in"
         "${CMAKE_CURRENT_BINARY_DIR}/daytona.rc"
         @ONLY)
     add_executable(daytona WIN32 ${DAYTONA_SOURCES} "${CMAKE_CURRENT_BINARY_DIR}/daytona.rc")
+elseif(WIN32)
+    add_executable(daytona WIN32 ${DAYTONA_SOURCES})
 else()
     add_executable(daytona ${DAYTONA_SOURCES})
 endif()
