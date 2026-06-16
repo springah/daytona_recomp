@@ -21,6 +21,9 @@ set PATH=%LLVM%;%CMAKE_DIR%;%NINJA_DIR%;%PATH%
 set LIB=%MSVC_BASE%\%MSVC_VER%\lib\x64;%SDK_BASE%\Lib\%SDK_VER%\um\x64;%SDK_BASE%\Lib\%SDK_VER%\ucrt\x64
 set INCLUDE=%MSVC_BASE%\%MSVC_VER%\include;%SDK_BASE%\Include\%SDK_VER%\um;%SDK_BASE%\Include\%SDK_VER%\ucrt;%SDK_BASE%\Include\%SDK_VER%\shared;%SDK_BASE%\Include\%SDK_VER%\winrt
 
+set BUILDDIR=out\build\win-amd64
+set BUILDOUT=%BUILDDIR%\Release
+
 cd /d "%ROOT%"
 
 :: ── git pull ──────────────────────────────────────────────────────────────────
@@ -34,27 +37,22 @@ git stash list | findstr /c:"__autoupd" >nul && (
 )
 
 echo [2/6] Updating submodules...
-git -C thirdparty\rexglue-sdk diff --quiet 2>nul
-if errorlevel 1 (
-    echo WARNING: thirdparty\rexglue-sdk has uncommitted changes that submodule update may discard.
-    echo   Commit or stash your SDK edits first, or close this window to abort.
-    pause
-)
 git submodule update --init --recursive
 if errorlevel 1 ( echo ERROR: submodule update failed & pause & exit /b 1 )
 
-:: ── cmake configure ───────────────────────────────────────────────────────────
+:: ── cmake configure (root layout; preset bakes REXSDK_DIR) ─────────────────────
 echo [3/6] Configuring...
-cmake --preset win-amd64 -S project
+cmake --preset win-amd64
 if errorlevel 1 ( echo ERROR: cmake configure failed & pause & exit /b 1 )
 
 :: ── codegen (only if game package present) ────────────────────────────────────
+:: The daytona_codegen target runs `rexglue codegen daytona_manifest.toml` using
+:: the SDK CLI built from the submodule; CMake auto-reconfigures to pick up the
+:: regenerated generated/default/sources.cmake before the daytona build below.
 if not exist "assets\default.xex" goto :skip_codegen
 echo [4/6] Running codegen...
-cmake --build project\out\build\win-amd64 --config Release --target daytona_codegen
-echo Applying codegen patch...
-"C:\Program Files\Git\usr\bin\patch.exe" -p0 --forward -i patches\daytona_working_codegen.patch
-if errorlevel 1 echo WARNING: codegen patch did not apply cleanly - check for .rej files
+cmake --build %BUILDDIR% --config Release --target daytona_codegen
+if errorlevel 1 ( echo ERROR: codegen failed & pause & exit /b 1 )
 goto :after_codegen
 :skip_codegen
 echo [4/6] Skipping codegen (no assets\default.xex found)
@@ -62,13 +60,12 @@ echo [4/6] Skipping codegen (no assets\default.xex found)
 
 :: ── build ─────────────────────────────────────────────────────────────────────
 echo [5/6] Building...
-cmake --build project\out\build\win-amd64 --config Release
+cmake --build %BUILDDIR% --config Release --target daytona
 if errorlevel 1 ( echo ERROR: build failed & pause & exit /b 1 )
 
 :: ── package ready-to-play release to Desktop ──────────────────────────────────
 echo [6/6] Packaging ready-to-play release to Desktop...
 set RELDIR=%USERPROFILE%\Desktop\Daytona-USA-PC
-set BUILDOUT=project\out\build\win-amd64\Release
 if not exist "%BUILDOUT%\daytona.exe" ( echo ERROR: built exe not found, skipping packaging & pause & exit /b 1 )
 if exist "%RELDIR%" rmdir /s /q "%RELDIR%"
 mkdir "%RELDIR%"
