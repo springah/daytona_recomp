@@ -9,7 +9,7 @@ directory, `default.xex`, media archives, audio, images, and build outputs — y
 supply your own legally obtained Daytona USA XBLA package.
 
 This is one of a family of Xbox 360 recomps that share the same ReXGlue SDK
-fork; daytona builds on the same `futari-clang-cl-fixes` SDK branch as the
+fork; daytona builds on the same `main` SDK branch as the
 sibling ports (futari, gh, guwange, sdoj, sotn).
 
 ## Prerequisites
@@ -55,7 +55,7 @@ git clone --recurse-submodules <repo-url> daytona_recomp
 ```
 
 The `thirdparty/rexglue-sdk` submodule is the shared ReXGlue fork, pinned to
-branch `futari-clang-cl-fixes` (the same SDK the sibling recomps use). If a clean
+branch `main` (the same SDK the sibling recomps use). If a clean
 `git submodule update --init --recursive` cannot find the pinned commit, fetch
 the branch from `https://github.com/springah/rexglue-sdk.git`.
 
@@ -142,7 +142,7 @@ ppc/                    local PPC detail headers (PPC_INCLUDE_DETAIL)
 scripts/regen.sh        codegen driver
 scripts/extract_game.py STFS package extractor
 generated/              codegen output (gitignored, regenerate via regen.sh)
-thirdparty/rexglue-sdk  shared ReXGlue SDK submodule (futari-clang-cl-fixes)
+thirdparty/rexglue-sdk  shared ReXGlue SDK submodule (branch main)
 ```
 
 ## Roadmap
