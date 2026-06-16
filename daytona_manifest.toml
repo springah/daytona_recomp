@@ -1,0 +1,17 @@
+# ReXGlue manifest for daytona (Daytona USA / Sega Racing Classic XBLA).
+#
+# Single-module title: only the shell default.xex is recompiled. Function-entry
+# seeds + analysis tuning live in daytona_functions.toml (the analyzer misses
+# some indirect/computed-call targets).
+#
+# Regenerate generated/ from this manifest with scripts/regen.sh.
+
+[project]
+name = "daytona"
+sdk_version = "0.8.0"
+game_root = "assets"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated/default"
+includes = ["daytona_functions.toml"]
