@@ -274,3 +274,10 @@ data_region_threshold = 16
 0x82266798 = {}
 0x822669A0 = {}
 0x824FE810 = {}
+
+# Functions the analyzer still misses (no PDATA / static call edge -- reached via
+# computed calls). Migrated from the old daytonaxbla SDK's post-codegen patch
+# (patches/daytona_working_codegen.patch), now seeded the proper way so codegen
+# registers them directly. Verified absent from the 4e90f00 codegen output.
+0x82342258 = {}
+0x824C8D80 = {}

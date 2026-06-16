@@ -1,308 +1,142 @@
 # Daytona USA ReXGlue Recompilation
 
-This project is a static recompilation of Daytona USA (Xbox 360 / XBLA, 2011) using Rexglue.
+A static recompilation of **Daytona USA** (Xbox 360 / XBLA, 2011) for native PC
+execution, built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)
+(a Xenia-derived runtime + PPC→C++ recompiler).
 
-No copyrighted game files are included. This tree excludes the
-extracted game directory, `default.xex`, `pe_image.bin`, media archives, audio,
-images, and build outputs.
+No copyrighted game files are included. This tree excludes the extracted game
+directory, `default.xex`, media archives, audio, images, and build outputs — you
+supply your own legally obtained Daytona USA XBLA package.
 
-## Quick start
-
-Building requires completing every step below in order. Skipping any step will cause the next one to fail.
-
-1. Install [prerequisites](#prerequisites)
-2. Clone with submodules: `git clone --recurse-submodules <this repo>`
-3. Place your game package in `game/` and run `python3 scripts/extract_game.py`
-4. Configure:
-   - Linux: `cmake --preset linux-amd64 -S project`
-   - Windows: `cmake --preset win-amd64 -S project`
-5. Run codegen:
-   - Linux: `cmake --build project/out/build/linux-amd64 --config Release --target daytona_codegen`
-   - Windows: `cmake --build project/out/build/win-amd64 --config Release --target daytona_codegen`
-6. Apply the patch: `patch -p0 < patches/daytona_working_codegen.patch`
-7. Build:
-   - Linux: `cmake --build project/out/build/linux-amd64 --config Release`
-   - Windows: `cmake --build project/out/build/win-amd64 --config Release`
-8. Run:
-   - Linux: `LD_LIBRARY_PATH="$PWD/thirdparty/rexglue-sdk/out/linux-amd64/Release" project/out/build/linux-amd64/Release/daytona --game_data_root="$PWD/extracted"`
-   - Windows: `project\out\build\win-amd64\Release\daytona.exe --game_data_root=extracted`
-
-See the sections below for details on each step and Windows equivalents.
+This is one of a family of Xbox 360 recomps that share the same ReXGlue SDK
+fork; daytona builds on the same `futari-clang-cl-fixes` SDK branch as the
+sibling ports (futari, gh, guwange, sdoj, sotn).
 
 ## Prerequisites
 
-### All platforms
+| Tool | Version | Notes |
+|------|---------|-------|
+| CMake | 3.25+ | |
+| Ninja | any | `winget install Ninja-build.Ninja` |
+| LLVM / clang | 20+ (validated on 22) | Standalone [LLVM](https://github.com/llvm/llvm-project/releases); daytona builds with the **clang++** (GNU) driver targeting the MSVC ABI |
+| Git + Bash | any | Submodules; `scripts/regen.sh` is a bash script |
 
-- **CMake 3.25+**
-- **Ninja** build system
+**Windows:** the clang++ build targets `x86_64-pc-windows-msvc`, so it needs the
+MSVC headers/libs + Windows SDK on `INCLUDE`/`LIB` (a "x64 Native Tools" command
+prompt sets these, or set them manually as in `update-and-rebuild.bat`).
 
-### Windows
+**Linux:** Clang 20+, GTK3 dev headers (`libgtk-3-dev` / `gtk3`), and X11/XCB
+interop (`libx11-xcb-dev` / `libx11` / `libX11-devel`). The SDK renders via XCB;
+on Wayland, XWayland must be running.
 
-- [**Visual Studio 2022 Community**](https://visualstudio.microsoft.com/vs/community/) with the **Desktop development with C++** workload, including:
-  - **C++ Clang Compiler for Windows** (20.x or newer)
-  - **MSBuild support for LLVM (clang-cl) toolset**
+## Game files
 
-### Linux
-
-- **Clang 20+**
-- GTK3 development headers (`libgtk-3-dev` on Debian/Ubuntu, `gtk3` on Arch)
-- X11/XCB interop library (`libx11-xcb-dev` on Debian/Ubuntu, `libx11` on Arch, `libX11-devel` on Fedora)
-- XWayland or a native X11 session (the SDK renders via XCB; on Wayland, XWayland must be running)
-
-## Included
-
-```text
-config/                         ReXGlue manifest/config files
-patches/daytona_working_codegen.patch
-docs/CODEGEN_PATCHES.md         notes for the manual codegen patch
-ppc/                            PPC metadata headers
-project/                        host project sources and CMake files
-scripts/extract_game.py         local STFS package extractor
-thirdparty/rexglue-sdk           required ReXGlue SDK submodule
-```
-
-The host project sources were copied from the running `daytona_working` tree,
-including:
-
-```text
-project/src/daytona_symbols.h
-project/src/stubs.cpp
-project/src/main.cpp
-```
-
-`project/src/daytona_symbols.h` is the full symbol map from the working version.
-
-## Required local game files
-
-To regenerate codegen or run the project, provide your own legally obtained
-Daytona USA XBLA package in:
-
-```text
-game/
-```
-
-The local package currently used with this tree is:
-
-```text
-game/{game_file_with_id}
-type: Microsoft Xbox 360 LIVE/STFS package, Arcade Title
-title/media: XA-2845, media ID 3CA562D4
-size: 240058368 bytes
-sha256: db2381451a15a4e537154712213a0309e9ddc33d20bdc03421d80c9939893cef
-```
-
-Extract it from the repository root with:
+Provide your own Daytona USA XBLA STFS package in `game/`, then extract it from
+the repository root:
 
 ```sh
 python3 scripts/extract_game.py
 ```
 
-The script extracts the STFS package into:
+This unpacks the package into `extracted/` (the runtime game data, passed via
+`--game_data_root`) and copies the shell executable to `assets/default.xex` (the
+codegen input). `game/`, `extracted/`, and `assets/` are gitignored.
 
-```text
-extracted/
-```
-
-and copies the executable required by ReXGlue to:
-
-```text
-assets/default.xex
-```
-
-`config/daytona_manifest.toml` references that executable as:
-
-```text
-../assets/default.xex
-```
-
-`game/`, `extracted/`, and `assets/` are ignored by git because they contain
-copyrighted game files. A successful extraction currently produces 162 files;
-the root `default.xex` should be detected by `file` as:
-
-```text
-Microsoft Xbox 360 executable (XA-2845, media ID: 3CA562D4), all regions
-```
-
-## Required ReXGlue SDK
-
-This recompilation requires the `daytonaxbla` branch of the ReXGlue SDK — **not** the default branch. It is vendored as a git submodule at:
-
-```text
-thirdparty/rexglue-sdk
-```
-
-After cloning this repository, initialize it with:
-
-```sh
-git submodule update --init --recursive
-```
-
-If `git submodule status --recursive` prints nothing even though `.gitmodules`
-contains `thirdparty/rexglue-sdk`, the submodule was not recorded in the index.
-Re-add it — the `-b daytonaxbla` flag is required:
-
-```sh
-git submodule add -b daytonaxbla https://github.com/Subarasheese/rexglue-sdk.git thirdparty/rexglue-sdk
-git submodule update --init --recursive
-```
-
-The current submodule checkout used when this tree was prepared is:
-
-```text
-82a88a385c456ccfd82eae2b320955d0f028d92d
-```
-
-CMake may warn that no `v*` tag is reachable from the SDK checkout and fall
-back to `0.8.0.0-dev.unknown`. That warning did not block configure, codegen, or
-the Release build on this tree.
-
-## Regenerate codegen
-
-From the repository root:
-
-**Linux**
-
-```sh
-cmake --preset linux-amd64 -S project
-cmake --build project/out/build/linux-amd64 --config Release --target daytona_codegen
-```
-
-**Windows**
-
-```bat
-cmake --preset win-amd64 -S project
-cmake --build project/out/build/win-amd64 --config Release --target daytona_codegen
-```
-
-That target uses the `rex::rexglue` executable built from
-`thirdparty/rexglue-sdk`. The `generated/` and `config/generated/` directories
-are local codegen outputs and are intentionally ignored by Git.
-
-On this checkout, the `daytona_codegen` target successfully regenerated files
-and printed `Done in 4.4s.`, then `rexglue` exited with signal 11 and Ninja
-reported the target as failed. Treat the generated files as usable if the run
-reaches `Done`, then apply the working patch below.
-
-## Apply working codegen fixes
-
-The working daytona tree has manual fixes on top of regenerated
-codegen. Apply them with:
-
-```sh
-patch -p0 < patches/daytona_working_codegen.patch
-```
-
-The patch changes only generated files. Keep the generated outputs ignored and
-commit the patch, not the regenerated files. See `docs/CODEGEN_PATCHES.md` for
-the exact files and reasons.
+The package this tree was prepared against: title/media `XA-2845`, media ID
+`3CA562D4`, 240058368 bytes, sha256
+`db2381451a15a4e537154712213a0309e9ddc33d20bdc03421d80c9939893cef`.
 
 ## Build
 
-> **Prerequisites:** complete [Regenerate codegen](#regenerate-codegen) and [Apply working codegen fixes](#apply-working-codegen-fixes) first. The build requires generated headers such as `daytona_init.h` that do not exist in the repository.
-
-Configure and build from the repository root.
-
-**Linux**
+### 1. Clone with submodules
 
 ```sh
-cmake --preset linux-amd64 -S project
-cmake --build project/out/build/linux-amd64 --config Release
+git clone --recurse-submodules <repo-url> daytona_recomp
 ```
 
-**Windows**
+The `thirdparty/rexglue-sdk` submodule is the shared ReXGlue fork, pinned to
+branch `futari-clang-cl-fixes` (the same SDK the sibling recomps use). If a clean
+`git submodule update --init --recursive` cannot find the pinned commit, fetch
+the branch from `https://github.com/springah/rexglue-sdk.git`.
 
-```bat
-cmake --preset win-amd64 -S project
-cmake --build project/out/build/win-amd64 --config Release
-```
+> **Windows symlink gotcha:** the SDK's `libmspack` submodule mirrors its sources
+> with git symlinks under `thirdparty/libmspack/cabextract/mspack/`. With
+> `core.symlinks=false` (the Windows default) git checks them out as plain text
+> containing the link target, which breaks the build (`error: expected
+> identifier`). Each must be a one-line `#include "<target>"` wrapper. Enable
+> `git config core.symlinks true` before checkout, or replace each file's
+> contents with `#include "<the path it points to>"`.
 
-Alternatively on either platform, `cd project/` first and run the presets without the `-S` / path overrides:
+### 2. Build the ReXGlue CLI (for codegen)
 
 ```sh
-# Linux
-cd project
-cmake --preset linux-amd64
-cmake --build --preset linux-amd64-release
+cmake -S thirdparty/rexglue-sdk -B thirdparty/rexglue-sdk/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build thirdparty/rexglue-sdk/build --target rexglue
+# -> thirdparty/rexglue-sdk/out/win-amd64/rexglue.exe
 ```
 
-```bat
-rem Windows
-cd project
-cmake --preset win-amd64
-cmake --build --preset win-amd64-release
-```
-
-If configuration fails with a missing SDK message, run:
+### 3. Regenerate the recompiled code
 
 ```sh
-git submodule update --init --recursive
+scripts/regen.sh
 ```
 
-The Daytona target directly compiles SDK sources including `rex_app.cpp`, so it
-needs two SDK include paths in `project/CMakeLists.txt`:
+This runs `rexglue codegen daytona_manifest.toml`, emitting `generated/`
+(`rexglue.cmake` + `generated/default/` with the recompiled C++). daytona is a
+single-module title, so this is one codegen pass. Function-entry seeds the
+analyzer can't discover on its own live in `daytona_functions.toml`. `generated/`
+is gitignored.
 
-```text
-thirdparty/rexglue-sdk/thirdparty/imgui
-project/out/build/<preset>/rexglue-sdk/include   (linux-amd64 or win-amd64)
+### 4. Configure & build
+
+```sh
+cmake --preset win-amd64      # or linux-amd64
+cmake --build out/build/win-amd64 --config Release --target daytona
 ```
 
-Without them, the Release build fails with missing `imgui.h` or
-`rex/version.h`.
+The preset bakes `REXSDK_DIR=thirdparty/rexglue-sdk`, so the SDK is built from
+source as part of the daytona build. Runtime DLLs (`rexruntime.dll`,
+`TracyClient.dll`) are staged next to `daytona.exe` automatically.
+
+On Windows, `update-and-rebuild.bat` wraps steps 1–4 plus packaging.
 
 ## Run
 
-Provide the extracted game directory via `--game_data_root`.
-
-**Linux**
-
-The executable links against SDK shared libraries from the build output. Run it
-with `LD_LIBRARY_PATH`:
-
-```sh
-LD_LIBRARY_PATH="$PWD/thirdparty/rexglue-sdk/out/linux-amd64/Release" \
-  project/out/build/linux-amd64/Release/daytona \
-  --game_data_root="$PWD/extracted"
-```
-
-For a short smoke test that does not leave the process running:
-
-```sh
-mkdir -p logs
-timeout 20 env \
-  DISPLAY=:1 \
-  GDK_BACKEND=x11 \
-  LD_LIBRARY_PATH="$PWD/thirdparty/rexglue-sdk/out/linux-amd64/Release" \
-  project/out/build/linux-amd64/Release/daytona \
-  --game_data_root="$PWD/extracted" \
-  --log_file="$PWD/logs/daytona_run.log" \
-  --log_level=debug
-```
-
-If `LD_LIBRARY_PATH` is omitted, `ldd project/out/build/linux-amd64/Release/daytona`
-shows `librexruntime.so => not found` and `libTracyClient.so => not found`.
-
-**Windows**
-
-The build step automatically copies runtime DLLs next to the executable, so no
-`PATH` changes are needed. Run from the repository root:
+Provide the extracted game directory via `--game_data_root`:
 
 ```bat
-project\out\build\win-amd64\Release\daytona.exe --game_data_root=extracted
+out\build\win-amd64\Release\daytona.exe --game_data_root=extracted
 ```
 
-`logs/` and `*.log` are ignored so local runtime logs are not uploaded.
+```sh
+# Linux
+LD_LIBRARY_PATH="$PWD/thirdparty/rexglue-sdk/out/linux-amd64/Release" \
+  out/build/linux-amd64/Release/daytona --game_data_root="$PWD/extracted"
+```
 
-This has been confirmed to build and run from this checkout after extracting the
-package, regenerating code, applying `patches/daytona_working_codegen.patch`,
-and building the Release preset. During a working run, the log may still print
-repeated `NtQueryInformationFile(XFileXctdCompressionInformation) unimplemented`
-messages and occasional `Skipping Vulkan frame presentation due to async
-placeholder draw usage in this frame` warnings.
+If `--game_data_root` is omitted, startup exits with
+`[ERROR] --game_data_root was not provided.`
 
-If `--game_data_root` is omitted, startup exits immediately with:
+During a healthy run the log prints repeated
+`NtQueryInformationFile(XFileXctdCompressionInformation) unimplemented` messages
+(the game streams XCTD-compressed assets; the query is a non-fatal stub).
+`logs/` and `*.log` are gitignored.
+
+## Repository layout
 
 ```text
-[ERROR] --game_data_root was not provided.
+CMakeLists.txt          links rex::runtime via generated/rexglue.cmake
+CMakePresets.json       win-amd64 / linux-amd64 presets (REXSDK_DIR baked in)
+daytona_manifest.toml   ReXGlue codegen manifest
+daytona_functions.toml  function-entry seeds + analysis tuning
+src/                    host sources (main.cpp, stubs.cpp, keyboard_driver, debug)
+ppc/                    local PPC detail headers (PPC_INCLUDE_DETAIL)
+scripts/regen.sh        codegen driver
+scripts/extract_game.py STFS package extractor
+generated/              codegen output (gitignored, regenerate via regen.sh)
+thirdparty/rexglue-sdk  shared ReXGlue SDK submodule (futari-clang-cl-fixes)
 ```
 
 ## Roadmap
@@ -313,3 +147,9 @@ If `--game_data_root` is omitted, startup exits immediately with:
 | Keyboard control mapping | Planned |
 | Android port | Planned |
 | Native rendering (replace Xbox 360 GPU emulation with a native Vulkan/D3D12 backend) | Planned |
+
+## Acknowledgements
+
+- [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) — Xbox 360 runtime + recompiler (Xenia-derived)
+- [Xenia](https://github.com/xenia-project) — the emulator ReXGlue's runtime is rooted in
+- Original Daytona USA recompilation work by Subarasheese
