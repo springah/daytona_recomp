@@ -1,4 +1,4 @@
 [submodule "thirdparty/rexglue-sdk"]
 	path = thirdparty/rexglue-sdk
 	url = https://github.com/springah/rexglue-sdk.git
-	branch = futari-clang-cl-fixes
+	branch = main
