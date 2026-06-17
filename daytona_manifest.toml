@@ -8,7 +8,7 @@
 
 [project]
 name = "daytona"
-sdk_version = "0.8.0"
+sdk_version = "0.8.1"
 game_root = "assets"
 
 [entrypoint]

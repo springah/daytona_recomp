@@ -119,102 +119,13 @@ void ReadGuestString(uint8_t* base, uint32_t address, char* out, size_t out_size
 
 // ── Graphics / GPU trace hooks ────────────────────────────────────────────────
 DT_TRACE_HOOK(sub_822346A0, daytona_debug::HookId::kGpuInterrupt)  // GpuInterruptHandler
+// sub_82234FA8 = GPU descriptor submit. The old DESC diagnostic hook dumped
+// guest memory at the raw register values (r3,r4,r8,r9,r10); when a register
+// held a non-pointer like 0x81000000 (>=0x70000000 so it passed the weak
+// safe_load guard, but unmapped) the dump itself faulted — a PHANTOM crash that
+// looked like a descriptor bug. The game's own submit is fine; pass through.
 REX_HOOK_RAW(sub_82234FA8) {
-    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kGpuDescriptorSubmit, ctx);
-
-    // Descriptor submit is very hot. Log early calls and then sparse samples.
-    const bool log =
-        (n <= 80) ||
-        (n <= 2000 && (n % 100) == 0) ||
-        ((n % 10000) == 0);
-
-    if (log) {
-        const uint32_t r3 = ctx.r3.u32;
-        const uint32_t r4 = ctx.r4.u32;
-        const uint32_t r5 = ctx.r5.u32;
-        const uint32_t r6 = ctx.r6.u32;
-        const uint32_t r7 = ctx.r7.u32;
-        const uint32_t r8 = ctx.r8.u32;
-        const uint32_t r9 = ctx.r9.u32;
-        const uint32_t r10 = ctx.r10.u32;
-
-        auto safe_load = [base](uint32_t a) -> uint32_t {
-            if (a < 0x70000000u) return 0xDEAD0001u;
-            return REX_LOAD_U32(a);
-        };
-
-        REXLOG_INFO(
-            "Daytona DESC sub_82234FA8 enter #{} lr={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X}",
-            n,
-            static_cast<uint32_t>(ctx.lr),
-            r3, r4, r5, r6, r7, r8, r9, r10);
-
-        const uint32_t obj21812 = safe_load(r3 + 21812);
-        const uint32_t obj23640 = safe_load(r3 + 23640);
-        const uint32_t vt21812 = obj21812 >= 0x70000000u ? safe_load(obj21812 + 0) : 0;
-        const uint32_t cb24 = vt21812 >= 0x70000000u ? safe_load(vt21812 + 24) : 0;
-        const uint32_t cb28 = vt21812 >= 0x70000000u ? safe_load(vt21812 + 28) : 0;
-        REXLOG_INFO(
-            "Daytona DESC obj #{} obj21812={:08X} vt={:08X} cb24={:08X} cb28={:08X} obj23640={:08X}",
-            n, obj21812, vt21812, cb24, cb28, obj23640);
-
-        if (r4 >= 0x70000000u && r5 != 0) {
-            for (uint32_t i = 0; i < r5 && i < 4; ++i) {
-                const uint32_t d0 = safe_load(r4 + i * 8 + 0);
-                const uint32_t d1 = safe_load(r4 + i * 8 + 4);
-                const uint32_t len24 = d0 & 0x00FFFFFFu;
-                const uint32_t conv =
-                    (d1 < 0x20000000u) ? (d1 - 0x40000000u) : (d1 - 0x41000000u);
-
-                REXLOG_INFO(
-                    "Daytona DESC pair #{} i={} d0={:08X} len24={:08X} d1={:08X} conv={:08X}",
-                    n, i, d0, len24, d1, conv);
-
-                if (d1 >= 0x70000000u) {
-                    REXLOG_INFO(
-                        "Daytona DESC d1mem #{} i={} base={:08X}: +00={:08X} +04={:08X} +08={:08X} +0C={:08X}",
-                        n, i, d1,
-                        safe_load(d1 + 0), safe_load(d1 + 4), safe_load(d1 + 8), safe_load(d1 + 12));
-                }
-                if (conv >= 0x70000000u) {
-                    REXLOG_INFO(
-                        "Daytona DESC convmem #{} i={} base={:08X}: +00={:08X} +04={:08X} +08={:08X} +0C={:08X} +10={:08X} +14={:08X} +18={:08X} +1C={:08X} +20={:08X} +24={:08X} +28={:08X} +2C={:08X} +30={:08X} +34={:08X} +38={:08X} +3C={:08X}",
-                        n, i, conv,
-                        safe_load(conv + 0x00), safe_load(conv + 0x04), safe_load(conv + 0x08), safe_load(conv + 0x0C),
-                        safe_load(conv + 0x10), safe_load(conv + 0x14), safe_load(conv + 0x18), safe_load(conv + 0x1C),
-                        safe_load(conv + 0x20), safe_load(conv + 0x24), safe_load(conv + 0x28), safe_load(conv + 0x2C),
-                        safe_load(conv + 0x30), safe_load(conv + 0x34), safe_load(conv + 0x38), safe_load(conv + 0x3C));
-                }
-            }
-        }
-
-        // Dump likely pointed-to guest structs. r3/r4 are the suspicious ones from the current log.
-        for (uint32_t base_addr : {r3, r4, r8, r9, r10}) {
-            if (base_addr >= 0x70000000u) {
-                REXLOG_INFO(
-                    "Daytona DESC mem #{} base={:08X}: +00={:08X} +04={:08X} +08={:08X} +0C={:08X} +10={:08X} +14={:08X} +18={:08X} +1C={:08X}",
-                    n,
-                    base_addr,
-                    safe_load(base_addr + 0x00),
-                    safe_load(base_addr + 0x04),
-                    safe_load(base_addr + 0x08),
-                    safe_load(base_addr + 0x0C),
-                    safe_load(base_addr + 0x10),
-                    safe_load(base_addr + 0x14),
-                    safe_load(base_addr + 0x18),
-                    safe_load(base_addr + 0x1C));
-            }
-        }
-    }
-
     __imp__sub_82234FA8(ctx, base);
-
-    if (log) {
-        REXLOG_INFO(
-            "Daytona DESC sub_82234FA8 exit #{} result={:08X}",
-            n,
-            ctx.r3.u32);
-    }
 }
 DT_TRACE_HOOK(sub_824140B8, daytona_debug::HookId::kGpuCacheFlush)  // GpuCacheFlush
 DT_TRACE_HOOK(sub_82130D68, daytona_debug::HookId::kBootPresentA)   // BootPresentA
@@ -389,94 +300,6 @@ REX_HOOK_RAW(sub_82176F48) {
 }
 
 
-#define DT_LOG_AROUND_ONLY(name) \
-    REX_HOOK_RAW(name) { \
-        REXLOG_INFO("Daytona around " #name " enter lr={:08X} r3={:08X} r4={:08X} r5={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32); \
-        __imp__##name(ctx, base); \
-        REXLOG_INFO("Daytona around " #name " exit result={:08X} lr={:08X}", ctx.r3.u32, static_cast<uint32_t>(ctx.lr)); \
-    }
-
-// ── Boot sub-path probes ──────────────────────────────────────────────────────
-DT_LOG_AROUND_ONLY(sub_821303D8)   // BootSubA
-DT_LOG_AROUND_ONLY(sub_8212DC68)   // BootSubB
-DT_LOG_AROUND_ONLY(sub_82130FD0)   // BootSubC
-DT_LOG_AROUND_ONLY(sub_82131418)   // BootSubD
-DT_LOG_AROUND_ONLY(sub_821F1888)   // BootSubE
-
-
-#define DT_LOG_SHADER_CHILD(name) \
-    REX_HOOK_RAW(name) { \
-        REXLOG_INFO("Daytona shader child " #name " enter lr={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32); \
-        __imp__##name(ctx, base); \
-        REXLOG_INFO("Daytona shader child " #name " exit result={:08X} lr={:08X}", ctx.r3.u32, static_cast<uint32_t>(ctx.lr)); \
-    }
-#define DT_LOG_65E00_CHILD(name) \
-    REX_HOOK_RAW(name) { \
-        REXLOG_INFO("Daytona 65E00 child " #name " enter lr={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32); \
-        __imp__##name(ctx, base); \
-        REXLOG_INFO("Daytona 65E00 child " #name " exit result={:08X} lr={:08X}", ctx.r3.u32, static_cast<uint32_t>(ctx.lr)); \
-    }
-static void DumpGuestBacktrace(uint8_t* base, const PPCContext& ctx, const char* reason) {
-    REXLOG_ERROR("Daytona guest backtrace begin: {} current_lr={:08X} current_sp={:08X}",
-                 reason,
-                 static_cast<uint32_t>(ctx.lr),
-                 ctx.r1.u32);
-
-    uint32_t sp = ctx.r1.u32;
-    for (uint32_t depth = 0; depth < 32; ++depth) {
-        if (sp == 0 || (sp & 3) != 0) {
-            REXLOG_ERROR("  bt#{:02} stop invalid sp={:08X}", depth, sp);
-            break;
-        }
-
-        uint32_t caller_sp = REX_LOAD_U32(sp);
-        if (caller_sp == 0 || caller_sp <= sp || (caller_sp & 3) != 0) {
-            REXLOG_ERROR("  bt#{:02} stop sp={:08X} caller_sp={:08X}", depth, sp, caller_sp);
-            break;
-        }
-
-        uint32_t saved_lr = REX_LOAD_U32(caller_sp - 8);
-        REXLOG_ERROR("  bt#{:02} sp={:08X} caller_sp={:08X} saved_lr={:08X}",
-                     depth,
-                     sp,
-                     caller_sp,
-                     saved_lr);
-
-        sp = caller_sp;
-    }
-
-    REXLOG_ERROR("Daytona guest backtrace end");
-}
-
-
-REX_HOOK_RAW(sub_82266808) {
-    REXLOG_ERROR("Daytona failure sink sub_82266808 enter lr={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X}",
-                 static_cast<uint32_t>(ctx.lr),
-                 ctx.r3.u32,
-                 ctx.r4.u32,
-                 ctx.r5.u32,
-                 ctx.r6.u32,
-                 ctx.r7.u32,
-                 ctx.r8.u32,
-                 ctx.r9.u32,
-                 ctx.r10.u32);
-
-    if (ctx.r3.u32 & 0x80000000u) {
-        DumpGuestBacktrace(base, ctx, "negative HRESULT entering sub_82266808");
-    }
-
-    __imp__sub_82266808(ctx, base);
-
-    REXLOG_ERROR("Daytona failure sink sub_82266808 exit result={:08X} lr={:08X}",
-                 ctx.r3.u32,
-                 static_cast<uint32_t>(ctx.lr));
-}
-#define DT_LOG_F9288_CHILD(name) \
-    REX_HOOK_RAW(name) { \
-        REXLOG_ERROR("Daytona F9288 child " #name " enter lr={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32); \
-        __imp__##name(ctx, base); \
-        REXLOG_ERROR("Daytona F9288 child " #name " exit result={:08X} lr={:08X}", ctx.r3.u32, static_cast<uint32_t>(ctx.lr)); \
-    }
 REX_HOOK_RAW(sub_822F8D48) {
     const uint32_t obj = ctx.r3.u32;
     const uint32_t obj0 = obj ? REX_LOAD_U32(obj + 0) : 0;
@@ -497,73 +320,20 @@ REX_HOOK_RAW(sub_822F8D48) {
     __imp__sub_822F8D48(ctx, base);
 }
 
-// ---- Daytona auto-culprit tracer ----
-
-
-
-// depth=1 parent=sub_822F8D48 file=daytona/generated/daytona_recomp.15.cpp
-// depth=2 parent=sub_822F88C8 file=daytona/generated/daytona_recomp.15.cpp
-// depth=3 parent=sub_822F8910 file=daytona/generated/daytona_recomp.15.cpp
-// depth=4 parent=sub_822F894C file=daytona/generated/daytona_recomp.15.cpp
-// depth=5 parent=sub_822F8790 file=daytona/generated/daytona_recomp.3.cpp
-// depth=5 parent=sub_822F8790 file=daytona/generated/daytona_recomp.15.cpp
-// depth=3 parent=sub_822F8910 file=daytona/generated/daytona_recomp.8.cpp
-// depth=4 parent=sub_82228790 file=daytona/generated/daytona_recomp.8.cpp
-// depth=5 parent=sub_82228108 file=daytona/generated/daytona_recomp.8.cpp
-// depth=2 parent=sub_822F88C8 file=daytona/generated/daytona_recomp.14.cpp
-// depth=3 parent=sub_822F86C8 file=daytona/generated/daytona_recomp.10.cpp
-// depth=1 parent=sub_822F8D48 file=daytona/generated/daytona_recomp.9.cpp
-
-REX_HOOK_RAW(sub_8219BE00) {
-    const uint32_t lr = static_cast<uint32_t>(ctx.lr);
-    const bool interesting =
-        (lr >= 0x822F0000 && lr < 0x82300000) ||
-        (lr >= 0x82240000 && lr < 0x82270000) ||
-        (lr >= 0x82190000 && lr < 0x821B0000);
-
-    if (interesting) {
-        REXLOG_ERROR("Daytona WAITPROBE alloc sub_8219BE00 enter lr={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X}",
-                     lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32);
-    }
-
-    __imp__sub_8219BE00(ctx, base);
-
-    if (interesting) {
-        REXLOG_ERROR("Daytona WAITPROBE alloc sub_8219BE00 exit result={:08X} lr={:08X}",
-                     ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
-    }
-}
-
-REX_HOOK_RAW(sub_822122C8) {
-    __imp__sub_822122C8(ctx, base);
-}
-
+// Daytona F9288 fix: sub_822F9288 (a boot shader-build routine) only reaches its
+// build path when this memzero helper returns 0 at its two F9288 call sites
+// (lr 0x822F9304 / 0x822F9484, len 0x9C0). Force that result.
 REX_HOOK_RAW(sub_824DFC40) {
     const uint32_t lr = static_cast<uint32_t>(ctx.lr);
     const bool f9288_site =
-        (lr == 0x822F9304 || lr == 0x822F9484) &&
+        (lr == 0x822F9304u || lr == 0x822F9484u) &&
         ctx.r4.u32 == 0 &&
-        ctx.r5.u32 == 0x000009C0;
-
-    if (f9288_site) {
-        REXLOG_ERROR("Daytona F9288 memzero-return probe enter lr={:08X} dst/r3={:08X} value/r4={:08X} len/r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X}",
-                     lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32);
-    }
-
+        ctx.r5.u32 == 0x000009C0u;
     __imp__sub_824DFC40(ctx, base);
-
     if (f9288_site) {
-        const uint32_t original_result = ctx.r3.u32;
-        REXLOG_ERROR("Daytona F9288 memzero-return probe original result={:08X}; forcing 00000000 so sub_822F9288 reaches build path",
-                     original_result);
         ctx.r3.u64 = 0;
     }
 }
-
-// ── Shader build-path probes (sub_822F9288 and callees) ──────────────────────
-DT_LOG_AROUND_ONLY(sub_822F8EB8)   // ShaderBuildAlloc
-DT_LOG_AROUND_ONLY(sub_822F8F98)   // ShaderBuildFinalizer
-DT_LOG_AROUND_ONLY(sub_822F9288)   // ShaderBuildRoot
 
 // Trampoline: single `b 0x824C78D0` instruction.
 extern "C" REX_FUNC(sub_824C8D80) {
@@ -574,9 +344,6 @@ extern "C" REX_FUNC(sub_824C8D80) {
 // The recompiler skipped this valid PPC leaf routine, but guest code calls it
 // indirectly as a comparator from sub_824DEC68.
 extern "C" REX_FUNC(sub_82342258) {
-    static uint32_t calls = 0;
-    ++calls;
-
     const uint32_t left_obj = REX_LOAD_U32(ctx.r3.u32 + 0);
     const uint32_t right_obj = REX_LOAD_U32(ctx.r4.u32 + 0);
 
@@ -610,17 +377,6 @@ extern "C" REX_FUNC(sub_82342258) {
     } else {
         // Matches the small helper at 0x823422CC: descending order.
         ctx.r3.s64 = (right_max > left_max) ? 1 : -1;
-    }
-
-    if (ShouldLog(calls)) {
-        REXLOG_ERROR("Daytona manual missing leaf sub_82342258 call #{} lr={:08X} left={:08X} right={:08X} left_max={:08X} right_max={:08X} result={:08X}",
-                     calls,
-                     static_cast<uint32_t>(ctx.lr),
-                     ctx.r3.u32,
-                     ctx.r4.u32,
-                     left_max,
-                     right_max,
-                     ctx.r3.u32);
     }
 }
 
@@ -795,6 +551,9 @@ REX_HOOK_RAW(LaunchTitle) {
 
     char launch_path[256];
     ReadGuestString(base, ctx.r3.u32, launch_path, sizeof(launch_path));
+    // Daytona's boot shell relaunches via XamLoaderLaunchTitle (e.g.
+    // 'XLNI_DASH_ARCADE'). The recompiled standalone title can't relaunch, so we
+    // exit cleanly. (Ignoring it and continuing → heap corruption; see notes.)
     REXLOG_INFO("Daytona requested title launch/exit path='{}'; closing PC port", launch_path);
     std::fflush(nullptr);
     std::_Exit(0);

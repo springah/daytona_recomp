@@ -3,7 +3,6 @@
 
 #include "daytona_init.h"
 #include "daytona_debug.h"
-#include "keyboard_driver.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -148,7 +147,7 @@ void WriteDefaultIni(const std::filesystem::path& path) {
         << "[Display]\n"
         << "resolution = 1280x720\n"
         << "game_resolution = 1280x720\n"
-        << "fullscreen = true\n"
+        << "fullscreen = false\n"
         << "monitor = 0\n"
         << "vsync = true\n"
         << "refresh_rate = 60\n"
@@ -429,11 +428,13 @@ protected:
 
     void OnPostSetup() override {
         daytona_debug::SetStage(daytona_debug::AppStage::kPostSetup);
-        if (!window() || !runtime() || !runtime()->input_system()) return;
-        auto* input_sys = static_cast<rex::input::InputSystem*>(runtime()->input_system());
-        auto kbd = std::make_unique<KeyboardInputDriver>(window());
-        kbd->Setup();
-        input_sys->AddDriver(std::move(kbd));
+        // Keyboard input is handled by the SDK's built-in MnK driver: WASD = left
+        // analog stick (steering), arrows = D-pad, Space = A, Shift = B, Return =
+        // Start, etc. (all rebindable via the keybind_* cvars). We intentionally do
+        // NOT register a game-specific keyboard driver: the old one (removed:
+        // src/keyboard_driver.*) was a stale Crazy-Taxi mapping that put WASD AND
+        // arrows on the D-pad, and since the InputSystem MERGES every connected
+        // driver it double-drove the stick (MnK) and the D-pad (ours) at once.
     }
 
     void OnPreLaunchModule() override {

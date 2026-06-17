@@ -5,7 +5,7 @@
 # to (re)generate it together with the recompiled sources under generated/.
 
 cmake_minimum_required(VERSION 3.25)
-project(daytona VERSION 0.1.1 LANGUAGES C CXX)
+project(daytona VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,7 +18,6 @@ include(generated/rexglue.cmake)
 set(DAYTONA_SOURCES
     src/main.cpp
     src/stubs.cpp
-    src/keyboard_driver.cpp
     src/daytona_debug.cpp
 )
 
