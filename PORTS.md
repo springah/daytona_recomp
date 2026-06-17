@@ -9,7 +9,7 @@ ships no game content.
 |----|--------------|--------|
 | Windows (x64) | `win-amd64` | ✅ v1.0.0 |
 | Steam Deck / Linux (x64) | `linux-amd64` | ⬜ not built yet |
-| macOS (arm64) | `mac-arm64` | ⬜ not built yet |
+| macOS (arm64) | `mac-arm64` | 🛠️ build-verified v1.0.0 (`Daytona.app` via `mac-build/`, MoltenVK); runtime not yet confirmed |
 
 ## SDK
 All builds link the shared **rexglue-sdk** via the **`REXSDK_DIR`** environment
