@@ -1,2 +1,8 @@
-# Shell scripts must stay LF or bash breaks on a Windows checkout (autocrlf=true).
+# Shell scripts always use LF — they run on macOS / Linux / Steam Deck / WSL,
+# where CRLF breaks the shebang and `set -o` parsing.
 *.sh text eol=lf
+
+# Windows helpers stay CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
