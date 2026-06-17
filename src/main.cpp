@@ -416,8 +416,13 @@ protected:
         daytona_debug::SetStage(daytona_debug::AppStage::kPreSetup);
         REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
 
+#ifdef _WIN32
+        // These readback cvars are defined only in the D3D12 backend, which is
+        // Windows-only; on the Vulkan/MoltenVK build (Linux/macOS) the symbols
+        // don't exist, so guard them to keep non-D3D12 builds linking.
         REXCVAR_SET(d3d12_readback_memexport, true);
         REXCVAR_SET(d3d12_readback_resolve, true);
+#endif
     }
 
     void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
