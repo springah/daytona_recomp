@@ -8,6 +8,7 @@
 #include <rex/filesystem.h>
 #include <rex/graphics/flags.h>
 #include <rex/logging/api.h>
+#include <rex/platform.h>
 #include <rex/rex_app.h>
 #include <rex/input/input_system.h>
 #include <rex/system/xthread.h>
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -437,12 +439,22 @@ protected:
         // Daytona's 3D scenes z-fight badly on the default Vulkan render-target
         // path: the host depth buffer can't reproduce Xenos float24 depth
         // precision, so coplanar surfaces (road markings, guardrails, billboards)
-        // flicker. The pixel-shader-interlock path emulates EDRAM (including
-        // float24 depth) accurately and largely resolves it. The SDK auto-falls-
-        // back to the default path on GPUs without fragment-shader-interlock, so
-        // this is safe to set unconditionally. (Heavier than the default path,
-        // but fine for a title this old.)
+        // flicker. The pixel-shader-interlock (FSI) path emulates EDRAM (including
+        // float24 depth) accurately and largely resolves it, so force it on.
+        //
+        // ...EXCEPT on macOS/MoltenVK, where the FSI/EDRAM path renders the 3D
+        // scene dark/underlit AND adds a doubled "top-band" artifact across the
+        // top ~15% of the frame (a MoltenVK SPIRV-Cross->MSL execution bug in the
+        // EDRAM path; native Vulkan is unaffected). The default host render-target
+        // path is bright and clean there, so leave Mac on it. Set DT_FORCE_FSI=1
+        // to override and re-test FSI on Mac once that MoltenVK bug is fixed.
+#if REX_PLATFORM_MAC
+        if (std::getenv("DT_FORCE_FSI")) {
+            REXCVAR_SET(render_target_path_vulkan, "fsi");
+        }
+#else
         REXCVAR_SET(render_target_path_vulkan, "fsi");
+#endif
 #endif
     }
 
