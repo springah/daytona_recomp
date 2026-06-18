@@ -416,12 +416,33 @@ protected:
         daytona_debug::SetStage(daytona_debug::AppStage::kPreSetup);
         REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
 
-#ifdef _WIN32
-        // These readback cvars are defined only in the D3D12 backend, which is
-        // Windows-only; on the Vulkan/MoltenVK build (Linux/macOS) the symbols
-        // don't exist, so guard them to keep non-D3D12 builds linking.
+        // Daytona relies on CPU readback of render-to-texture resolves for
+        // correct rendering (missing/garbled geometry otherwise). The readback
+        // cvars are split per backend, and each backend only defines (links) its
+        // own pair, so select by the compile-time BACKEND macro (not the OS):
+        // a Windows+Vulkan build still defines _WIN32 but links no d3d12_* cvars.
+        // NB: the shared `readback_memexport` already defaults true, so the
+        // memexport set is belt-and-suspenders; `readback_resolve` defaults to
+        // "none" (disabled), so the resolve set is what actually restores parity
+        // and was the regression when the D3D12-only sets were _WIN32-guarded.
+#if REX_HAS_D3D12
         REXCVAR_SET(d3d12_readback_memexport, true);
         REXCVAR_SET(d3d12_readback_resolve, true);
+#elif REX_HAS_VULKAN
+        REXCVAR_SET(vulkan_readback_memexport, true);
+        REXCVAR_SET(vulkan_readback_resolve, true);
+#endif
+
+#if REX_HAS_VULKAN
+        // Daytona's 3D scenes z-fight badly on the default Vulkan render-target
+        // path: the host depth buffer can't reproduce Xenos float24 depth
+        // precision, so coplanar surfaces (road markings, guardrails, billboards)
+        // flicker. The pixel-shader-interlock path emulates EDRAM (including
+        // float24 depth) accurately and largely resolves it. The SDK auto-falls-
+        // back to the default path on GPUs without fragment-shader-interlock, so
+        // this is safe to set unconditionally. (Heavier than the default path,
+        // but fine for a title this old.)
+        REXCVAR_SET(render_target_path_vulkan, "fsi");
 #endif
     }
 
