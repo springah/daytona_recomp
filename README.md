@@ -1,5 +1,10 @@
 # Daytona USA ReXGlue Recompilation
 
+> ⚠️ **Disclaimer — built with heavy use of AI.** The recompilation, port code,
+> tooling, and documentation in this repo were developed largely with the assistance
+> of AI coding tools (large language models). It's a hobby project: verify things
+> yourself before relying on them, and expect rough edges. No warranty.
+
 A static recompilation of **Daytona USA** (Xbox 360 / XBLA, 2011) for native PC
 execution, built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)
 (a Xenia-derived runtime + PPC→C++ recompiler).
