@@ -147,7 +147,9 @@ void WriteDefaultIni(const std::filesystem::path& path) {
         << "# Edit this file, then restart the game.\n"
         << "\n"
         << "[Display]\n"
-        << "resolution = 1280x720\n"
+        << "# Window size as WxH (host window). game_resolution is the guest\n"
+        << "# render resolution; leave it at 1280x720 for authentic output.\n"
+        << "resolution = 1920x1080\n"
         << "game_resolution = 1280x720\n"
         << "fullscreen = false\n"
         << "monitor = 0\n"
@@ -400,7 +402,9 @@ public:
 protected:
     void OnConfigurePaths(rex::PathConfig& paths) override {
         const std::filesystem::path exe_dir = rex::filesystem::GetExecutableFolder();
-        paths.config_path = exe_dir / "daytona.toml";
+        // Leave config_path at the SDK default (<exe_dir>/daytona.ini) so the
+        // "Save to config" overlay and any auto-loaded cvars use .ini, matching
+        // the sibling recomps (futari/gh/guwange/sdoj/sotn) -- no .toml.
         paths.cache_root = exe_dir / "cache";
         ini_settings_ = LoadDaytonaIni(exe_dir, paths);
         // Default the game data root to an "assets" folder next to the
@@ -417,6 +421,14 @@ protected:
         (void)config;
         daytona_debug::SetStage(daytona_debug::AppStage::kPreSetup);
         REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
+
+        // Non-game runtime settings are baked into the binary (not exposed in
+        // the .ini, which carries only user-facing game settings): a full
+        // content license, and keyboard/mouse input on with the mouse left
+        // uncaptured.
+        SetCvarInt("license_mask", 1);
+        SetCvarBool("mnk_mode", true);
+        SetCvarBool("mnk_mouse_capture", false);
 
         // Daytona relies on CPU readback of render-to-texture resolves for
         // correct rendering (missing/garbled geometry otherwise). The readback
