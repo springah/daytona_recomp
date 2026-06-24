@@ -22,6 +22,22 @@ jobs:
           fi
           echo "clean: no game data tracked"
 
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint tracked shell scripts
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh' '*.bash' | grep -vE '^thirdparty/' || true)
+          if [ "${#scripts[@]}" -eq 0 ]; then echo "no shell scripts"; exit 0; fi
+          printf '  %s\n' "${scripts[@]}"
+          # error-severity: catches real breakage (bad heredocs, CRLF, syntax)
+          # without failing on pre-existing style nits.
+          shellcheck --severity=error "${scripts[@]}"
+
   identity:
     name: Commit identity (springah/noreply)
     runs-on: ubuntu-latest
