@@ -1,0 +1,39 @@
+name: Guards
+
+# Cheap static guards for a recomp game repo (no build needed):
+#  - block accidental commits of copyrighted game data (it must stay gitignored)
+#  - enforce springah/noreply commit identity (the repos were identity-scrubbed)
+on: [pull_request, push]
+
+jobs:
+  no-game-data:
+    name: No copyrighted game data tracked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reject tracked game assets / dumps
+        run: |
+          # Game data must live only in the gitignored assets/ + generated/ trees.
+          bad="$(git ls-files | grep -iE '(^|/)assets/|\.(xex|xexp|iso|wmv|xma|mrg|mrgc|bik)$' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::game-data-like files are tracked (must stay gitignored):"
+            echo "$bad"
+            exit 1
+          fi
+          echo "clean: no game data tracked"
+
+  identity:
+    name: Commit identity (springah/noreply)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reject non-springah author/committer on HEAD
+        run: |
+          ok="321120+springah@users.noreply.github.com"
+          fail=0
+          for role in ae ce; do
+            e="$(git log -1 --format="%${role}")"
+            if [ "$e" != "$ok" ]; then echo "::error::HEAD ${role} '$e' != $ok"; fail=1; fi
+          done
+          [ "$fail" -eq 0 ] && echo "identity OK"
+          exit $fail
