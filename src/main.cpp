@@ -439,6 +439,11 @@ protected:
         // memexport set is belt-and-suspenders; `readback_resolve` defaults to
         // "none" (disabled), so the resolve set is what actually restores parity
         // and was the regression when the D3D12-only sets were _WIN32-guarded.
+        // DIAGNOSTIC escape (Deck perf investigation 2026-06-22): DT_NO_READBACK=1
+        // skips forcing the per-frame CPU readback (expensive on the Deck APU) to
+        // measure its cost + whether daytona still renders correctly without it
+        // (post-SDK-fixes). No env => current behavior.
+        if (!std::getenv("DT_NO_READBACK")) {
 #if REX_HAS_D3D12
         REXCVAR_SET(d3d12_readback_memexport, true);
         REXCVAR_SET(d3d12_readback_resolve, true);
@@ -446,6 +451,7 @@ protected:
         REXCVAR_SET(vulkan_readback_memexport, true);
         REXCVAR_SET(vulkan_readback_resolve, true);
 #endif
+        }
 
 #if REX_HAS_VULKAN
         // Daytona's 3D scenes z-fight badly on the default Vulkan render-target
@@ -465,7 +471,13 @@ protected:
             REXCVAR_SET(render_target_path_vulkan, "fsi");
         }
 #else
-        REXCVAR_SET(render_target_path_vulkan, "fsi");
+        // DIAGNOSTIC escape (Deck perf investigation 2026-06-22): DT_RT_HOST=1 skips
+        // forcing the FSI/EDRAM path (expensive on the Deck) so it uses the cheaper
+        // host render-target path (like Mac) -- to measure perf + whether z-fighting
+        // is now tolerable/fixed. No env => current behavior (FSI forced).
+        if (!std::getenv("DT_RT_HOST")) {
+            REXCVAR_SET(render_target_path_vulkan, "fsi");
+        }
 #endif
 
         // MoltenVK computes implicit texture LOD/gradients inconsistently across a
