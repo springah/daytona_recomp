@@ -5,8 +5,8 @@
 set -euo pipefail
 
 PROJ="${PROJ:-$HOME/Desktop/projects}"
-# Multi-Config build -> Release subdir.
-BUILD="${BUILD:-$PROJ/daytona_recomp/out/build/mac-arm64/Release}"
+# Single-config Ninja preset (mac-arm64-release) -> binaries at the build-dir root.
+BUILD="${BUILD:-$PROJ/daytona_recomp/out/build/mac-arm64-release}"
 # Shared external SDK; its runtime dylibs land in $SDK/out/mac-arm64/Release/.
 SDK="${SDK:-${REXSDK_DIR:-$PROJ/rexglue-sdk}}"
 ASSETS_SRC="${ASSETS_SRC:-$PROJ/daytona_recomp/extracted}"
