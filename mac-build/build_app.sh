@@ -12,6 +12,7 @@ SDK="${SDK:-${REXSDK_DIR:-$PROJ/rexglue-sdk}}"
 ASSETS_SRC="${ASSETS_SRC:-$PROJ/daytona_recomp/extracted}"
 APP="${APP:-$PROJ/Daytona.app}"
 ICON_SRC="${ICON_SRC:-$PROJ/daytona_recomp/src/daytona.ico}"
+VER="${VER:-1.0.3}"
 C="$APP/Contents"
 
 # Copy a file from the first place it exists (build dir or SDK out dir).
@@ -69,7 +70,7 @@ fi
 rm -rf "$WORK"
 
 echo "[6/7] Info.plist"
-cat > "$C/Info.plist" <<'PLIST'
+cat > "$C/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -81,8 +82,8 @@ cat > "$C/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key>              <string>AppIcon</string>
     <key>CFBundlePackageType</key>           <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
-    <key>CFBundleShortVersionString</key>    <string>1.0.0</string>
-    <key>CFBundleVersion</key>               <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>    <string>${VER}</string>
+    <key>CFBundleVersion</key>               <string>${VER}</string>
     <key>LSMinimumSystemVersion</key>        <string>13.0</string>
     <key>NSHighResolutionCapable</key>       <true/>
     <key>LSApplicationCategoryType</key>     <string>public.app-category.games</string>
