@@ -192,7 +192,13 @@ std::atomic<bool> g_seq_printed{false};
 // renderer author how wide each case actually has to be: which samplers exist,
 // how many vertex streams, which primitive topologies are used at all. Static
 // analysis cannot answer that; only a run can.
+// r4..r7 are tracked because the interesting scalar is not always r4:
+//   DrawVertices(dev, PrimitiveType, StartVertex, VertexCount)  -> r4, r6
+//   SetStreamSource(dev, Stream, pVB, Offset, Stride, ...)      -> r4, r7 (stride
+//     is the vertex size, i.e. the layout the host renderer must reproduce)
+//   SetTexture(dev, Sampler, pTex, ...)                         -> r4
 constexpr size_t kArgSlots = 12;
+constexpr size_t kArgRegs  = 4;   // r4, r5, r6, r7
 
 struct ArgHist {
     uint32_t value[kArgSlots]{};
@@ -201,10 +207,10 @@ struct ArgHist {
     uint32_t overflow = 0;   // distinct values beyond kArgSlots
 };
 
-ArgHist g_args[kEntryCount];
+ArgHist g_args[kEntryCount][kArgRegs];
 
-void NoteArg(size_t index, uint32_t v) {
-    ArgHist& h = g_args[index];
+void NoteArg(size_t index, size_t reg, uint32_t v) {
+    ArgHist& h = g_args[index][reg];
     // Read distinct ONCE into a local and bound every access by it. Re-reading
     // h.distinct between the bounds check and the store lets two threads both
     // see kArgSlots-1, both store, and both increment -- walking distinct past
@@ -235,7 +241,10 @@ void Record(size_t index, const PPCContext& ctx) {
         s.lr = static_cast<uint32_t>(ctx.lr);
         s.captured.store(true, std::memory_order_relaxed);
     }
-    NoteArg(index, ctx.r4.u32);
+    NoteArg(index, 0, ctx.r4.u32);
+    NoteArg(index, 1, ctx.r5.u32);
+    NoteArg(index, 2, ctx.r6.u32);
+    NoteArg(index, 3, ctx.r7.u32);
 
     // Per-draw sequence capture. Sampled, not continuous: we want a handful of
     // representative draw blocks, not a 4-million-entry firehose.
@@ -339,20 +348,26 @@ void Dump(const char* reason) {
     // First-argument distributions for the entry points that fire often enough to
     // matter. Narrow distributions are the useful result: "only samplers 0 and 1"
     // or "only one primitive type" each collapse a whole branch of the renderer.
-    REXLOG_WARN("-- first-argument (r4) distributions, entries with >1000 calls --");
+    REXLOG_WARN("-- argument distributions (r4..r7), entries with >1000 calls --");
+    static const char* kRegName[kArgRegs] = {"r4", "r5", "r6", "r7"};
     for (size_t i : order) {
         const uint32_t c = g_slots[i].count.load(std::memory_order_relaxed);
         if (c < 1000) continue;
-        const ArgHist& h = g_args[i];
-        const Entry&   e = kEntries[i];
-        std::string vals;
-        for (uint32_t k = 0; k < h.distinct; ++k) {
-            if (!vals.empty()) vals += " ";
-            vals += fmt::format("{:X}({})", h.value[k], h.count[k]);
+        const Entry& e = kEntries[i];
+        REXLOG_WARN("   {:<14} {}", e.sym, e.name[0] ? e.name : "(unidentified)");
+        for (size_t r = 0; r < kArgRegs; ++r) {
+            const ArgHist& h = g_args[i][r];
+            if (h.distinct == 0) continue;
+            // A register with one value is either a genuine constant or an
+            // unused argument slot; either way it is worth seeing.
+            std::string vals;
+            for (uint32_t k = 0; k < h.distinct && k < kArgSlots; ++k) {
+                if (!vals.empty()) vals += " ";
+                vals += fmt::format("{:X}({})", h.value[k], h.count[k]);
+            }
+            REXLOG_WARN("        {} {:>2} distinct{:<6} {}",
+                        kRegName[r], h.distinct, h.overflow ? "+more" : "", vals);
         }
-        REXLOG_WARN("   {:<14} {:<44} {} distinct{}: {}",
-                    e.sym, e.name[0] ? e.name : "(unidentified)",
-                    h.distinct, h.overflow ? "+more" : "", vals);
     }
 
     // Per-draw call sequences: what state the game sets between consecutive draws.
