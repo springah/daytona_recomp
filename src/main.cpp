@@ -536,6 +536,7 @@ protected:
         // spike/d3d9-hook-trace phase 0: emit the D3D9 call profile. Dumps also
         // fire periodically, so a hard kill still leaves usable data in the log.
         dt_d3d9_trace::Dump("shutdown");
+        daytona_debug::LogCensus("shutdown");
         debug_dialog_.reset();
     }
 

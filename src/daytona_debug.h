@@ -155,4 +155,10 @@ uint32_t RecordHook(HookId id, const PPCContext& ctx);
 Snapshot GetSnapshot();
 const char* StageName(AppStage stage);
 
+// Dump every hook's count at WARN. The per-hook LogGuestCall lines are INFO and
+// the shipped daytona.ini sets log_level=warn, so without this an unattended run
+// yields no input / signin / session / storage evidence -- which is exactly what
+// is needed to tell "waiting for START" apart from "blocked at a gate".
+void LogCensus(const char* reason);
+
 }  // namespace daytona_debug

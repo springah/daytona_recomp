@@ -1,5 +1,7 @@
 #include "daytona_debug.h"
 
+#include <rex/logging.h>
+
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -228,6 +230,31 @@ const char* StageName(AppStage stage) {
             return "GuestThreadExit";
     }
     return "Unknown";
+}
+
+void LogCensus(const char* reason) {
+    // Logged at WARN on purpose. Every per-hook line in this file goes through
+    // LogGuestCall -> REXLOG_INFO, and the shipped daytona.ini sets
+    // log_level=warn, so an unattended run produces NO input, signin, session or
+    // storage evidence at all. That made the phase-0 log structurally unable to
+    // distinguish "parked on a menu waiting for START" from "stuck at a signin or
+    // storage gate and not even polling input" -- and the futari
+    // XMsgInProcessCall history says the second failure mode is real.
+    const Snapshot s = GetSnapshot();
+    REXLOG_WARN("===== DAYTONA HOOK CENSUS ({}) stage={} uptime={:.1f}s =====",
+                reason, StageName(s.stage), s.uptime_seconds);
+    size_t fired = 0;
+    for (const auto& h : s.hooks) {
+        if (h.count == 0) continue;
+        ++fired;
+        REXLOG_WARN("  {:>9}  {:<44} last={:.1f}s r3={:08X} r4={:08X}",
+                    h.count, h.name, h.last_seen_seconds, h.r3, h.r4);
+    }
+    REXLOG_WARN("  -- never fired --");
+    for (const auto& h : s.hooks) {
+        if (h.count == 0 && h.name && h.name[0]) REXLOG_WARN("     {}", h.name);
+    }
+    REXLOG_WARN("===== end census ({} of {} fired) =====", fired, s.hooks.size());
 }
 
 }  // namespace daytona_debug

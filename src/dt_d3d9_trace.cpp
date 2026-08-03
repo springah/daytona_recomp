@@ -186,6 +186,8 @@ uint32_t g_scratch_len = 0;
 bool     g_scratch_overflow = false;
 std::atomic<uint32_t> g_draws{0};
 std::atomic<bool> g_seq_printed{false};
+uint32_t g_last_draw_total = 0;   // frame-tick thread only
+uint32_t g_draw_baseline   = 0;
 
 // ---- first-argument histogram ----------------------------------------------
 // r4 is the first meaningful argument on nearly every D3D9 entry point (the
@@ -284,6 +286,30 @@ void Record(size_t index, const PPCContext& ctx) {
 
 void OnFrame() {
     const uint64_t f = g_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // "Did we leave the menu?" detector.
+    //
+    // The phase-0 trace was taken on a screen that never advanced, and that was
+    // only noticed afterwards by eyeballing the numbers. Draws-per-frame is the
+    // sharpest available proxy for a scene change (a Model 2 race scene cannot
+    // possibly draw ~19 quads/frame), so watch it live and say so loudly instead
+    // of leaving it to be inferred from a table later.
+    const uint32_t draws = g_draws.load(std::memory_order_relaxed);
+    const uint32_t per   = static_cast<uint32_t>(draws - g_last_draw_total);
+    g_last_draw_total = draws;
+    if (g_draw_baseline == 0 && f > 120 && per > 0) {
+        g_draw_baseline = per;
+        REXLOG_WARN("D3D9 TRACE: draws/frame baseline = {} at frame {}", per, f);
+    } else if (g_draw_baseline != 0 && per > 0) {
+        const uint32_t hi = g_draw_baseline * 3, lo = g_draw_baseline / 3;
+        if (per > hi || per < lo) {
+            REXLOG_WARN("D3D9 TRACE: *** SCENE CHANGE *** draws/frame {} -> {} at frame {} "
+                        "(baseline was {})", g_draw_baseline, per, f, g_draw_baseline);
+            g_draw_baseline = per;
+            Dump("scene change");
+        }
+    }
+
     if (f == 60 || (f % 600) == 0) Dump("frame tick");
 }
 

@@ -212,6 +212,12 @@ REX_HOOK_RAW(sub_82233C80) {
     // XDK 20500 d3d9.lib), so it is the frame tick. Drives the trace dump cadence
     // and doubles as the "did we render at all" control.
     dt_d3d9_trace::OnFrame();
+    // Fold the domain-hook census (input, signin, session, storage) into the
+    // same WARN cadence, so an unattended run records WHY it is parked.
+    {
+        static uint32_t frames = 0;
+        if ((++frames % 1800) == 0) daytona_debug::LogCensus("periodic");
+    }
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDeviceSwap, ctx);
 
     if (ShouldLog(n)) {
