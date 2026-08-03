@@ -167,7 +167,7 @@ void DumpVertexElements(uint32_t elements_ea, uint8_t* base) {
     }
 
 // ── Graphics / GPU trace hooks ────────────────────────────────────────────────
-DT_TRACE_HOOK(sub_822346A0, daytona_debug::HookId::kGpuInterrupt)  // GpuInterruptHandler
+DT_TRACE_HOOK(sub_822346A0, daytona_debug::HookId::kD3DInterruptCallback)  // D3D_InterruptCallback (ring.obj)
 // sub_82234FA8 = GPU descriptor submit. The old DESC diagnostic hook dumped
 // guest memory at the raw register values (r3,r4,r8,r9,r10); when a register
 // held a non-pointer like 0x81000000 (>=0x70000000 so it passed the weak
@@ -200,19 +200,19 @@ REX_HOOK_RAW(sub_82131088) {
             static_cast<uint32_t>(ctx.lr));
     }
 }
-DT_TRACE_HOOK(sub_8223CF68, daytona_debug::HookId::kRenderPresentWorker)  // RenderPresentWorker
-DT_TRACE_HOOK(sub_82233C78, daytona_debug::HookId::kFrameFenceReset)      // FrameFenceReset
+DT_TRACE_HOOK(sub_8223CF68, daytona_debug::HookId::kD3DWorkerThread)  // D3D_WorkerThread (xps.obj)
+DT_TRACE_HOOK(sub_82233C78, daytona_debug::HookId::kD3DSyncToPresentation)      // D3DDevice_SynchronizeToPresentationInterval (swap.obj)
 REX_HOOK_RAW(sub_822337C0) {
     __imp__sub_822337C0(ctx, base);
 }
-DT_TRACE_HOOK(sub_82235B20, daytona_debug::HookId::kCommandFlush)  // CommandFlush
-DT_TRACE_HOOK(sub_82235D58, daytona_debug::HookId::kCommandAlloc)  // CommandAlloc
+DT_TRACE_HOOK(sub_82235B20, daytona_debug::HookId::kD3DKickOff)  // D3D_CDevice_KickOff (ring.obj)
+DT_TRACE_HOOK(sub_82235D58, daytona_debug::HookId::kD3DBeginRingBig)  // D3D_CDevice_BeginRingBig (ring.obj)
 REX_HOOK_RAW(sub_82233C80) {
     // spike/d3d9-hook-trace phase 0: this is D3DDevice_Swap (confirmed against
     // XDK 20500 d3d9.lib), so it is the frame tick. Drives the trace dump cadence
     // and doubles as the "did we render at all" control.
     dt_d3d9_trace::OnFrame();
-    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kVdSwapCaller, ctx);
+    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDeviceSwap, ctx);
 
     if (ShouldLog(n)) {
         REXLOG_INFO(
@@ -237,14 +237,14 @@ REX_HOOK_RAW(sub_82233C80) {
     }
 }
 DT_TRACE_HOOK_AFTER(sub_822297D8, daytona_debug::HookId::kCreateDeviceLike)   // D3DDevice-like create
-DT_TRACE_HOOK_AFTER(sub_8221E940, daytona_debug::HookId::kSetRenderStateA)    // SetRenderState (A)
+DT_TRACE_HOOK_AFTER(sub_8221E940, daytona_debug::HookId::kD3DSetRSPresentInterval)    // SetRenderState (A)
 DT_TRACE_HOOK_AFTER(sub_8221E950, daytona_debug::HookId::kSetRenderStateB)    // SetRenderState (B)
-DT_TRACE_HOOK_AFTER(sub_8221E658, daytona_debug::HookId::kSetRenderStateC)    // SetRenderState (C)
+DT_TRACE_HOOK_AFTER(sub_8221E658, daytona_debug::HookId::kD3DSetRSHalfPixelOffset)    // SetRenderState (C)
 DT_TRACE_HOOK_AFTER(sub_822337E8, daytona_debug::HookId::kBackbufferSetup)    // BackbufferSetup
 DT_TRACE_HOOK_AFTER(sub_8222C4C8, daytona_debug::HookId::kSceneSetup)         // SceneSetup
-DT_TRACE_HOOK_AFTER(sub_8222EBC0, daytona_debug::HookId::kRenderTargetSetup)  // RenderTargetSetup
+DT_TRACE_HOOK_AFTER(sub_8222EBC0, daytona_debug::HookId::kD3DResolve)  // D3DDevice_Resolve
 DT_TRACE_HOOK_AFTER(sub_8212F028, daytona_debug::HookId::kBeginSceneLike)     // BeginScene
-DT_TRACE_HOOK_AFTER(sub_82223F28, daytona_debug::HookId::kClearLike)          // Clear
+DT_TRACE_HOOK_AFTER(sub_82223F28, daytona_debug::HookId::kD3DSetShaderGPRAlloc)          // Clear
 DT_TRACE_HOOK(sub_824DC8A8, daytona_debug::HookId::kMemcpyLikeDc8)            // Memcpy-like (DC8)
 DT_TRACE_HOOK(sub_824EB2B8, daytona_debug::HookId::kMemcpyLikeEb2)            // Memcpy-like (EB2)
 // ── Boot / Init sequence hooks ────────────────────────────────────────────────
@@ -258,10 +258,10 @@ DT_TRACE_HOOK_AROUND(sub_82130870,
                      daytona_debug::HookId::kBootPollEnter,
                      daytona_debug::HookId::kBootPollExit)        // BootPoll
 DT_TRACE_HOOK_AFTER(sub_8212F000, daytona_debug::HookId::kEndSceneLike)       // EndScene
-DT_TRACE_HOOK_AFTER(sub_8222AF38, daytona_debug::HookId::kBootCreateTarget)   // BootCreateTarget
-DT_TRACE_HOOK_AFTER(sub_8222AE18, daytona_debug::HookId::kBootCreateTarget2)  // BootCreateTarget2
+DT_TRACE_HOOK_AFTER(sub_8222AF38, daytona_debug::HookId::kD3DCreateSurface)   // D3DDevice_CreateSurface (texture.obj)
+DT_TRACE_HOOK_AFTER(sub_8222AE18, daytona_debug::HookId::kD3DCreateTexture)  // D3DDevice_CreateTexture (texture.obj)
 DT_TRACE_HOOK_AFTER(sub_822203B8, daytona_debug::HookId::kBootBindTarget)     // BootBindTarget
-DT_TRACE_HOOK_AFTER(sub_822200E0, daytona_debug::HookId::kBootSetTarget)      // BootSetTarget
+DT_TRACE_HOOK_AFTER(sub_822200E0, daytona_debug::HookId::kD3DSetDepthStencil)      // D3DDevice_SetDepthStencilSurface (state.obj)
 DT_TRACE_HOOK_AFTER(sub_8212E068, daytona_debug::HookId::kBootShaderPath)     // BootShaderPath
 DT_TRACE_HOOK_AFTER(sub_82220730, daytona_debug::HookId::kBootAllocA)         // BootAllocA
 DT_TRACE_HOOK_AFTER(sub_82221780, daytona_debug::HookId::kBootClearAllocA)    // BootClearAllocA
@@ -298,9 +298,9 @@ DT_TRACE_HOOK_AROUND(sub_8212C7B8,
 
 // ── UI texture hooks ──────────────────────────────────────────────────────────
 DT_TRACE_HOOK_AFTER(sub_82241750, daytona_debug::HookId::kUiTextureSizeA)         // UiTextureSizeA
-DT_TRACE_HOOK_AFTER(sub_82225658, daytona_debug::HookId::kUiTextureFinalizeA)     // UiTextureFinalizeA
+DT_TRACE_HOOK_AFTER(sub_82225658, daytona_debug::HookId::kD3DCreateVertexShader)     // D3DDevice_CreateVertexShader (shader.obj)
 DT_TRACE_HOOK_AFTER(sub_82241740, daytona_debug::HookId::kUiTextureSizeB)         // UiTextureSizeB
-DT_TRACE_HOOK_AFTER(sub_82225470, daytona_debug::HookId::kUiTextureFinalizeB)     // UiTextureFinalizeB
+DT_TRACE_HOOK_AFTER(sub_82225470, daytona_debug::HookId::kD3DCreatePixelShader)     // D3DDevice_CreatePixelShader (shader.obj)
 
 REX_HOOK_RAW(sub_8212F990) {
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kMainShaderSetup, ctx);
@@ -499,34 +499,34 @@ REX_HOOK_RAW(InputGetCapabilitiesEx) {
 }
 
 // ── Video (Vd*) domain hooks ──────────────────────────────────────────────────
-// GpuSetDisplayMode: VdGetCurrentDisplayInformation + VdSetDisplayMode + VdSetDisplayModeOverride
-REX_HOOK_RAW(GpuSetDisplayMode) {
-    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kGpuSetDisplayMode, ctx);
+// D3D_VideoModeInitialize: VdGetCurrentDisplayInformation + VdSetDisplayMode + VdSetDisplayModeOverride
+REX_HOOK_RAW(D3D_VideoModeInitialize) {
+    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DVideoModeInitialize, ctx);
     if (ShouldLog(n))
-        LogGuestCall("GpuSetDisplayMode enter", n, ctx);
+        LogGuestCall("D3D_VideoModeInitialize enter", n, ctx);
     __imp__sub_82237F18(ctx, base);
     if (ShouldLog(n))
-        REXLOG_INFO("Daytona GpuSetDisplayMode exit #{} result={:08X}", n, ctx.r3.u32);
+        REXLOG_INFO("Daytona D3D_VideoModeInitialize exit #{} result={:08X}", n, ctx.r3.u32);
 }
 
-// GpuInitEngines: VdInitializeEngines + VdSetGraphicsInterruptCallback
-REX_HOOK_RAW(GpuInitEngines) {
-    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kGpuInitEngines, ctx);
+// D3D_DriverInitialize: VdInitializeEngines + VdSetGraphicsInterruptCallback
+REX_HOOK_RAW(D3D_DriverInitialize) {
+    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDriverInitialize, ctx);
     if (ShouldLog(n))
-        LogGuestCall("GpuInitEngines enter", n, ctx);
+        LogGuestCall("D3D_DriverInitialize enter", n, ctx);
     __imp__sub_82238028(ctx, base);
     if (ShouldLog(n))
-        REXLOG_INFO("Daytona GpuInitEngines exit #{} result={:08X}", n, ctx.r3.u32);
+        REXLOG_INFO("Daytona D3D_DriverInitialize exit #{} result={:08X}", n, ctx.r3.u32);
 }
 
-// GpuInitRingBuffer: VdInitializeRingBuffer + VdEnableRingBufferRPtrWriteBack
-REX_HOOK_RAW(GpuInitRingBuffer) {
-    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kGpuInitRingBuffer, ctx);
+// D3DDevice_SetRingBufferParameters: VdInitializeRingBuffer + VdEnableRingBufferRPtrWriteBack
+REX_HOOK_RAW(D3DDevice_SetRingBufferParameters) {
+    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DSetRingBufferParams, ctx);
     if (ShouldLog(n))
-        LogGuestCall("GpuInitRingBuffer enter", n, ctx);
+        LogGuestCall("D3DDevice_SetRingBufferParameters enter", n, ctx);
     __imp__sub_82235EA0(ctx, base);
     if (ShouldLog(n))
-        REXLOG_INFO("Daytona GpuInitRingBuffer exit #{} result={:08X}", n, ctx.r3.u32);
+        REXLOG_INFO("Daytona D3DDevice_SetRingBufferParameters exit #{} result={:08X}", n, ctx.r3.u32);
 }
 
 // ── Network domain hooks ──────────────────────────────────────────────────────
@@ -648,7 +648,8 @@ REX_HOOK_RAW(FrameRender) {
         REXLOG_INFO("Daytona FrameRender exit #{} result={:08X}", n, ctx.r3.u32);
 }
 
-// SceneRender (sub_8212B3C8): dispatches to Scene3dRender; checks render-object dirty flags.
+// SceneRender (sub_8212B3C8): game code -- checks render-object dirty flags, then
+// calls into D3D9's tiling path (D3DDevice_EndTiling).
 REX_HOOK_RAW(SceneRender) {
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kSceneRender, ctx);
     const bool log = n <= 5 || (n % 1000) == 0;
@@ -657,11 +658,14 @@ REX_HOOK_RAW(SceneRender) {
     __imp__sub_8212B3C8(ctx, base);
 }
 
-// Scene3dRender (sub_8222CB88): builds the 3D draw list; calls RenderTargetSetup.
-REX_HOOK_RAW(Scene3dRender) {
-    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kScene3dRender, ctx);
+// D3DDevice_EndTiling (sub_8222CB88): D3D9 LIBRARY code, not game code -- ends a
+// predicated tiling pass and resolves each tile out of EDRAM. It was previously
+// named "Scene3dRender" and described as building the 3D draw list; that was
+// wrong. Identified against d3d9.lib from XDK 20500 (tile.obj).
+REX_HOOK_RAW(D3DDevice_EndTiling) {
+    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DEndTiling, ctx);
     const bool log = n <= 5 || (n % 1000) == 0;
     if (log)
-        LogGuestCall("Scene3dRender", n, ctx);
+        LogGuestCall("D3DDevice_EndTiling", n, ctx);
     __imp__sub_8222CB88(ctx, base);
 }

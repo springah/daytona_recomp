@@ -17,27 +17,27 @@ enum class AppStage : uint32_t {
 };
 
 enum class HookId : size_t {
-    kGpuInterrupt,
-    kGpuDescriptorSubmit,
+    kD3DInterruptCallback,
+    kD3DAddCallsToPrimary,
     kGpuCacheFlush,
     kBootPresentA,
     kBootPresentB,
-    kRenderPresentWorker,
-    kFrameFenceReset,
+    kD3DWorkerThread,
+    kD3DSyncToPresentation,
     kFrameFenceWait,
-    kCommandFlush,
-    kCommandAlloc,
-    kVdSwapCaller,
+    kD3DKickOff,
+    kD3DBeginRingBig,
+    kD3DDeviceSwap,
     kCreateDeviceLike,
-    kSetRenderStateA,
+    kD3DSetRSPresentInterval,
     kSetRenderStateB,
-    kSetRenderStateC,
+    kD3DSetRSHalfPixelOffset,
     kBootPoll,
     kBackbufferSetup,
     kSceneSetup,
-    kRenderTargetSetup,
+    kD3DResolve,
     kBeginSceneLike,
-    kClearLike,
+    kD3DSetShaderGPRAlloc,
     kMemcpyLikeDc8,
     kMemcpyLikeEb2,
     kPostStateGateEnter,
@@ -47,10 +47,10 @@ enum class HookId : size_t {
     kBootPollEnter,
     kBootPollExit,
     kEndSceneLike,
-    kBootCreateTarget,
-    kBootCreateTarget2,
+    kD3DCreateSurface,
+    kD3DCreateTexture,
     kBootBindTarget,
-    kBootSetTarget,
+    kD3DSetDepthStencil,
     kBootShaderPath,
     kBootAllocA,
     kBootClearAllocA,
@@ -72,9 +72,9 @@ enum class HookId : size_t {
     kBootUiSetupGExit,
     kUiTextureSizeA,
     kUiTextureLoad,
-    kUiTextureFinalizeA,
+    kD3DCreateVertexShader,
     kUiTextureSizeB,
-    kUiTextureFinalizeB,
+    kD3DCreatePixelShader,
     kMainShaderSetup,
 
     // Audio domain
@@ -86,9 +86,9 @@ enum class HookId : size_t {
     kInputGetCapabilitiesEx,
 
     // Video domain
-    kGpuSetDisplayMode,
-    kGpuInitEngines,
-    kGpuInitRingBuffer,
+    kD3DVideoModeInitialize,
+    kD3DDriverInitialize,
+    kD3DSetRingBufferParams,
 
     // Network domain
     kNetXNetStartup,
@@ -115,7 +115,7 @@ enum class HookId : size_t {
     // Render pipeline orchestrators
     kFrameRender,
     kSceneRender,
-    kScene3dRender,
+    kD3DEndTiling,
 
     kCount,
 };

@@ -28,43 +28,56 @@
 // XAudioGetDuckerLevel wrapper
 #define AudioGetDuckerLevel          sub_82460290
 
-// ── Graphics / Video (Vd*) ────────────────────────────────────────────────────
+// ── Xbox 360 D3D9 library internals (statically linked into the XEX) ─────────
+//
+// These are NOT game functions. They were originally named by which Vd* kernel
+// import each one calls, which is why they read like a GPU driver API -- but
+// they are the retail Xbox 360 D3D9 static library, linked into the title.
+// Identified by signature-matching the recompiled image against d3d9.lib from
+// XDK 20500, the exact build this XEX was compiled with (per its import-library
+// version xboxkrnl.exe 2.0.20500.0). See _tools/daytona_d3d9_sigscan/.
+//
+// The Vd* comments below are retained: they are accurate observations of what
+// each function calls. Only the *names* were wrong.
+//
+// The whole D3D9 region is 0x8221CDE0-0x822414B0 (~145 KB, ~720 functions).
+//
 // VdEnableDisableClockGating
-#define GpuSetClockGating            sub_8222EDA8
+#define D3D_P_EPC                    sub_8222EDA8   // query.obj; was mislabelled "GpuSetClockGating"
 // VdSwap + VdPersistDisplay + VdGetSystemCommandBuffer — main present call
-#define GpuPresent                   sub_82233C80
+#define D3DDevice_Swap               sub_82233C80   // swap.obj; was mislabelled "GpuPresent"
 // VdInitializeRingBuffer + VdEnableRingBufferRPtrWriteBack + VdSetSystemCommandBufferGpuIdentifierAddress
-#define GpuInitRingBuffer            sub_82235EA0
+#define D3DDevice_SetRingBufferParameters sub_82235EA0   // ring.obj; was mislabelled "GpuInitRingBuffer"  (propagated match -- lower confidence)
 // VdGetCurrentDisplayGamma
-#define GpuGetDisplayGamma           sub_82236418
+#define D3D_GetCurrentGammaTable     sub_82236418   // gamma.obj; was mislabelled "GpuGetDisplayGamma"
 // VdShutdownEngines
-#define GpuShutdownEngines           sub_82237930
+#define D3D_D3DTerminateNotification sub_82237930   // initialize.obj; was mislabelled "GpuShutdownEngines"
 // VdQueryVideoMode (primary)
-#define GpuQueryVideoMode            sub_82237BC0
+#define D3D_InitializePresentationParameters sub_82237BC0   // initialize.obj; was mislabelled "GpuQueryVideoMode"
 // VdGetCurrentDisplayInformation + VdSetDisplayMode + VdSetDisplayModeOverride
-#define GpuSetDisplayMode            sub_82237F18
+#define D3D_VideoModeInitialize      sub_82237F18   // initialize.obj; was mislabelled "GpuSetDisplayMode"
 // VdInitializeEngines + VdSetGraphicsInterruptCallback
-#define GpuInitEngines               sub_82238028
+#define D3D_DriverInitialize         sub_82238028   // initialize.obj; was mislabelled "GpuInitEngines"
 // VdIsHSIOTrainingSucceeded
-#define GpuIsHsioTrained             sub_82238130
+#define D3D_InitializeHardwareDevice sub_82238130   // initialize.obj; was mislabelled "GpuIsHsioTrained"
 // VdSetGraphicsInterruptCallback + VdSetSystemCommandBufferGpuIdentifierAddress + VdShutdownEngines
-#define GpuReinitOrShutdown          sub_82238468
+#define D3D_UninitializeDevice       sub_82238468   // initialize.obj; was mislabelled "GpuReinitOrShutdown"
 // VdQueryVideoMode (variant 2)
-#define GpuQueryVideoMode2           sub_8223B5E0
+#define D3D_PixCaptureVideoFrame     sub_8223B5E0   // pix.obj; was mislabelled "GpuQueryVideoMode2"
 // VdQueryVideoFlags
-#define GpuQueryVideoFlags           sub_8223D738
+#define D3D_InitializeDefaultScalerParameters sub_8223D738   // scaler.obj; was mislabelled "GpuQueryVideoFlags"
 // VdCallGraphicsNotificationRoutines
-#define GpuCallNotifications         sub_8223D8D8
+#define D3D_SendScalerNotification   sub_8223D8D8   // scaler.obj; was mislabelled "GpuCallNotifications"
 // VdQueryVideoMode (variant 3)
-#define GpuQueryVideoMode3           sub_8223ECE8
+#define D3D_InternalScalerSetup      sub_8223ECE8   // scaler.obj; was mislabelled "GpuQueryVideoMode3"  (propagated match -- lower confidence)
 // VdInitializeScalerCommandBuffer
-#define GpuInitScaler                sub_8223F278
+#define D3D_SetupScaler              sub_8223F278   // scaler.obj; was mislabelled "GpuInitScaler"
 // VdRetrainEDRAM + VdRetrainEDRAMWorker
-#define GpuRetrainEdram              sub_8223F4F0
+#define D3D_TrainEDRAM               sub_8223F4F0   // hsio.obj; was mislabelled "GpuRetrainEdram"
 // VdGetCurrentDisplayInformation (primary)
-#define GpuGetDisplayInfo            sub_82240348
+#define D3D_XBMEndCapture            sub_82240348   // movie.obj; was mislabelled "GpuGetDisplayInfo"
 // VdGetCurrentDisplayInformation (variant 2)
-#define GpuGetDisplayInfo2           sub_82240798
+#define D3D_XBMBeginCapture          sub_82240798   // movie.obj; was mislabelled "GpuGetDisplayInfo2"  (propagated match -- lower confidence)
 
 // ── Input ─────────────────────────────────────────────────────────────────────
 // XamInputGetCapabilities
@@ -628,36 +641,39 @@
 #define FrameEntry                   sub_8212BD68
 // Full frame renderer (478 lines): BeginScene→SceneRender→EndScene
 #define FrameRender                  sub_8212B828
-// Scene orchestrator: checks dirty flags, dispatches to Scene3dRender
+// Scene orchestrator: checks dirty flags, dispatches to D3DDevice_EndTiling
 #define SceneRender                  sub_8212B3C8
-// 3D scene renderer (678 lines): builds draw list, calls RenderTargetSetup
-#define Scene3dRender                sub_8222CB88
-// Render target binder before Scene3dRender: calls RenderTargetCore
-#define RenderTargetSetup            sub_8222EBC0
-// Render target EDRAM core (reads format/viewport, VMX ops)
-#define RenderTargetCore             sub_8222DA70
+// D3D9: ends a predicated tiling pass (resolves each tile out of EDRAM).
+// NOT a scene renderer -- it is library code, reached from SceneRender.
+#define D3DDevice_EndTiling          sub_8222CB88   // tile.obj; was mislabelled "Scene3dRender"
+// D3D9: resolve EDRAM to a destination surface/texture.
+#define D3DDevice_Resolve            sub_8222EBC0   // resolve.obj; was mislabelled "RenderTargetSetup"  (propagated match -- lower confidence)
+// D3D9: extended resolve -- reads format/viewport, VMX ops. 1108 insns, the
+// largest function in the D3D9 region.
+#define D3DDevice_ResolveEx          sub_8222DA70   // resolve.obj; was mislabelled "RenderTargetCore"  (propagated match -- lower confidence)
 // Per-object scene setup (camera/projection state)
 #define SetupScene                   sub_8212AF18
 // Render target attach helper (called by SceneRender on dirty flags)
 #define SetupRenderTarget            sub_8212AC20
-// Scaler render pass — calls RenderPass + GpuInitScaler
-#define ScalerPass                   sub_8223AB80
-// Full render pass (1160 lines): shader bind, draw, state flush
-#define RenderPass                   sub_82239F30
-// Present-side display update (Clear + IoWriteFile + display notify)
-#define DisplayUpdate                sub_82240B00
-// Present-side update pump: calls DisplayUpdate
-#define PresentUpdate                sub_822413C0
+// D3D9 PIX instrumentation: decode a captured video frame. NOT a scaler pass.
+#define D3D_PixDecodeVideoFrame      sub_8223AB80   // pix.obj; was mislabelled "ScalerPass"
+// D3D9 PIX/codec: show a decoded frame. NOT a render pass -- the "1160 lines,
+// shader bind/draw/state flush" reading was wrong.
+#define D3D_CodecShowFrame           sub_82239F30   // pix.obj; was mislabelled "RenderPass"
+// D3D9 XBM (Xbox movie playback): capture a frame. NOT a display update.
+#define D3D_XBMCaptureFrame          sub_82240B00   // movie.obj; was mislabelled "DisplayUpdate"
+// D3D9 XBM: process a swap for movie playback. NOT the present pump.
+#define D3D_XBMProcessSwap           sub_822413C0   // movie.obj; was mislabelled "PresentUpdate"  (propagated match -- lower confidence)
 
 // ── D3D-like device state setters (0x8221Exxx) ───────────────────────────────
 // stw r4, 13872(r3) — single-word device state store (slot A)
-#define DeviceSetStateA              sub_8221E940
+#define D3DDevice_SetRenderState_PresentInterval sub_8221E940   // state.obj; was mislabelled "DeviceSetStateA"  (propagated match -- lower confidence)
 // bitfield insert into device+12156, bits 2-8 (slot B, e.g. alpha-test ref)
 #define DeviceSetStateB              sub_8221E950
 // stw r4, device+10688; sets dirty bit 35 (slot C, e.g. backbuffer gamma)
-#define DeviceSetStateC              sub_8221E658
+#define D3DDevice_SetRenderState_HalfPixelOffset sub_8221E658   // state.obj; was mislabelled "DeviceSetStateC"  (propagated match -- lower confidence)
 // reads bit 0 of device+10688 — getter for slot C
-#define DeviceGetStateC              sub_8221E680
+#define D3DDevice_GetRenderState_HalfPixelOffset sub_8221E680   // state.obj; was mislabelled "DeviceGetStateC"  (propagated match -- lower confidence)
 
 // ── Shader source builder (0x8227xxxx) ────────────────────────────────────────
 // Append a formatted string fragment to the shader source buffer at r3+1532[+1536]

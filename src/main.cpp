@@ -379,7 +379,7 @@ private:
         rate_accumulator_ += std::max(delta_time, 0.0f);
         if (rate_accumulator_ < 0.25f) return;
 
-        const uint32_t count = snapshot.hooks[static_cast<size_t>(daytona_debug::HookId::kVdSwapCaller)].count;
+        const uint32_t count = snapshot.hooks[static_cast<size_t>(daytona_debug::HookId::kD3DDeviceSwap)].count;
         vd_swap_rate_ = static_cast<float>(count - prev_vd_swap_count_) / rate_accumulator_;
         prev_vd_swap_count_ = count;
         rate_accumulator_ = 0.0f;
