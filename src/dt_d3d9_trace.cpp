@@ -14,7 +14,7 @@ namespace dt_d3d9_trace {
 
 const Entry kEntries[kEntryCount] = {
     {0x8213DB98, "sub_8213DB98", "", 45, 3},
-    {0x82161FE0, "sub_82161FE0", "D3DCommandBuffer_CreateVertexBufferFixup", 64, 5},
+    {0x82161FE0, "sub_82161FE0", "", 64, 5},
     {0x821B7000, "sub_821B7000", "??0Disassembler@D3D@@QAA@P6AJPAXPBDK@Z0P6AJ0KI0I@Z0@Z", 21, 2},
     {0x821C29D0, "sub_821C29D0", "?DoPrint@Disassembler@D3D@@AAAXPBDPAD@Z", 63, 3},
     {0x821DC0E0, "sub_821DC0E0", "D3DDevice_QueryBufferSpace", 75, 1},
@@ -131,7 +131,7 @@ const Entry kEntries[kEntryCount] = {
     {0x823DBDF8, "sub_823DBDF8", "", 62, 2},
     {0x82441640, "sub_82441640", "", 57, 4},
     {0x8248EB18, "sub_8248EB18", "", 49, 1},
-    {0x824C8668, "sub_824C8668", "?Get@CParser@D3D@@QAAHPAKPAUParseData@2@@Z", 186, 4},
+    {0x824C8668, "sub_824C8668", "", 186, 4},
     {0x824CAFF0, "sub_824CAFF0", "", 19, 1},
     {0x824DA560, "sub_824DA560", "?ReportUnexpectedMemexport@D3D@@YAXH@Z", 2, 2},
     {0x824F2A20, "sub_824F2A20", "", 36, 1},

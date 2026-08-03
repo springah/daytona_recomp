@@ -21,7 +21,7 @@
 
 
 DT_D3D9_TRACE(sub_8213DB98, 0)  // (unidentified)
-DT_D3D9_TRACE(sub_82161FE0, 1)  // D3DCommandBuffer_CreateVertexBufferFixup
+DT_D3D9_TRACE(sub_82161FE0, 1)  // (unidentified)
 DT_D3D9_TRACE(sub_821B7000, 2)  // ??0Disassembler@D3D@@QAA@P6AJPAXPBDK@Z0P6AJ0KI0I@Z0@Z
 DT_D3D9_TRACE(sub_821C29D0, 3)  // ?DoPrint@Disassembler@D3D@@AAAXPBDPAD@Z
 DT_D3D9_TRACE(sub_821DC0E0, 4)  // D3DDevice_QueryBufferSpace
@@ -138,7 +138,7 @@ DT_D3D9_TRACE(sub_823CB3C0, 114)  // ?WriteData@CCapture@D3D@@QAAXW4RecordType@@
 DT_D3D9_TRACE(sub_823DBDF8, 115)  // (unidentified)
 DT_D3D9_TRACE(sub_82441640, 116)  // (unidentified)
 DT_D3D9_TRACE(sub_8248EB18, 117)  // (unidentified)
-DT_D3D9_TRACE(sub_824C8668, 118)  // ?Get@CParser@D3D@@QAAHPAKPAUParseData@2@@Z
+DT_D3D9_TRACE(sub_824C8668, 118)  // (unidentified)
 DT_D3D9_TRACE(sub_824CAFF0, 119)  // (unidentified)
 DT_D3D9_TRACE(sub_824DA560, 120)  // ?ReportUnexpectedMemexport@D3D@@YAXH@Z
 DT_D3D9_TRACE(sub_824F2A20, 121)  // (unidentified)
