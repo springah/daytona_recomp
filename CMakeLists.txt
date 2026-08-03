@@ -19,6 +19,9 @@ set(DAYTONA_SOURCES
     src/main.cpp
     src/stubs.cpp
     src/daytona_debug.cpp
+    # spike/d3d9-hook-trace phase 0: pass-through D3D9 call tracer (generated).
+    src/dt_d3d9_trace.cpp
+    src/dt_d3d9_hooks.cpp
 )
 
 # Embed the application icon + VERSIONINFO resource (visible in Explorer /

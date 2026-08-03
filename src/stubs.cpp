@@ -4,6 +4,7 @@
 #include "daytona_init.h"
 #include "daytona_debug.h"
 #include "daytona_symbols.h"
+#include "dt_d3d9_trace.h"
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/system/xtypes.h>
@@ -159,6 +160,10 @@ REX_HOOK_RAW(sub_822337C0) {
 DT_TRACE_HOOK(sub_82235B20, daytona_debug::HookId::kCommandFlush)  // CommandFlush
 DT_TRACE_HOOK(sub_82235D58, daytona_debug::HookId::kCommandAlloc)  // CommandAlloc
 REX_HOOK_RAW(sub_82233C80) {
+    // spike/d3d9-hook-trace phase 0: this is D3DDevice_Swap (confirmed against
+    // XDK 20500 d3d9.lib), so it is the frame tick. Drives the trace dump cadence
+    // and doubles as the "did we render at all" control.
+    dt_d3d9_trace::OnFrame();
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kVdSwapCaller, ctx);
 
     if (ShouldLog(n)) {

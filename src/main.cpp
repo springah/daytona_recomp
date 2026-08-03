@@ -3,6 +3,7 @@
 
 #include "daytona_init.h"
 #include "daytona_debug.h"
+#include "dt_d3d9_trace.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -532,6 +533,9 @@ protected:
     }
 
     void OnShutdown() override {
+        // spike/d3d9-hook-trace phase 0: emit the D3D9 call profile. Dumps also
+        // fire periodically, so a hard kill still leaves usable data in the log.
+        dt_d3d9_trace::Dump("shutdown");
         debug_dialog_.reset();
     }
 
