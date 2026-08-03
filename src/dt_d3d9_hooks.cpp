@@ -20,13 +20,13 @@
     }
 
 
-DT_D3D9_TRACE(sub_8213DB98, 0)  // __FusionFlushVertexCache
+DT_D3D9_TRACE(sub_8213DB98, 0)  // (unidentified)
 DT_D3D9_TRACE(sub_82161FE0, 1)  // D3DCommandBuffer_CreateVertexBufferFixup
 DT_D3D9_TRACE(sub_821B7000, 2)  // ??0Disassembler@D3D@@QAA@P6AJPAXPBDK@Z0P6AJ0KI0I@Z0@Z
 DT_D3D9_TRACE(sub_821C29D0, 3)  // ?DoPrint@Disassembler@D3D@@AAAXPBDPAD@Z
 DT_D3D9_TRACE(sub_821DC0E0, 4)  // D3DDevice_QueryBufferSpace
-DT_D3D9_TRACE(sub_821FDE60, 5)  // D3DDevice_BeginConditionalSurvey
-DT_D3D9_TRACE(sub_82202020, 6)  // D3DDevice_CreateOcclusionQueryBatch
+DT_D3D9_TRACE(sub_821FDE60, 5)  // (unidentified)
+DT_D3D9_TRACE(sub_82202020, 6)  // (unidentified)
 DT_D3D9_TRACE(sub_8221D0D0, 7)  // (unidentified)
 DT_D3D9_TRACE(sub_8221D100, 8)  // (unidentified)
 DT_D3D9_TRACE(sub_8221D130, 9)  // (unidentified)
@@ -129,20 +129,20 @@ DT_D3D9_TRACE(sub_8222DA70, 105)  // D3DDevice_ResolveEx
 DT_D3D9_TRACE(sub_82230DB0, 106)  // (unidentified)
 DT_D3D9_TRACE(sub_82233260, 107)  // D3DVertexShader_Bind
 DT_D3D9_TRACE(sub_822337F0, 108)  // (unidentified)
-DT_D3D9_TRACE(sub_82295A08, 109)  // D3DDevice_EndConditionalRendering
-DT_D3D9_TRACE(sub_822BD598, 110)  // ?HSIOLoadValidationShadersImmediate@D3D@@YAXPAVCDevice@1@@Z
+DT_D3D9_TRACE(sub_82295A08, 109)  // (unidentified)
+DT_D3D9_TRACE(sub_822BD598, 110)  // (unidentified)
 DT_D3D9_TRACE(sub_822FE328, 111)  // ?bfi@D3D@@YAXPAEKKJ@Z
-DT_D3D9_TRACE(sub_8232BDF0, 112)  // ?SubmitCommandBuffersEx@D3D@@YAJPAUD3DDevice@@PBKK@Z
-DT_D3D9_TRACE(sub_82345D58, 113)  // ?WhackAddresses@D3D@@YAXPAKKKK@Z
+DT_D3D9_TRACE(sub_8232BDF0, 112)  // (unidentified)
+DT_D3D9_TRACE(sub_82345D58, 113)  // (unidentified)
 DT_D3D9_TRACE(sub_823CB3C0, 114)  // ?WriteData@CCapture@D3D@@QAAXW4RecordType@@PBXKKKK@Z
-DT_D3D9_TRACE(sub_823DBDF8, 115)  // ?Write@MiniMicrocodeBuilder@D3D@@QAAJPAXKPAK@Z
-DT_D3D9_TRACE(sub_82441640, 116)  // D3DBaseTexture_LockTail
-DT_D3D9_TRACE(sub_8248EB18, 117)  // D3DDevice_XpsEnd
+DT_D3D9_TRACE(sub_823DBDF8, 115)  // (unidentified)
+DT_D3D9_TRACE(sub_82441640, 116)  // (unidentified)
+DT_D3D9_TRACE(sub_8248EB18, 117)  // (unidentified)
 DT_D3D9_TRACE(sub_824C8668, 118)  // ?Get@CParser@D3D@@QAAHPAKPAUParseData@2@@Z
-DT_D3D9_TRACE(sub_824CAFF0, 119)  // ?HSIOSetShaderConstant16@D3D@@YAXPAVCDevice@1@KPBX@Z
+DT_D3D9_TRACE(sub_824CAFF0, 119)  // (unidentified)
 DT_D3D9_TRACE(sub_824DA560, 120)  // ?ReportUnexpectedMemexport@D3D@@YAXH@Z
-DT_D3D9_TRACE(sub_824F2A20, 121)  // D3DDevice_NuiMetaData
-DT_D3D9_TRACE(sub_824F7D28, 122)  // ?PrintWarning@Disassembler@D3D@@AAAX_NHPBDZZ
+DT_D3D9_TRACE(sub_824F2A20, 121)  // (unidentified)
+DT_D3D9_TRACE(sub_824F7D28, 122)  // (unidentified)
 DT_D3D9_TRACE(sub_824F8C60, 123)  // ?DoDisassembly_InstructionCallback@Disassembler@D3D@@AAAJKKPATGPUSHADER_INSTRUCTION@@@Z
 DT_D3D9_TRACE(sub_824F9AA0, 124)  // XDisassembleMicrocodeShaderRaw
 
