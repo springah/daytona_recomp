@@ -24,7 +24,7 @@ struct Entry {
     uint16_t    game_callers;  // distinct game functions that call it (static)
 };
 
-inline constexpr size_t kEntryCount = 123;
+inline constexpr size_t kEntryCount = 125;
 extern const Entry kEntries[kEntryCount];
 
 // Recorded on every intercepted call. Cheap: one relaxed atomic increment plus

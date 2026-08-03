@@ -76,6 +76,54 @@ void ReadGuestString(uint8_t* base, uint32_t address, char* out, size_t out_size
     out[i] = 0;
 }
 
+const char* DeclUsageName(uint8_t usage) {
+    switch (usage) {
+        case 0:  return "POSITION";
+        case 1:  return "BLENDWEIGHT";
+        case 2:  return "BLENDINDICES";
+        case 3:  return "NORMAL";
+        case 4:  return "PSIZE";
+        case 5:  return "TEXCOORD";
+        case 6:  return "TANGENT";
+        case 7:  return "BINORMAL";
+        case 8:  return "TESSFACTOR";
+        case 10: return "COLOR";
+        case 11: return "FOG";
+        case 12: return "DEPTH";
+        case 13: return "SAMPLE";
+        default: return "?";
+    }
+}
+
+// Dump a guest D3DVERTEXELEMENT9[] (12 bytes/element on the 360: WORD Stream,
+// WORD Offset, DWORD Type, BYTE Method, BYTE Usage, BYTE UsageIndex, pad),
+// terminated by Stream == 0xFF.
+//
+// This is the vertex format the native renderer has to reproduce. It cannot be
+// read statically: the game builds the array on the stack at call time (see
+// sub_8212F598, which stores Stream/Offset with sth and Method/Usage/UsageIndex
+// with stb into a stack frame). Logged at WARN so it survives the shipped
+// log_level=warn.
+void DumpVertexElements(uint32_t elements_ea, uint8_t* base) {
+    static bool dumped = false;
+    if (dumped || elements_ea == 0) return;
+    dumped = true;   // Daytona creates exactly one declaration; see dt_d3d9_trace
+    REXLOG_WARN("===== D3DVERTEXELEMENT9[] @ {:08X} =====", elements_ea);
+    for (uint32_t i = 0; i < 64; ++i) {
+        const uint32_t p      = elements_ea + i * 12;
+        const uint16_t stream = REX_LOAD_U16(p);
+        if (stream == 0x00FF || stream == 0xFFFF) {
+            REXLOG_WARN("   [{:2}] END (stream=0x{:X})", i, stream);
+            break;
+        }
+        REXLOG_WARN("   [{:2}] stream={:<2} offset={:<4} type=0x{:08X} method={} usage={} ({}) index={}",
+                    i, stream, REX_LOAD_U16(p + 2), REX_LOAD_U32(p + 4),
+                    REX_LOAD_U8(p + 8), REX_LOAD_U8(p + 9),
+                    DeclUsageName(REX_LOAD_U8(p + 9)), REX_LOAD_U8(p + 10));
+    }
+    REXLOG_WARN("===== end D3DVERTEXELEMENT9[] =====");
+}
+
 }  // namespace
 
 #define DT_TRACE_HOOK(name, id)                         \
@@ -218,7 +266,21 @@ DT_TRACE_HOOK_AFTER(sub_8212E068, daytona_debug::HookId::kBootShaderPath)     //
 DT_TRACE_HOOK_AFTER(sub_82220730, daytona_debug::HookId::kBootAllocA)         // BootAllocA
 DT_TRACE_HOOK_AFTER(sub_82221780, daytona_debug::HookId::kBootClearAllocA)    // BootClearAllocA
 DT_TRACE_HOOK_AFTER(sub_822207F8, daytona_debug::HookId::kBootUnlockAllocA)   // BootUnlockAllocA
-DT_TRACE_HOOK_AFTER(sub_82223EA8, daytona_debug::HookId::kBootMakeDraw)       // BootMakeDraw
+// sub_82223EA8 = D3DDevice_CreateVertexDeclaration, identified against XDK 20500
+// d3d9.lib: its body walks a 12-byte-stride element array until Stream == 0xFF,
+// then allocates 56 + 12*count and calls XGSetVertexDeclaration (sub_82223DB8).
+// r3 on entry is the D3DVERTEXELEMENT9[]; it is clobbered by the return value,
+// so capture it before calling through. The trace shows Daytona binds only ONE
+// declaration game-wide, so this dump is the whole vertex format.
+REX_HOOK_RAW(sub_82223EA8) {
+    const uint32_t elements = ctx.r3.u32;
+    __imp__sub_82223EA8(ctx, base);
+    DumpVertexElements(elements, base);
+    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kBootMakeDraw, ctx);
+    if (ShouldLog(n)) {
+        LogGuestCall("CreateVertexDeclaration", n, ctx);
+    }
+}
 DT_TRACE_HOOK_AFTER(sub_82220808, daytona_debug::HookId::kBootAllocB)         // BootAllocB
 DT_TRACE_HOOK_AFTER(sub_822217D0, daytona_debug::HookId::kBootClearAllocB)    // BootClearAllocB
 DT_TRACE_HOOK_AFTER(sub_822208B8, daytona_debug::HookId::kBootUnlockAllocB)   // BootUnlockAllocB
