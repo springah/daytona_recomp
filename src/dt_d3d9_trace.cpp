@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <string>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include <rex/logging.h>
 
@@ -180,6 +183,45 @@ uint16_t g_scratch[kSeqCapacity];
 uint32_t g_scratch_len = 0;
 bool     g_scratch_overflow = false;
 std::atomic<uint32_t> g_draws{0};
+std::atomic<bool> g_seq_printed{false};
+
+// ---- first-argument histogram ----------------------------------------------
+// r4 is the first meaningful argument on nearly every D3D9 entry point (the
+// sampler index, stream number, primitive type, render-state value, ...), since
+// r3 is always the D3DDevice*. Knowing its DISTINCT values is what tells a
+// renderer author how wide each case actually has to be: which samplers exist,
+// how many vertex streams, which primitive topologies are used at all. Static
+// analysis cannot answer that; only a run can.
+constexpr size_t kArgSlots = 12;
+
+struct ArgHist {
+    uint32_t value[kArgSlots]{};
+    uint32_t count[kArgSlots]{};
+    uint32_t distinct = 0;
+    uint32_t overflow = 0;   // distinct values beyond kArgSlots
+};
+
+ArgHist g_args[kEntryCount];
+
+void NoteArg(size_t index, uint32_t v) {
+    ArgHist& h = g_args[index];
+    // Read distinct ONCE into a local and bound every access by it. Re-reading
+    // h.distinct between the bounds check and the store lets two threads both
+    // see kArgSlots-1, both store, and both increment -- walking distinct past
+    // the array and turning the next call into an out-of-bounds write. A lost
+    // update here is harmless; an OOB write corrupts the neighbouring histogram.
+    const uint32_t d = h.distinct < kArgSlots ? h.distinct : kArgSlots;
+    for (uint32_t i = 0; i < d; ++i) {
+        if (h.value[i] == v) { ++h.count[i]; return; }
+    }
+    if (d < kArgSlots) {
+        h.value[d] = v;
+        h.count[d] = 1;
+        h.distinct = d + 1;
+    } else {
+        ++h.overflow;
+    }
+}
 
 }  // namespace
 
@@ -193,6 +235,8 @@ void Record(size_t index, const PPCContext& ctx) {
         s.lr = static_cast<uint32_t>(ctx.lr);
         s.captured.store(true, std::memory_order_relaxed);
     }
+    NoteArg(index, ctx.r4.u32);
+
     // Per-draw sequence capture. Sampled, not continuous: we want a handful of
     // representative draw blocks, not a 4-million-entry firehose.
     if (g_block_count.load(std::memory_order_relaxed) < kSeqBlocks) {
@@ -292,8 +336,41 @@ void Dump(const char* reason) {
         REXLOG_WARN("   {:<14} {:<46} ({} static game callers)",
                     e.sym, e.name[0] ? e.name : "(unidentified)", e.game_callers);
     }
+    // First-argument distributions for the entry points that fire often enough to
+    // matter. Narrow distributions are the useful result: "only samplers 0 and 1"
+    // or "only one primitive type" each collapse a whole branch of the renderer.
+    REXLOG_WARN("-- first-argument (r4) distributions, entries with >1000 calls --");
+    for (size_t i : order) {
+        const uint32_t c = g_slots[i].count.load(std::memory_order_relaxed);
+        if (c < 1000) continue;
+        const ArgHist& h = g_args[i];
+        const Entry&   e = kEntries[i];
+        std::string vals;
+        for (uint32_t k = 0; k < h.distinct; ++k) {
+            if (!vals.empty()) vals += " ";
+            vals += fmt::format("{:X}({})", h.value[k], h.count[k]);
+        }
+        REXLOG_WARN("   {:<14} {:<44} {} distinct{}: {}",
+                    e.sym, e.name[0] ? e.name : "(unidentified)",
+                    h.distinct, h.overflow ? "+more" : "", vals);
+    }
+
     // Per-draw call sequences: what state the game sets between consecutive draws.
+    // Printed ONCE (when the last block is captured) and again on shutdown -- the
+    // blocks never change after capture, and reprinting them on every periodic
+    // dump rotated the log file and buried everything else.
     const uint32_t nb = g_block_count.load(std::memory_order_relaxed);
+    const bool final_dump = reason && reason[0] == 's';   // "shutdown"
+    if (nb < kSeqBlocks && !final_dump) {
+        REXLOG_WARN("-- per-draw call sequences: {}/{} blocks captured so far --", nb, kSeqBlocks);
+        REXLOG_WARN("===== end D3D9 CALL TRACE =====");
+        return;
+    }
+    if (!final_dump && g_seq_printed.exchange(true, std::memory_order_relaxed)) {
+        REXLOG_WARN("-- per-draw call sequences: {} blocks (already printed above) --", nb);
+        REXLOG_WARN("===== end D3D9 CALL TRACE =====");
+        return;
+    }
     REXLOG_WARN("-- per-draw call sequences ({} blocks captured) --",
                 nb < kSeqBlocks ? nb : kSeqBlocks);
     for (uint32_t b = 0; b < nb && b < kSeqBlocks; ++b) {
