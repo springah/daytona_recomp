@@ -153,6 +153,34 @@ std::atomic<uint64_t> g_frames{0};
 // than presenting an empty profile as if it were a finding.
 constexpr size_t kControls[] = {30, 39, 100};
 
+// ---- per-draw call-sequence capture ----------------------------------------
+// Call COUNTS tell you frequency; building a renderer needs call ORDER around a
+// draw -- which state is set per-draw, which is left standing from the previous
+// one. D3DDevice_DrawVertices delimits a state block, so we snapshot the calls
+// between consecutive draws for the first few draws of a few different frames.
+constexpr size_t kDrawIndex   = 39;
+constexpr size_t kSeqCapacity = 512;   // calls captured per draw block
+constexpr size_t kSeqBlocks   = 12;    // draw blocks retained
+
+struct SeqBlock {
+    uint64_t frame = 0;
+    uint32_t draw  = 0;
+    uint32_t len   = 0;
+    bool     overflowed = false;
+    uint16_t entries[kSeqCapacity]{};
+};
+
+SeqBlock g_blocks[kSeqBlocks];
+std::atomic<uint32_t> g_block_count{0};
+// Single-writer scratch: Daytona issues its draw calls from one render thread
+// (confirmed in the phase-0 trace -- every render hook logged the same thread
+// id). If that ever stops holding, the worst case is an interleaved block, not
+// a crash: len is clamped and the buffer is fixed-size.
+uint16_t g_scratch[kSeqCapacity];
+uint32_t g_scratch_len = 0;
+bool     g_scratch_overflow = false;
+std::atomic<uint32_t> g_draws{0};
+
 }  // namespace
 
 void Record(size_t index, const PPCContext& ctx) {
@@ -165,6 +193,32 @@ void Record(size_t index, const PPCContext& ctx) {
         s.lr = static_cast<uint32_t>(ctx.lr);
         s.captured.store(true, std::memory_order_relaxed);
     }
+    // Per-draw sequence capture. Sampled, not continuous: we want a handful of
+    // representative draw blocks, not a 4-million-entry firehose.
+    if (g_block_count.load(std::memory_order_relaxed) < kSeqBlocks) {
+        if (index == kDrawIndex) {
+            const uint32_t d = g_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+            // Sample early draws, then spread out to catch later render states.
+            if (d <= 4 || d == 64 || d == 256 || d == 1024 || d == 4096 || (d % 20000) == 0) {
+                const uint32_t b = g_block_count.fetch_add(1, std::memory_order_relaxed);
+                if (b < kSeqBlocks) {
+                    SeqBlock& blk = g_blocks[b];
+                    blk.frame = g_frames.load(std::memory_order_relaxed);
+                    blk.draw  = d;
+                    blk.len   = g_scratch_len < kSeqCapacity ? g_scratch_len : kSeqCapacity;
+                    blk.overflowed = g_scratch_overflow;
+                    for (uint32_t i = 0; i < blk.len; ++i) blk.entries[i] = g_scratch[i];
+                }
+            }
+            g_scratch_len = 0;
+            g_scratch_overflow = false;
+        } else if (g_scratch_len < kSeqCapacity) {
+            g_scratch[g_scratch_len++] = static_cast<uint16_t>(index);
+        } else {
+            g_scratch_overflow = true;
+        }
+    }
+
     // Periodic dump without touching a clock on the hot path.
     // NB: must skip v==0 -- dumping on the very first intercepted call reports a
     // control failure before the game has begun rendering, which reads as "the
@@ -237,6 +291,31 @@ void Dump(const char* reason) {
         const Entry& e = kEntries[i];
         REXLOG_WARN("   {:<14} {:<46} ({} static game callers)",
                     e.sym, e.name[0] ? e.name : "(unidentified)", e.game_callers);
+    }
+    // Per-draw call sequences: what state the game sets between consecutive draws.
+    const uint32_t nb = g_block_count.load(std::memory_order_relaxed);
+    REXLOG_WARN("-- per-draw call sequences ({} blocks captured) --",
+                nb < kSeqBlocks ? nb : kSeqBlocks);
+    for (uint32_t b = 0; b < nb && b < kSeqBlocks; ++b) {
+        const SeqBlock& blk = g_blocks[b];
+        REXLOG_WARN("  [draw #{} @ frame {}] {} calls before this draw{}",
+                    blk.draw, blk.frame, blk.len, blk.overflowed ? " (TRUNCATED)" : "");
+        // Run-length encode: the game re-sets the same state repeatedly, and the
+        // raw list is unreadable without collapsing runs.
+        uint32_t i = 0;
+        while (i < blk.len) {
+            const uint16_t e = blk.entries[i];
+            uint32_t run = 1;
+            while (i + run < blk.len && blk.entries[i + run] == e) ++run;
+            const Entry& en = kEntries[e];
+            if (run > 1)
+                REXLOG_WARN("      {}x {:<14} {}", run, en.sym,
+                            en.name[0] ? en.name : "(unidentified)");
+            else
+                REXLOG_WARN("         {:<14} {}", en.sym,
+                            en.name[0] ? en.name : "(unidentified)");
+            i += run;
+        }
     }
     REXLOG_WARN("===== end D3D9 CALL TRACE =====");
 }
