@@ -620,10 +620,16 @@
 #define GetTexStateTableB            sub_82241740
 // Texture load entry point: marshals args around BSS[4028] descriptor, calls sub_822426E8
 #define TexLoad                      sub_822429C8
-// Finalize texture B: check BSS[14084] hook, call GpuFormatLookup, set up GPU texture state
-#define TexFinalizeB                 sub_82225470
-// Finalize texture A: check BSS[14088] hook, process texture descriptor variant A
-#define TexFinalizeA                 sub_82225658
+// D3D9: create a pixel shader from a microcode blob. NOT texture finalization.
+// Inferred from symmetry with CreateVertexShader below (same size, same two
+// callers, adjacent address, different tail call) rather than a direct match --
+// treat as lower confidence than its sibling.
+#define D3DDevice_CreatePixelShader   sub_82225470   // shader.obj; was mislabelled "TexFinalizeB"
+// D3D9: create a vertex shader from a microcode blob. NOT texture finalization.
+// Confirmed: tail-calls sub_82225560 = XGRegisterVertexShader.
+// This and CreatePixelShader are the ONLY place the shader microcode blob is
+// reachable -- hook here to capture the shader inventory.
+#define D3DDevice_CreateVertexShader  sub_82225658   // shader.obj; was mislabelled "TexFinalizeA"
 
 // ── GPU state & cache flush (0x8241xxxx) ──────────────────────────────────────
 // Set texture state entry's ID field (bits 12-19 of entry[0]); marks entry dirty at +48
@@ -668,8 +674,12 @@
 // ── D3D-like device state setters (0x8221Exxx) ───────────────────────────────
 // stw r4, 13872(r3) — single-word device state store (slot A)
 #define D3DDevice_SetRenderState_PresentInterval sub_8221E940   // state.obj; was mislabelled "DeviceSetStateA"  (propagated match -- lower confidence)
-// bitfield insert into device+12156, bits 2-8 (slot B, e.g. alpha-test ref)
-#define DeviceSetStateB              sub_8221E950
+// D3D9 state.obj, sandwiched between SetRenderState_PresentInterval (0x8221E940)
+// and the rest of the per-state setter run, so it is one of that family -- but the
+// signature scan could not name it and I am not going to invent one. Observed
+// behaviour: bitfield insert into device+12156, bits 2-8 (plausibly alpha-test
+// ref, unconfirmed). UNKNOWN is in the name deliberately; do not trust it.
+#define D3DDevice_SetRenderState_UNKNOWN_E950  sub_8221E950
 // stw r4, device+10688; sets dirty bit 35 (slot C, e.g. backbuffer gamma)
 #define D3DDevice_SetRenderState_HalfPixelOffset sub_8221E658   // state.obj; was mislabelled "DeviceSetStateC"  (propagated match -- lower confidence)
 // reads bit 0 of device+10688 — getter for slot C
