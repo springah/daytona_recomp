@@ -10,12 +10,23 @@
 // listed at the bottom and must be folded into their existing bodies in phase 1.
 #include "daytona_init.h"
 #include "dt_d3d9_trace.h"
+#include "dt_plume.h"
 
 #include <rex/hook.h>
 
 #define DT_D3D9_TRACE(sub, idx)               \
     REX_HOOK_RAW(sub) {                       \
         dt_d3d9_trace::Record((idx), ctx);    \
+        __imp__##sub(ctx, base);              \
+    }
+
+// Same, plus a decoded call into the native renderer's draw-state shadow. The
+// argument registers come from the XDK 20500 d3d9.h prototypes (see SEMANTIC in
+// gen_trace.py), NOT from guesswork.
+#define DT_D3D9_TRACE_SEM(sub, idx, call)     \
+    REX_HOOK_RAW(sub) {                       \
+        dt_d3d9_trace::Record((idx), ctx);    \
+        call;                                 \
         __imp__##sub(ctx, base);              \
     }
 
@@ -50,7 +61,7 @@ DT_D3D9_TRACE(sub_8221EED8, 26)  // (unidentified)
 DT_D3D9_TRACE(sub_8221EF78, 27)  // (unidentified)
 DT_D3D9_TRACE(sub_8221EFF8, 28)  // (unidentified)
 DT_D3D9_TRACE(sub_8221F398, 29)  // D3DDevice_SetScissorRect
-DT_D3D9_TRACE(sub_8221F490, 30)  // D3DDevice_SetStreamSource
+DT_D3D9_TRACE_SEM(sub_8221F490, 30, dt_plume::OnSetStreamSource(ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32))  // D3DDevice_SetStreamSource
 DT_D3D9_TRACE(sub_8221F640, 31)  // D3DDevice_GetRenderTarget
 DT_D3D9_TRACE(sub_8221F688, 32)  // D3DDevice_GetDepthStencilSurface
 DT_D3D9_TRACE(sub_8221F868, 33)  // (unidentified)
@@ -59,7 +70,7 @@ DT_D3D9_TRACE(sub_8221FC20, 35)  // D3DDevice_SetViewport
 DT_D3D9_TRACE(sub_822203C0, 36)  // D3DResource_GetType
 DT_D3D9_TRACE(sub_82221700, 37)  // D3DResource_Release
 DT_D3D9_TRACE(sub_82221818, 38)  // D3DDevice_InvalidateGpuCache
-DT_D3D9_TRACE(sub_82221918, 39)  // D3DDevice_DrawVertices
+DT_D3D9_TRACE_SEM(sub_82221918, 39, dt_plume::OnDrawVertices(ctx.r4.u32, ctx.r5.u32, ctx.r6.u32))  // D3DDevice_DrawVertices
 DT_D3D9_TRACE(sub_82222B70, 40)  // (unidentified)
 DT_D3D9_TRACE(sub_82222B90, 41)  // (unidentified)
 DT_D3D9_TRACE(sub_82222BB0, 42)  // (unidentified)
@@ -71,9 +82,9 @@ DT_D3D9_TRACE(sub_82223878, 47)  // (unidentified)
 DT_D3D9_TRACE(sub_822238D8, 48)  // (unidentified)
 DT_D3D9_TRACE(sub_82223930, 49)  // (unidentified)
 DT_D3D9_TRACE(sub_82223988, 50)  // (unidentified)
-DT_D3D9_TRACE(sub_82223A10, 51)  // D3DDevice_SetPixelShader
-DT_D3D9_TRACE(sub_82223BD0, 52)  // D3DDevice_SetVertexShader
-DT_D3D9_TRACE(sub_82223DA0, 53)  // D3DDevice_SetVertexDeclaration
+DT_D3D9_TRACE_SEM(sub_82223A10, 51, dt_plume::OnSetPixelShader(ctx.r4.u32))  // D3DDevice_SetPixelShader
+DT_D3D9_TRACE_SEM(sub_82223BD0, 52, dt_plume::OnSetVertexShader(ctx.r4.u32))  // D3DDevice_SetVertexShader
+DT_D3D9_TRACE_SEM(sub_82223DA0, 53, dt_plume::OnSetVertexDeclaration(ctx.r4.u32))  // D3DDevice_SetVertexDeclaration
 DT_D3D9_TRACE(sub_82224010, 54)  // (unidentified)
 DT_D3D9_TRACE(sub_82224018, 55)  // (unidentified)
 DT_D3D9_TRACE(sub_82224D40, 56)  // (unidentified)

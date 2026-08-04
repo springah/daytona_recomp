@@ -317,15 +317,21 @@ DT_TRACE_HOOK_AFTER(sub_82241740, daytona_debug::HookId::kUiTextureSizeB)       
 // BEFORE the call. Container header: +4 virtualSize, +8 physicalSize; the whole
 // blob is virtualSize + physicalSize bytes. These two calls are the only place
 // the microcode is ever visible -- everything downstream holds an opaque handle.
+// The return value is the guest D3DVertexShader*/D3DPixelShader* the rest of the
+// game holds. Pairing it with the container hash here is the ONLY chance to do
+// so -- SetVertexShader/SetPixelShader only ever see the opaque handle.
 #define DT_SHADER_CREATE_HOOK(name, is_vertex, id)                             \
     REX_HOOK_RAW(name) {                                                       \
         const uint32_t fn = ctx.r3.u32;                                        \
+        uint64_t hash = 0;                                                     \
         if (fn != 0) {                                                         \
-            dt_shader_dump::Record((is_vertex), fn,                            \
-                                   REX_LOAD_U32(fn + 4), REX_LOAD_U32(fn + 8), \
-                                   REX_RAW_ADDR(fn));                          \
+            hash = dt_shader_dump::Record((is_vertex), fn,                     \
+                                          REX_LOAD_U32(fn + 4),                \
+                                          REX_LOAD_U32(fn + 8),                \
+                                          REX_RAW_ADDR(fn));                   \
         }                                                                      \
         __imp__##name(ctx, base);                                              \
+        if (hash != 0) dt_plume::OnShaderObject(ctx.r3.u32, hash);             \
         uint32_t n = daytona_debug::RecordHook((id), ctx);                     \
         if (ShouldLog(n)) LogGuestCall(#name, n, ctx);                         \
     }

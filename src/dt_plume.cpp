@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -40,6 +41,113 @@ std::unordered_map<uint64_t, Created> g_shaders;
 uint32_t g_resolved = 0;
 uint32_t g_unresolved = 0;
 uint32_t g_failed = 0;
+
+// ── Draw-state shadow ────────────────────────────────────────────────────────
+// The D3D9 calls all arrive on one render thread (every trace dump so far shows
+// a single thread id), so the shadow is plain globals with no locking -- at ~6k
+// calls/frame a mutex per call would be a real cost. That assumption is CHECKED
+// below rather than trusted: if a second thread ever touches it, we shout.
+constexpr uint32_t kMaxStreams = 16;
+constexpr uint32_t kMaxCombos = 64;
+
+struct StreamBinding {
+    uint32_t buffer_ea = 0;
+    uint32_t offset = 0;
+    uint32_t stride = 0;
+};
+
+// Per-combo record of what a draw ACTUALLY had bound. Captured at draw time,
+// not at dump time: SetStreamSource passes a null buffer on ~85% of calls, so a
+// snapshot taken between frames shows everything unbound and tells you nothing.
+constexpr uint32_t kMaxComboStreams = 6;
+
+struct ComboStream {
+    uint32_t stream = 0;
+    uint32_t stride = 0;
+};
+
+struct Combo {
+    uint64_t vs = 0;
+    uint64_t ps = 0;
+    uint32_t topology = 0;
+    uint64_t draws = 0;
+    uint64_t vertices = 0;
+    uint32_t min_count = 0xFFFFFFFFu;
+    uint32_t max_count = 0;
+    ComboStream streams[kMaxComboStreams];
+    uint32_t stream_count = 0;
+    uint32_t stream_overflow = 0;
+    uint32_t decl_ea = 0;
+};
+
+std::unordered_map<uint32_t, uint64_t> g_shader_objects;   // guest object ea -> container hash
+StreamBinding g_streams[kMaxStreams];
+uint32_t g_cur_vs_ea = 0;
+uint32_t g_cur_ps_ea = 0;
+uint32_t g_cur_decl_ea = 0;
+Combo g_combos[kMaxCombos];
+uint32_t g_combo_count = 0;
+uint64_t g_draws = 0;
+uint64_t g_draws_unresolved = 0;     // a draw whose VS or PS we have no blob for
+uint32_t g_combo_overflow = 0;
+uint32_t g_decl_changes = 0;
+
+constexpr uint32_t kMaxDecls = 8;
+struct DeclBind {
+    uint32_t ea = 0;
+    uint64_t binds = 0;
+};
+DeclBind g_decls[kMaxDecls];
+uint32_t g_decl_count = 0;
+uint32_t g_decl_overflow = 0;
+
+unsigned long g_render_thread = 0;
+bool g_thread_warned = false;
+
+// Portable and cheap: a thread_local counter, so the hot path is one TLS read.
+unsigned long CurrentThreadIdCheap() {
+    static std::atomic<unsigned long> next{1};
+    static thread_local unsigned long id = next.fetch_add(1, std::memory_order_relaxed);
+    return id;
+}
+
+// Returns false the first time a second thread shows up, and shouts once.
+bool OnRenderThread() {
+    const unsigned long id = CurrentThreadIdCheap();
+    if (g_render_thread == 0) {
+        g_render_thread = id;
+        return true;
+    }
+    if (g_render_thread != id) {
+        if (!g_thread_warned) {
+            g_thread_warned = true;
+            REXLOG_WARN("plume: DRAW STATE TOUCHED FROM A SECOND THREAD ({} then {}) -- the "
+                        "lock-free shadow is unsafe; the census below may be wrong",
+                        g_render_thread, id);
+        }
+        return false;
+    }
+    return true;
+}
+
+uint64_t HashOf(uint32_t shader_ea) {
+    if (shader_ea == 0) return 0;
+    auto it = g_shader_objects.find(shader_ea);
+    return it == g_shader_objects.end() ? ~0ull : it->second;
+}
+
+const char* TopologyName(uint32_t t) {
+    switch (t) {
+        case 1:  return "POINTLIST";
+        case 2:  return "LINELIST";
+        case 3:  return "LINESTRIP";
+        case 4:  return "TRIANGLELIST";
+        case 5:  return "TRIANGLESTRIP";
+        case 6:  return "TRIANGLEFAN";
+        case 13: return "QUADLIST";
+        default: return "?";
+    }
+}
 
 // XenosRecomp invokes DXC without -E, so the entry point is the default and the
 // generated HLSL declares `void main(...)`.
@@ -175,6 +283,109 @@ void OnShaderCreated(uint64_t container_hash, bool is_vertex) {
     g_shaders.emplace(container_hash, std::move(created));
 }
 
+void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash) {
+    if (!Enabled() || shader_object_ea == 0) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_shader_objects[shader_object_ea] = container_hash;
+}
+
+void OnSetVertexShader(uint32_t shader_ea) {
+    if (!Enabled()) return;
+    if (!OnRenderThread()) return;
+    g_cur_vs_ea = shader_ea;
+}
+
+void OnSetPixelShader(uint32_t shader_ea) {
+    if (!Enabled()) return;
+    if (!OnRenderThread()) return;
+    g_cur_ps_ea = shader_ea;
+}
+
+void OnSetVertexDeclaration(uint32_t decl_ea) {
+    if (!Enabled()) return;
+    if (!OnRenderThread()) return;
+    if (decl_ea != g_cur_decl_ea) {
+        ++g_decl_changes;
+        g_cur_decl_ea = decl_ea;
+    }
+    // Distinct declarations matter: the spec says ONE game-wide, but the change
+    // count runs at 2x the draw count, which means it alternates between two
+    // values (very likely real <-> null). Record what they are.
+    for (uint32_t i = 0; i < g_decl_count; ++i) {
+        if (g_decls[i].ea == decl_ea) {
+            ++g_decls[i].binds;
+            return;
+        }
+    }
+    if (g_decl_count < kMaxDecls) {
+        g_decls[g_decl_count].ea = decl_ea;
+        g_decls[g_decl_count].binds = 1;
+        ++g_decl_count;
+    } else {
+        ++g_decl_overflow;
+    }
+}
+
+void OnSetStreamSource(uint32_t stream, uint32_t buffer_ea, uint32_t offset, uint32_t stride) {
+    if (!Enabled()) return;
+    if (!OnRenderThread()) return;
+    if (stream >= kMaxStreams) return;
+    g_streams[stream] = {buffer_ea, offset, stride};
+}
+
+void OnDrawVertices(uint32_t primitive_type, uint32_t start_vertex, uint32_t vertex_count) {
+    if (!Enabled()) return;
+    if (!OnRenderThread()) return;
+    (void)start_vertex;
+    ++g_draws;
+
+    const uint64_t vs = HashOf(g_cur_vs_ea);
+    const uint64_t ps = HashOf(g_cur_ps_ea);
+    if (vs == ~0ull || ps == ~0ull) ++g_draws_unresolved;
+
+    Combo* found = nullptr;
+    for (uint32_t i = 0; i < g_combo_count; ++i) {
+        Combo& c = g_combos[i];
+        if (c.vs == vs && c.ps == ps && c.topology == primitive_type) {
+            found = &c;
+            break;
+        }
+    }
+    if (found == nullptr) {
+        if (g_combo_count >= kMaxCombos) {
+            ++g_combo_overflow;   // never silently truncate -- reported in Dump()
+            return;
+        }
+        found = &g_combos[g_combo_count++];
+        found->vs = vs;
+        found->ps = ps;
+        found->topology = primitive_type;
+        found->decl_ea = g_cur_decl_ea;
+    }
+    ++found->draws;
+    found->vertices += vertex_count;
+    if (vertex_count < found->min_count) found->min_count = vertex_count;
+    if (vertex_count > found->max_count) found->max_count = vertex_count;
+
+    // Fold in whatever is actually bound right now.
+    for (uint32_t s = 0; s < kMaxStreams; ++s) {
+        if (g_streams[s].buffer_ea == 0) continue;
+        bool seen = false;
+        for (uint32_t k = 0; k < found->stream_count; ++k) {
+            if (found->streams[k].stream == s && found->streams[k].stride == g_streams[s].stride) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (found->stream_count >= kMaxComboStreams) {
+            ++found->stream_overflow;
+            continue;
+        }
+        found->streams[found->stream_count++] = {s, g_streams[s].stride};
+    }
+}
+
 void Dump(const char* reason) {
     if (!Enabled()) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -194,6 +405,41 @@ void Dump(const char* reason) {
                     "reached the code that creates them",
                     dt_shader_blobs::kEntryCount - g_resolved, dt_shader_blobs::kEntryCount);
     }
+
+    REXLOG_WARN("   draws={} unresolved={} decl changes={} combos={}",
+                g_draws, g_draws_unresolved, g_decl_changes, g_combo_count);
+    if (g_combo_overflow) {
+        REXLOG_WARN("   WARNING: {} draws fell outside the {}-combo table -- the census below "
+                    "is INCOMPLETE, raise kMaxCombos", g_combo_overflow, kMaxCombos);
+    }
+    if (g_draws_unresolved) {
+        REXLOG_WARN("   WARNING: {} draws used a shader object we never saw created", g_draws_unresolved);
+    }
+
+    // This is the number the renderer actually needs: one plume pipeline per row.
+    REXLOG_WARN("   --- pipeline combinations (one plume pipeline each) ---");
+    for (uint32_t i = 0; i < g_combo_count; ++i) {
+        const Combo& c = g_combos[i];
+        const auto* ve = c.vs == ~0ull ? nullptr : dt_shader_blobs::Find(c.vs);
+        const auto* pe = c.ps == ~0ull ? nullptr : dt_shader_blobs::Find(c.ps);
+        std::string streams;
+        for (uint32_t k = 0; k < c.stream_count; ++k) {
+            streams += "s" + std::to_string(c.streams[k].stream) +
+                       "/" + std::to_string(c.streams[k].stride) + " ";
+        }
+        if (c.stream_overflow) streams += "(+more) ";
+        REXLOG_WARN("   [{:2}] {:>13} vs={:<20} ps={:<20} draws={:<9} verts {}..{} streams: {}",
+                    i, TopologyName(c.topology),
+                    ve ? ve->name : (c.vs == 0 ? "(none)" : "(UNKNOWN)"),
+                    pe ? pe->name : (c.ps == 0 ? "(none)" : "(UNKNOWN)"),
+                    c.draws, c.min_count == 0xFFFFFFFFu ? 0 : c.min_count, c.max_count,
+                    streams.empty() ? "(none bound)" : streams);
+    }
+    REXLOG_WARN("   --- vertex declarations bound ({} distinct) ---", g_decl_count);
+    for (uint32_t i = 0; i < g_decl_count; ++i) {
+        REXLOG_WARN("   decl {:08X}  binds={}", g_decls[i].ea, g_decls[i].binds);
+    }
+    if (g_decl_overflow) REXLOG_WARN("   (+{} more distinct declarations)", g_decl_overflow);
     REXLOG_WARN("===== end plume renderer =====");
 }
 

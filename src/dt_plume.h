@@ -30,6 +30,22 @@ bool Init();
 // creates the plume shader object.
 void OnShaderCreated(uint64_t container_hash, bool is_vertex);
 
+// The guest object address the create call RETURNED, paired with the container
+// hash it was built from. This is the only place the two are visible together,
+// and it is what lets SetVertexShader/SetPixelShader (which pass an opaque
+// handle) be resolved back to a shader we have a blob for.
+void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash);
+
+// ── Draw-state shadow ────────────────────────────────────────────────────────
+// Argument decoding lives in gen_trace.py's SEMANTIC map, from the XDK 20500
+// d3d9.h prototypes. These run on the game's render thread at up to ~885
+// draws/frame, so they must stay cheap.
+void OnSetVertexShader(uint32_t shader_ea);
+void OnSetPixelShader(uint32_t shader_ea);
+void OnSetVertexDeclaration(uint32_t decl_ea);
+void OnSetStreamSource(uint32_t stream, uint32_t buffer_ea, uint32_t offset, uint32_t stride);
+void OnDrawVertices(uint32_t primitive_type, uint32_t start_vertex, uint32_t vertex_count);
+
 // Log what resolved and what did not.
 void Dump(const char* reason);
 

@@ -46,16 +46,16 @@ bool Enabled() {
     return on;
 }
 
-void Record(bool is_vertex,
-            uint32_t function_ea,
-            uint32_t virtual_size,
-            uint32_t physical_size,
-            const uint8_t* raw) {
+uint64_t Record(bool is_vertex,
+                uint32_t function_ea,
+                uint32_t virtual_size,
+                uint32_t physical_size,
+                const uint8_t* raw) {
     (is_vertex ? g_vs_calls : g_ps_calls).fetch_add(1, std::memory_order_relaxed);
     // The hash is needed by the plume renderer too (it keys dt_shader_blobs), so
     // validate and hash whenever EITHER consumer is on -- only the file write is
     // gated on DT_DUMP_SHADERS.
-    if (raw == nullptr || (!Enabled() && !dt_plume::Enabled())) return;
+    if (raw == nullptr || (!Enabled() && !dt_plume::Enabled())) return 0;
 
     const uint64_t total64 = static_cast<uint64_t>(virtual_size) + physical_size;
     if (total64 < kMinBlob || total64 > kMaxBlob) {
@@ -66,7 +66,7 @@ void Record(bool is_vertex,
                         "implausible size, is r3 really the container pointer?",
                         is_vertex ? "VS" : "PS", function_ea, virtual_size, physical_size);
         }
-        return;
+        return 0;
     }
     const size_t total = static_cast<size_t>(total64);
     const uint64_t hash = Fnv1a(raw, total);
@@ -75,10 +75,10 @@ void Record(bool is_vertex,
     // still sees every shader when DT_DUMP_SHADERS is off.
     dt_plume::OnShaderCreated(hash, is_vertex);
 
-    if (!Enabled()) return;
+    if (!Enabled()) return hash;
 
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_seen.insert(hash).second) return;   // already dumped this exact blob
+    if (!g_seen.insert(hash).second) return hash;   // already dumped this exact blob
 
     if (!g_dir_ready) {
         std::error_code ec;
@@ -93,7 +93,7 @@ void Record(bool is_vertex,
     std::ofstream out(name, std::ios::binary);
     if (!out) {
         REXLOG_WARN("shader dump: could not open {}", name);
-        return;
+        return hash;
     }
     out.write(reinterpret_cast<const char*>(raw), static_cast<std::streamsize>(total));
 
@@ -101,6 +101,7 @@ void Record(bool is_vertex,
     REXLOG_WARN("shader dump {} #{} ea={:08X} virtual={} physical={} total={} -> {}",
                 is_vertex ? "VS" : "PS", is_vertex ? g_vs_unique : g_ps_unique,
                 function_ea, virtual_size, physical_size, total, name);
+    return hash;
 }
 
 void Dump(const char* reason) {

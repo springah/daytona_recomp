@@ -19,11 +19,15 @@ bool Enabled();
 
 // virtual_size/physical_size come from the container header (+4 and +8);
 // the blob is virtual_size + physical_size bytes starting at `raw`.
-void Record(bool is_vertex,
-            uint32_t function_ea,
-            uint32_t virtual_size,
-            uint32_t physical_size,
-            const uint8_t* raw);
+//
+// Returns the FNV-1a of the container, or 0 if it was rejected or no consumer is
+// enabled. The caller needs it to pair the hash with the guest shader object the
+// create call returns (see dt_plume::OnShaderObject).
+uint64_t Record(bool is_vertex,
+                uint32_t function_ea,
+                uint32_t virtual_size,
+                uint32_t physical_size,
+                const uint8_t* raw);
 
 void Dump(const char* reason);
 
