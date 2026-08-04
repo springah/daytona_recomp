@@ -870,3 +870,44 @@
 #define PlatformIpc4                 sub_8220EFD0
 // NtWaitForSingleObjectEx (platform async wait)
 #define PlatformAsyncWait            sub_8220FA20
+
+// ── D3D9 shadow-state setters (0x8221Dxxx-0x8221Fxxx) ────────────────────────
+// The 20 hottest calls in a race, all previously unnamed. Identified 2026-08-04
+// by BIT-FIELD signature match against XDK 20500 d3d9.lib: these functions call
+// nothing, so the call-sequence matcher was ~1000-way ambiguous on them, but the
+// exact (struct offset, shift, mask) instruction sequence each one writes is
+// unique. Full decode -- offsets, bit positions, dirty bits -- lives in
+// _tools/daytona_d3d9_sigscan/SHADOW_STATE_TABLE.md.
+//
+// Model: the device object is a shadow of the Xenos register file plus two
+// 64-bit dirty masks (render state @device+16, samplers @device+24, bit index
+// 32+sampler). A setter splices a bit field then sets its dirty bit; a later
+// SetPending_* flush emits the real PM4.
+//
+// ⚠ 55% of all D3D9 traffic is redundant sampler state -- the top three verbs
+// below are 3,287 of ~5,952 calls/frame. A host renderer should fold these per
+// draw, not replay them.
+
+// Texture fetch constants: entry = device + (sampler+48)*24 (24B = 6 dwords)
+#define D3DDevice_SetSamplerState_MipMapLodBias sub_8221EED8  // 1628/f -- word+16 bits 12..21
+#define D3DDevice_SetSamplerState_MaxMipLevel   sub_8221EF78  //  830/f -- word+16 bits 2..5
+#define D3DDevice_SetSamplerState_MinMipLevel   sub_8221EFF8  //  830/f -- word+16 bits 6..9
+#define D3DDevice_SetSamplerState_MinFilter     sub_8221E970  //   51/f -- word+12 bits 21..22
+#define D3DDevice_SetSamplerState_MagFilter     sub_8221EB18  //   51/f -- word+12 bits 19..20
+
+// Render state: shadow words at fixed device offsets
+#define D3DDevice_SetRenderState_ZEnable        sub_8221D7F8  // +10548 bit 1  (RB_DEPTHCONTROL)
+#define D3DDevice_SetRenderState_ZWriteEnable   sub_8221D838  // +10548 bit 2
+#define D3DDevice_SetRenderState_ZFunc          sub_8221D868  // +10548 bits 4..6
+#define D3DDevice_SetRenderState_AlphaFunc      sub_8221D5F0  // +10556 bits 0..2 (RB_COLORCONTROL)
+#define D3DDevice_SetRenderState_AlphaTestEnable sub_8221D130 // +10556 bit 3
+#define D3DDevice_SetRenderState_AlphaRef       sub_8221D590
+#define D3DDevice_SetRenderState_CullMode       sub_8221D0D0  // +10568 bits 0..2 (PA_SU_SC_MODE_CNTL)
+#define D3DDevice_SetRenderState_ColorWriteEnable sub_8221DD98 // +10460 bits 0..3
+#define D3DDevice_SetRenderState_DepthBias      sub_8221DCA0
+#define D3DDevice_SetRenderState_SlopeScaleDepthBias sub_8221DBD8
+#define D3DDevice_SetRenderState_BlendFactor    sub_8221D620
+#define D3DDevice_SetRenderState_PointSpriteEnable sub_8221DE98
+#define D3DDevice_SetRenderState_ScissorTestEnable sub_8221FC10 // plain stw to +12160
+#define D3DDevice_SetBlendState                 sub_8221F868  //   24/f
+#define D3DDevice_GpuBeginShaderConstantF4      sub_822298B0  //   27/f -- constant upload
