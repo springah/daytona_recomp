@@ -4,6 +4,7 @@
 #include "daytona_init.h"
 #include "daytona_debug.h"
 #include "dt_d3d9_trace.h"
+#include "dt_null_audio.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -419,9 +420,30 @@ protected:
     }
 
     void OnPreSetup(rex::RuntimeConfig& config) override {
-        (void)config;
         daytona_debug::SetStage(daytona_debug::AppStage::kPreSetup);
         REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
+
+        // DT_NOAUDIO=1 swaps the SDL audio backend for the SDK's no-op one.
+        //
+        // Why this exists: the guest treats audio-device init failure as FATAL --
+        // it calls KeBugCheckEx and the process dies at startup, after the window
+        // appears but before anything renders, which reads as a graphics crash.
+        // On this machine that happens whenever the display sleeps and takes the
+        // HDMI audio endpoint with it, so any unattended or overnight run dies a
+        // few minutes in for a reason that has nothing to do with the port.
+        //
+        // ReXApp::SetupPresentation() assigns the SDL backend and THEN calls
+        // OnPreSetup(config_), so overriding here wins without touching the SDK
+        // that the other six ports share.
+        //
+        // Deliberately opt-in, not an automatic fallback: silently substituting a
+        // silent audio system would turn "my sound is broken" into an invisible
+        // config state. No env => stock SDL audio, unchanged.
+        if (std::getenv("DT_NOAUDIO")) {
+            config.audio_factory = REX_AUDIO_BACKEND(dt_null_audio::NullAudioSystem);
+            REXLOG_WARN("DT_NOAUDIO set -- using the silent null audio backend. "
+                        "There will be NO SOUND; this is for unattended runs.");
+        }
 
         // Non-game runtime settings are baked into the binary (not exposed in
         // the .ini, which carries only user-facing game settings): a full

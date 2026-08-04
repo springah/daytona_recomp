@@ -117,6 +117,13 @@ enum class HookId : size_t {
     kSceneRender,
     kD3DEndTiling,
 
+    // Input polling -- the plain XamInputGet* wrappers. Added because the census
+    // showed the *Ex/RawState paths never firing, and concluding "the game never
+    // polls input" from that would have been wrong while these were unhooked.
+    kInputGetCapabilities,
+    kInputGetState,
+    kInputSetState,
+
     kCount,
 };
 

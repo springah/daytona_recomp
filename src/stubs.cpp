@@ -487,6 +487,14 @@ REX_HOOK_RAW(AudioSubmitRenderFrame) {
 }
 
 // ── Input domain hooks ────────────────────────────────────────────────────────
+// Plain XamInputGet* wrappers. Hooked because the first census showed the *Ex /
+// RawState paths never firing, and concluding "the game never polls input" from
+// that would have been wrong while these three were unhooked -- they are the
+// likelier controller-poll path.
+DT_TRACE_HOOK(sub_82210450, daytona_debug::HookId::kInputGetCapabilities)
+DT_TRACE_HOOK(sub_82210458, daytona_debug::HookId::kInputGetState)
+DT_TRACE_HOOK(sub_82210468, daytona_debug::HookId::kInputSetState)
+
 // InputGetRawState: XamInputGetState + XamInputRawState + XNotifyGetNext
 REX_HOOK_RAW(InputGetRawState) {
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kInputGetRawState, ctx);

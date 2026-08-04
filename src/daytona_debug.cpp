@@ -129,6 +129,9 @@ std::array<HookState, static_cast<size_t>(HookId::kCount)> g_hooks{{
     {"frame render sub_8212B828"},
     {"scene render sub_8212B3C8"},
     {"D3DDevice_EndTiling sub_8222CB88"},
+    {"input caps InputGetCapabilities sub_82210450"},
+    {"input state InputGetState sub_82210458"},
+    {"input setstate InputSetState sub_82210468"},
 }};
 
 uint64_t UptimeMicros() {
