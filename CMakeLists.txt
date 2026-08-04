@@ -24,6 +24,7 @@ set(DAYTONA_SOURCES
     src/dt_d3d9_hooks.cpp
     # DT_NOAUDIO: silent-but-functional audio for unattended runs.
     src/dt_null_audio.cpp
+    src/dt_shader_dump.cpp
 )
 
 # Embed the application icon + VERSIONINFO resource (visible in Explorer /

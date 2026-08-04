@@ -5,6 +5,7 @@
 #include "daytona_debug.h"
 #include "daytona_symbols.h"
 #include "dt_d3d9_trace.h"
+#include "dt_shader_dump.h"
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/system/xtypes.h>
@@ -217,6 +218,7 @@ REX_HOOK_RAW(sub_82233C80) {
     {
         static uint32_t frames = 0;
         if ((++frames % 1800) == 0) daytona_debug::LogCensus("periodic");
+        if ((frames % 1800) == 0) dt_shader_dump::Dump("periodic");
     }
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDeviceSwap, ctx);
 
@@ -304,9 +306,30 @@ DT_TRACE_HOOK_AROUND(sub_8212C7B8,
 
 // ── UI texture hooks ──────────────────────────────────────────────────────────
 DT_TRACE_HOOK_AFTER(sub_82241750, daytona_debug::HookId::kUiTextureSizeA)         // UiTextureSizeA
-DT_TRACE_HOOK_AFTER(sub_82225658, daytona_debug::HookId::kD3DCreateVertexShader)     // D3DDevice_CreateVertexShader (shader.obj)
 DT_TRACE_HOOK_AFTER(sub_82241740, daytona_debug::HookId::kUiTextureSizeB)         // UiTextureSizeB
-DT_TRACE_HOOK_AFTER(sub_82225470, daytona_debug::HookId::kD3DCreatePixelShader)     // D3DDevice_CreatePixelShader (shader.obj)
+
+// ── Shader creation (shader.obj) ──────────────────────────────────────────────
+// Both take a SINGLE argument in r3 -- a pointer to the Xbox 360 shader
+// container. There is no device parameter (XDK 20500 d3d9.h:2268-2269), and r3
+// is overwritten with the returned shader object, so the blob must be captured
+// BEFORE the call. Container header: +4 virtualSize, +8 physicalSize; the whole
+// blob is virtualSize + physicalSize bytes. These two calls are the only place
+// the microcode is ever visible -- everything downstream holds an opaque handle.
+#define DT_SHADER_CREATE_HOOK(name, is_vertex, id)                             \
+    REX_HOOK_RAW(name) {                                                       \
+        const uint32_t fn = ctx.r3.u32;                                        \
+        if (fn != 0) {                                                         \
+            dt_shader_dump::Record((is_vertex), fn,                            \
+                                   REX_LOAD_U32(fn + 4), REX_LOAD_U32(fn + 8), \
+                                   REX_RAW_ADDR(fn));                          \
+        }                                                                      \
+        __imp__##name(ctx, base);                                              \
+        uint32_t n = daytona_debug::RecordHook((id), ctx);                     \
+        if (ShouldLog(n)) LogGuestCall(#name, n, ctx);                         \
+    }
+
+DT_SHADER_CREATE_HOOK(sub_82225658, true,  daytona_debug::HookId::kD3DCreateVertexShader)
+DT_SHADER_CREATE_HOOK(sub_82225470, false, daytona_debug::HookId::kD3DCreatePixelShader)
 
 REX_HOOK_RAW(sub_8212F990) {
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kMainShaderSetup, ctx);
