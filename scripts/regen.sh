@@ -15,12 +15,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# SDK CLI built in the standalone sibling repo (../rexglue-sdk). The standalone
-# single-config build (README step 2) lands at out/<plat>/rexglue.exe; the Ninja
-# Multi-Config preset build adds a Release/ subdir. Try both, or override with
-# REXGLUE=<path>.
+# SDK CLI built from the pinned submodule (thirdparty/rexglue-sdk), falling back
+# to the shared sibling checkout (../rexglue-sdk). The standalone single-config
+# build (README step 2) lands at out/<plat>/rexglue.exe; the Ninja Multi-Config
+# preset build adds a Release/ subdir. Try both, or override with REXGLUE=<path>.
 if [ -z "${REXGLUE:-}" ]; then
   for cand in \
+    thirdparty/rexglue-sdk/out/win-amd64/rexglue.exe \
+    thirdparty/rexglue-sdk/out/win-amd64/Release/rexglue.exe \
+    thirdparty/rexglue-sdk/out/linux-amd64/rexglue \
+    thirdparty/rexglue-sdk/out/linux-amd64/Release/rexglue \
     ../rexglue-sdk/out/win-amd64/rexglue.exe \
     ../rexglue-sdk/out/win-amd64/Release/rexglue.exe \
     ../rexglue-sdk/out/linux-amd64/rexglue \
@@ -30,7 +34,7 @@ if [ -z "${REXGLUE:-}" ]; then
 fi
 
 if [ -z "${REXGLUE:-}" ] || { [ ! -x "$REXGLUE" ] && [ ! -f "$REXGLUE" ]; }; then
-  echo "[regen] rexglue CLI not found under ../rexglue-sdk/out/." >&2
+  echo "[regen] rexglue CLI not found under thirdparty/rexglue-sdk/out/ or ../rexglue-sdk/out/." >&2
   echo "[regen] build it first (see README step 2) or set REXGLUE=<path>." >&2
   exit 1
 fi

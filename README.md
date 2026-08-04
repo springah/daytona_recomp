@@ -53,31 +53,30 @@ The package this tree was prepared against: title/media `XA-2845`, media ID
 
 ## Build
 
-### 1. Clone alongside the shared SDK
+### 1. Clone (SDK included)
 
 ```sh
-git clone <repo-url> daytona_recomp
+git clone -c core.symlinks=true --recurse-submodules <repo-url> daytona_recomp
 ```
 
-ReXGlue is **not** vendored as a submodule. It lives in the standalone
-[`springah/rexglue-sdk`](https://github.com/springah/rexglue-sdk) fork — the same
-SDK the sibling recomps share — cloned as a sibling directory next to this repo
-and referenced via `REXSDK_DIR` (the preset bakes `../rexglue-sdk`):
+The [ReXGlue SDK](https://github.com/springah/rexglue-sdk) is a submodule at
+`thirdparty/rexglue-sdk`, **pinned at a tagged release** (currently v0.8.5.1) so
+every build links a recorded SDK SHA. To develop against a live SDK checkout
+instead, set `REXSDK_DIR` to it at configure time (step 4) — when unset, the
+build uses the submodule.
 
-```sh
-# from the parent directory that holds daytona_recomp/
-git clone https://github.com/springah/rexglue-sdk.git rexglue-sdk
-```
-
-(The SDK has its own build prerequisites — see its README, including the Windows
-`libmspack` symlink note.)
+> **Windows:** clone with `-c core.symlinks=true` (as above) or the SDK's
+> `libmspack` submodule checks out its symlinks as plain text files and the build
+> fails in `lzxd.c`. Fixing it after the fact: `git -C thirdparty/rexglue-sdk/thirdparty/libmspack
+> config core.symlinks true`, delete the offending files, `git checkout -- .`.
 
 ### 2. Build the ReXGlue CLI (for codegen)
 
 ```sh
-cmake --preset win-amd64 -S ../rexglue-sdk -B ../rexglue-sdk/out/build/win-amd64
-cmake --build ../rexglue-sdk/out/build/win-amd64 --config Release --target rexglue
-# -> ../rexglue-sdk/out/win-amd64/Release/rexglue.exe (regen.sh finds it automatically)
+cmake --preset win-amd64 -S thirdparty/rexglue-sdk -B thirdparty/rexglue-sdk/out/build/win-amd64
+cmake --build thirdparty/rexglue-sdk/out/build/win-amd64 --config Release --target rexglue
+# -> thirdparty/rexglue-sdk/out/win-amd64/Release/rexglue.exe (regen.sh finds it
+#    automatically, falling back to a ../rexglue-sdk sibling build)
 ```
 
 ### 3. Regenerate the recompiled code
@@ -99,10 +98,10 @@ cmake --preset win-amd64      # or linux-amd64
 cmake --build out/build/win-amd64 --config Release --target daytona
 ```
 
-The preset bakes `REXSDK_DIR=../rexglue-sdk`, so the SDK is built from the
-standalone sibling source tree as part of the daytona build. Runtime DLLs
-(`rexruntime.dll`, `TracyClient.dll`) are staged next to `daytona.exe`
-automatically.
+The SDK defaults to the pinned `thirdparty/rexglue-sdk` submodule and is built
+from source as part of the daytona build; add `-DREXSDK_DIR=<path>` to build
+against a live SDK checkout instead. Runtime DLLs (`rexruntime.dll`,
+`TracyClient.dll`) are staged next to `daytona.exe` automatically.
 
 ## Run
 
@@ -138,7 +137,7 @@ During a healthy run the log prints repeated
 
 ```text
 CMakeLists.txt          links rex::runtime via generated/rexglue.cmake
-CMakePresets.json       win-amd64 / linux-amd64 presets (REXSDK_DIR baked in)
+CMakePresets.json       win-amd64 / linux-amd64 presets (SDK from the submodule)
 daytona_manifest.toml   ReXGlue codegen manifest
 daytona_functions.toml  function-entry seeds + analysis tuning
 src/                    host sources (main.cpp, stubs.cpp, keyboard_driver, debug)
@@ -146,7 +145,8 @@ ppc/                    local PPC detail headers (PPC_INCLUDE_DETAIL)
 scripts/regen.sh        codegen driver
 scripts/extract_game.py STFS package extractor
 generated/              codegen output (gitignored, regenerate via regen.sh)
-thirdparty/rexglue-sdk  shared ReXGlue SDK submodule (branch main)
+thirdparty/rexglue-sdk  ReXGlue SDK submodule, pinned at a tagged release
+thirdparty/plume        plume rendering abstraction submodule
 ```
 
 ## Roadmap

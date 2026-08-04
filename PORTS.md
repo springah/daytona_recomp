@@ -12,10 +12,14 @@ ships no game content.
 | macOS (arm64) | `mac-arm64` | 🛠️ build-verified v1.0.0 (`Daytona.app` via `mac-build/`, MoltenVK); runtime not yet confirmed |
 
 ## SDK
-All builds link the shared **rexglue-sdk** via the **`REXSDK_DIR`** environment
-variable — an external dependency, not a vendored sibling or submodule. Set it
-before configuring, e.g. `REXSDK_DIR=C:\Users\shant\Desktop\projects\rexglue-sdk`
-(the `_resync_build.ps1` helper sets it automatically).
+All builds link the **rexglue-sdk** submodule at `thirdparty/rexglue-sdk`,
+**pinned at a tagged SDK release** (currently v0.8.5.1) — `cmake --preset
+win-amd64-release` resolves it with no flags or env vars. The presets no longer
+read the `REXSDK_DIR` environment variable (the persistent user-profile value
+still serves the sibling ports); to build daytona against a live SDK checkout,
+pass it explicitly: `cmake --preset win-amd64-release -DREXSDK_DIR=<path>`.
+To bump the pin: tag a new SDK release, `git -C thirdparty/rexglue-sdk fetch
+--tags && git -C thirdparty/rexglue-sdk checkout vX.Y.Z`, commit the gitlink.
 
 ## Build & stage
 - **Windows:** `projects\_resync_build.ps1 -ProjDir <repo>` (configures `win-amd64`
