@@ -78,6 +78,7 @@ struct Combo {
     uint32_t stream_count = 0;
     uint32_t stream_overflow = 0;
     uint32_t decl_ea = 0;
+    uint64_t decl_mismatch = 0;
 };
 
 std::unordered_map<uint32_t, uint64_t> g_shader_objects;   // guest object ea -> container hash
@@ -364,6 +365,9 @@ void OnDrawVertices(uint32_t primitive_type, uint32_t start_vertex, uint32_t ver
     }
     ++found->draws;
     found->vertices += vertex_count;
+    // A combination is assumed to use one declaration; count it if that is ever
+    // false rather than silently reporting whichever one happened to be first.
+    if (g_cur_decl_ea != found->decl_ea) ++found->decl_mismatch;
     if (vertex_count < found->min_count) found->min_count = vertex_count;
     if (vertex_count > found->max_count) found->max_count = vertex_count;
 
@@ -428,11 +432,12 @@ void Dump(const char* reason) {
                        "/" + std::to_string(c.streams[k].stride) + " ";
         }
         if (c.stream_overflow) streams += "(+more) ";
-        REXLOG_WARN("   [{:2}] {:>13} vs={:<20} ps={:<20} draws={:<9} verts {}..{} streams: {}",
+        REXLOG_WARN("   [{:2}] {:>13} vs={:<20} ps={:<20} draws={:<9} verts {}..{} decl={:08X}{} streams: {}",
                     i, TopologyName(c.topology),
                     ve ? ve->name : (c.vs == 0 ? "(none)" : "(UNKNOWN)"),
                     pe ? pe->name : (c.ps == 0 ? "(none)" : "(UNKNOWN)"),
                     c.draws, c.min_count == 0xFFFFFFFFu ? 0 : c.min_count, c.max_count,
+                    c.decl_ea, c.decl_mismatch ? "(VARIES!)" : "",
                     streams.empty() ? "(none bound)" : streams);
     }
     REXLOG_WARN("   --- vertex declarations bound ({} distinct) ---", g_decl_count);
