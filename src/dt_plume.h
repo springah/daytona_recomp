@@ -61,6 +61,11 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx);
 void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
                         GuestResolve resolve, void* ctx);
 
+// Build one plume graphics pipeline per observed (VS, PS, topology) combination.
+// Needs the vertex layouts, so it only builds a combination once that shader's
+// layout is known. Safe to call repeatedly; already-built ones are skipped.
+void BuildPipelines(const char* reason);
+
 // ── Draw-state shadow ────────────────────────────────────────────────────────
 // Argument decoding lives in gen_trace.py's SEMANTIC map, from the XDK 20500
 // d3d9.h prototypes. These run on the game's render thread at up to ~885

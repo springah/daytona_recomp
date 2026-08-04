@@ -268,6 +268,7 @@ REX_HOOK_RAW(sub_82233C80) {
         // happens when the game binds it, so keep retrying as content changes.
         if ((frames % 600) == 0) {
             dt_plume::DeriveVertexLayouts("periodic", PatchTestResolve, base);
+            dt_plume::BuildPipelines("periodic");
         }
     }
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDeviceSwap, ctx);

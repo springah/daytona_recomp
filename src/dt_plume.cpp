@@ -30,6 +30,7 @@ bool g_init_ok = false;
 
 std::unique_ptr<plume::RenderInterface> g_interface;
 std::unique_ptr<plume::RenderDevice> g_device;
+std::unique_ptr<plume::RenderPipelineLayout> g_pipeline_layout;
 plume::RenderShaderFormat g_shader_format = plume::RenderShaderFormat::UNKNOWN;
 const char* g_backend = "none";
 
@@ -43,6 +44,11 @@ struct FetchedAttribute {
     uint32_t offset = 0;        // bytes
     bool num_format_all = false;
     bool signed_all = false;
+    // Fetch constant = constIndex*3 + constIndexSelect. It identifies the
+    // STREAM, which is what an input slot must key on. Keying on stride
+    // instead collapses a de-interleaved layout: every attribute sits at
+    // offset 0 with the same stride, so they would all alias slot 0.
+    uint32_t fetch_const = 0;
 };
 
 struct Created {
@@ -84,6 +90,8 @@ struct StreamBinding {
 // snapshot taken between frames shows everything unbound and tells you nothing.
 constexpr uint32_t kMaxComboStreams = 6;
 
+enum class PipelineState { kPending, kBuilt, kFailed };
+
 struct ComboStream {
     uint32_t stream = 0;
     uint32_t stride = 0;
@@ -102,6 +110,8 @@ struct Combo {
     uint32_t stream_overflow = 0;
     uint32_t decl_ea = 0;
     uint64_t decl_mismatch = 0;
+    PipelineState pipeline_state = PipelineState::kPending;
+    std::unique_ptr<plume::RenderPipeline> pipeline;
 };
 
 std::unordered_map<uint32_t, uint64_t> g_shader_objects;   // guest object ea -> container hash
@@ -244,6 +254,48 @@ uint32_t ComponentBytes(uint32_t gpu_format) {
         default:                   return 0;   // unknown: refuse to swap
     }
 }
+
+// Semantic name and Vulkan location MUST match what XenosRecomp emitted into the
+// shader, or D3D12 fails to match by semantic and Vulkan fails to match by
+// location. Mirrored from its USAGE_SEMANTICS / USAGE_LOCATIONS tables --
+// including the Depth entry added by xenosrecomp-main-daytona.patch, which
+// upstream lacks because Sonic Unleashed never used Depth as a vertex element.
+const char* SemanticName(uint8_t usage) {
+    switch (usage) {
+        case 0:  return "POSITION";
+        case 1:  return "BLENDWEIGHT";
+        case 2:  return "BLENDINDICES";
+        case 3:  return "NORMAL";
+        case 4:  return "PSIZE";
+        case 5:  return "TEXCOORD";
+        case 6:  return "TANGENT";
+        case 7:  return "BINORMAL";
+        case 10: return "COLOR";
+        case 12: return "DEPTH";
+        default: return "TEXCOORD";
+    }
+}
+
+uint32_t VulkanLocation(uint8_t usage, uint8_t index) {
+    switch (usage) {
+        case 0:  return index == 0 ? 0u : 15u;              // Position0 / Position1
+        case 3:  return 1;                                   // Normal0
+        case 6:  return 2;                                   // Tangent0
+        case 7:  return 3;                                   // Binormal0
+        case 5:  return index < 4 ? 4u + index : 12u + (index - 4u);   // TexCoord0..7
+        case 10: return index == 0 ? 8u : 11u;               // Color0 / Color1
+        case 2:  return 9;                                   // BlendIndices0
+        case 1:  return 10;                                  // BlendWeight0
+        case 12: return 16;                                  // Depth0 -- the local patch
+        default: return 0;
+    }
+}
+
+// Provisional until the swapchain is wired: the guest presents B8G8R8A8 and the
+// pixel shaders write SV_Depth, so a depth target must exist for them to compile
+// against. Revisit when the render targets are real.
+constexpr plume::RenderFormat kRenderTargetFormat = plume::RenderFormat::B8G8R8A8_UNORM;
+constexpr plume::RenderFormat kDepthTargetFormat = plume::RenderFormat::D32_FLOAT;
 
 const char* UsageName(uint8_t usage) {
     switch (usage) {
@@ -459,6 +511,7 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
     for (uint32_t e = 0; e < s.entry->element_count; ++e) {
         const auto& el = s.entry->elements[e];
         const uint32_t d = uint32_t(base_dword) + uint32_t(el.address) * 3;
+        const uint32_t w0 = LoadBE32(ucode + d * 4);
         const uint32_t w1 = LoadBE32(ucode + (d + 1) * 4);
         const uint32_t w2 = LoadBE32(ucode + (d + 2) * 4);
         FetchedAttribute a;
@@ -470,6 +523,7 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
         a.signed_all = ((w1 >> 14) & 1) != 0;
         a.stride = (w2 & 0xFF) * 4;
         a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
+        a.fetch_const = ((w0 >> 20) & 0x1F) * 3 + ((w0 >> 25) & 0x3);
         if (a.format == 0 && a.stride == 0) {
             if (!s.logged_placeholder) {
                 s.logged_placeholder = true;
@@ -498,6 +552,141 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
         if (rf == plume::RenderFormat::UNKNOWN) {
             REXLOG_WARN("      ^^ UNMAPPED GPUVERTEXFORMAT {}", a.format);
         }
+    }
+}
+
+void BuildPipelines(const char* reason) {
+    if (!Enabled() || !g_init_ok) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (g_pipeline_layout == nullptr) {
+        plume::RenderPipelineLayoutDesc desc;
+        desc.allowInputLayout = true;
+        g_pipeline_layout = g_device->createPipelineLayout(desc);
+        if (g_pipeline_layout == nullptr) {
+            REXLOG_WARN("plume: createPipelineLayout failed; no pipelines can be built");
+            return;
+        }
+    }
+
+    uint32_t built = 0, waiting = 0, failed = 0;
+    for (uint32_t i = 0; i < g_combo_count; ++i) {
+        Combo& c = g_combos[i];
+        if (c.pipeline_state != PipelineState::kPending) {
+            built += (c.pipeline_state == PipelineState::kBuilt);
+            failed += (c.pipeline_state == PipelineState::kFailed);
+            continue;
+        }
+        auto vs = g_shaders.find(c.vs);
+        auto ps = g_shaders.find(c.ps);
+        if (vs == g_shaders.end() || ps == g_shaders.end() ||
+            vs->second.shader == nullptr || ps->second.shader == nullptr ||
+            !vs->second.layout_done) {
+            ++waiting;
+            continue;
+        }
+
+        // One input slot per distinct stride the layout uses. The UI shaders are
+        // de-interleaved (every attribute at offset 0 in its own stream) while
+        // the 3D path is a single interleaved buffer, so slots are assigned from
+        // what the vfetch operands actually say rather than assumed.
+        std::vector<plume::RenderInputSlot> slots;
+        std::vector<uint32_t> slot_consts;
+        std::vector<plume::RenderInputElement> elements;
+        bool usable = true;
+        for (const auto& a : vs->second.attributes) {
+            const auto fmt = ToRenderFormat(a.format, a.num_format_all, a.signed_all);
+            if (fmt == plume::RenderFormat::UNKNOWN) {
+                REXLOG_WARN("plume: combo {} unusable -- {}{} has unmapped GPUVERTEXFORMAT {}",
+                            i, UsageName(a.usage), a.usage_index, a.format);
+                usable = false;
+                break;
+            }
+            // One slot per FETCH CONSTANT (i.e. per stream). The 3D path has all
+            // five attributes on one constant with distinct offsets -> one slot;
+            // the UI paths have one constant each at offset 0 -> a slot each.
+            uint32_t slot = UINT32_MAX;
+            for (uint32_t s = 0; s < slot_consts.size(); ++s) {
+                if (slot_consts[s] == a.fetch_const) { slot = s; break; }
+            }
+            if (slot == UINT32_MAX) {
+                // STRIDE IS PER-DRAW, NOT PER-SHADER. The same shader is bound
+                // with different strides: combo 0 uses s0/12 s3/4 s8/8 while
+                // combo 1 uses s0/24 s3/24 s8/24, and the ground-truth vfetch
+                // dump shows fetch constant 95 with 3, 4, 6 and 9 dwords. So the
+                // stride comes from THIS combination's SetStreamSource bindings;
+                // only the format and offset are properties of the shader.
+                //
+                // Fetch constants are allocated downward from 95, so
+                // stream = 95 - fetch_const (observed: s0->95, s3->92, s8->87,
+                // and the 3D path's single stream 0 -> 95). Validated below
+                // rather than assumed.
+                const uint32_t stream = (a.fetch_const <= 95u) ? (95u - a.fetch_const) : UINT32_MAX;
+                uint32_t stride = 0;
+                for (uint32_t k = 0; k < c.stream_count; ++k) {
+                    if (c.streams[k].stream == stream) { stride = c.streams[k].stride; break; }
+                }
+                if (stride == 0) {
+                    REXLOG_WARN("plume: combo {} {}{} maps to fetch const {} -> stream {}, which "
+                                "this combination never bound; falling back to the shader's "
+                                "stride {}", i, UsageName(a.usage), a.usage_index,
+                                a.fetch_const, stream, a.stride);
+                    stride = a.stride;
+                } else if (stride != a.stride) {
+                    REXLOG_WARN("plume: combo {} stream {} stride {} (bound) vs {} (shader) -- "
+                                "using the bound one", i, stream, stride, a.stride);
+                }
+                slot = uint32_t(slots.size());
+                slot_consts.push_back(a.fetch_const);
+                slots.emplace_back(slot, stride);
+            }
+            elements.emplace_back(SemanticName(a.usage), a.usage_index,
+                                  VulkanLocation(a.usage, a.usage_index), fmt, slot, a.offset);
+        }
+        if (!usable) { c.pipeline_state = PipelineState::kFailed; ++failed; continue; }
+
+        plume::RenderGraphicsPipelineDesc desc;
+        desc.pipelineLayout = g_pipeline_layout.get();
+        desc.vertexShader = vs->second.shader.get();
+        desc.pixelShader = ps->second.shader.get();
+        desc.inputSlots = slots.data();
+        desc.inputSlotsCount = uint32_t(slots.size());
+        desc.inputElements = elements.data();
+        desc.inputElementsCount = uint32_t(elements.size());
+        desc.renderTargetFormat[0] = kRenderTargetFormat;
+        desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
+        desc.renderTargetCount = 1;
+        desc.depthTargetFormat = kDepthTargetFormat;
+        // QUADLIST and TRIANGLEFAN both become an indexed TRIANGLE_LIST: neither
+        // exists in D3D12/Vulkan, and both expand with a static index pattern
+        // (0,1,2, 0,2,3 per quad; 0,i,i+1 for a fan). See RENDERER_INPUT_SPEC.md.
+        desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+
+        c.pipeline = g_device->createGraphicsPipeline(desc);
+        if (c.pipeline == nullptr) {
+            c.pipeline_state = PipelineState::kFailed;
+            ++failed;
+            REXLOG_WARN("plume: pipeline {} FAILED ({} + {}, {})", i,
+                        vs->second.entry->name, ps->second.entry->name, TopologyName(c.topology));
+            continue;
+        }
+        c.pipeline_state = PipelineState::kBuilt;
+        ++built;
+        std::string desc_str;
+        for (const auto& e : elements) {
+            desc_str += std::string(e.semanticName) + std::to_string(e.semanticIndex) +
+                        "@" + std::to_string(e.alignedByteOffset) +
+                        "/s" + std::to_string(e.slotIndex) +
+                        "(fc" + std::to_string(slot_consts[e.slotIndex]) + ") ";
+        }
+        REXLOG_WARN("plume: pipeline {} BUILT  {} + {}  {} -> TRIANGLE_LIST  slots={} : {}",
+                    i, vs->second.entry->name, ps->second.entry->name,
+                    TopologyName(c.topology), slots.size(), desc_str);
+    }
+    if (built || waiting || failed) {
+        REXLOG_WARN("plume: pipelines ({}) -- built {} / waiting on layout {} / failed {} "
+                    "(of {} observed combinations)",
+                    reason, built, waiting, failed, g_combo_count);
     }
 }
 
@@ -543,6 +732,7 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
             const auto& el = s.entry->elements[e];
             const uint32_t d = uint32_t(el.address) * 3;
             if ((d + 3) * 4 > s.code.size()) { all_patched = false; break; }
+            const uint32_t w0 = LoadBE32(code + d * 4);
             const uint32_t w1 = LoadBE32(code + (d + 1) * 4);
             const uint32_t w2 = LoadBE32(code + (d + 2) * 4);
             FetchedAttribute a;
@@ -554,6 +744,7 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
             a.signed_all = ((w1 >> 14) & 1) != 0;
             a.stride = (w2 & 0xFF) * 4;            // instruction stores dwords
             a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
+            a.fetch_const = ((w0 >> 20) & 0x1F) * 3 + ((w0 >> 25) & 0x3);
             // format 0 and stride 0 is the unpatched placeholder the compiler
             // emits; that shader simply has not been bound yet.
             if (a.format == 0 && a.stride == 0) { all_patched = false; break; }
@@ -784,6 +975,8 @@ void Dump(const char* reason) {
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_shaders.clear();
+    for (uint32_t i = 0; i < g_combo_count; ++i) g_combos[i].pipeline.reset();
+    g_pipeline_layout.reset();
     g_device.reset();
     g_interface.reset();
     g_init_ok = false;
