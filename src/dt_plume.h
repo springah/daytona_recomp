@@ -34,7 +34,24 @@ void OnShaderCreated(uint64_t container_hash, bool is_vertex);
 // hash it was built from. This is the only place the two are visible together,
 // and it is what lets SetVertexShader/SetPixelShader (which pass an opaque
 // handle) be resolved back to a shader we have a blob for.
-void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash);
+//
+// `code`/`code_size` are the container's physical region -- the microcode as
+// created. It is kept so the LIVE copy can be located inside the shader object
+// later: the guest D3D9 runtime patches the vertex layout into the vfetch
+// instructions at bind time (proven, commit 3755cbc), and that patched copy is
+// the only place the vertex format, stride and offset ever appear.
+void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash,
+                    const uint8_t* code, uint32_t code_size);
+
+// Resolve a guest address to a host pointer. The caller owns `base`, which the
+// REX_RAW_ADDR macro needs in scope, so it is supplied as a callback.
+using GuestResolve = const uint8_t* (*)(uint32_t ea, void* ctx);
+
+// Locate each shader's live microcode and decode the patched vfetch operands
+// into a vertex input layout. Safe to call repeatedly; a layout is only derived
+// once the runtime has actually patched that shader (i.e. once it has been
+// bound), so early calls simply report nothing yet.
+void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx);
 
 // ── Draw-state shadow ────────────────────────────────────────────────────────
 // Argument decoding lives in gen_trace.py's SEMANTIC map, from the XDK 20500

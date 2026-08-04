@@ -5,6 +5,7 @@
 #include <rex/logging.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,9 +33,28 @@ std::unique_ptr<plume::RenderDevice> g_device;
 plume::RenderShaderFormat g_shader_format = plume::RenderShaderFormat::UNKNOWN;
 const char* g_backend = "none";
 
+// One decoded vfetch, i.e. one vertex input attribute.
+struct FetchedAttribute {
+    uint8_t usage = 0;
+    uint8_t usage_index = 0;
+    uint32_t instruction = 0;   // microcode instruction index (element `address`)
+    uint32_t format = 0;        // GPUVERTEXFORMAT
+    uint32_t stride = 0;        // bytes (the instruction stores dwords)
+    uint32_t offset = 0;        // bytes
+    bool num_format_all = false;
+    bool signed_all = false;
+};
+
 struct Created {
     const dt_shader_blobs::Entry* entry = nullptr;
     std::unique_ptr<plume::RenderShader> shader;
+
+    uint32_t object_ea = 0;
+    std::vector<uint8_t> code;   // microcode as created (pre-patch)
+    uint32_t code_ea = 0;        // where the LIVE copy lives, once located
+    bool located = false;
+    bool layout_done = false;
+    std::vector<FetchedAttribute> attributes;
 };
 std::unordered_map<uint64_t, Created> g_shaders;
 
@@ -153,6 +173,28 @@ const char* TopologyName(uint32_t t) {
 // XenosRecomp invokes DXC without -E, so the entry point is the default and the
 // generated HLSL declares `void main(...)`.
 constexpr const char* kEntryPoint = "main";
+
+uint32_t LoadBE32(const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+}
+
+// Image is 0x82000000-based; the guest heap this title uses runs 0xA0000000+.
+bool PlausibleGuestPointer(uint32_t v) {
+    return (v >= 0x82000000u && v < 0x83500000u) || (v >= 0xA0000000u && v < 0xD0000000u);
+}
+
+// GPUVERTEXFORMAT (d3d9gpu.h). Only the ones this title has been seen to use are
+// named; anything else prints its number so it shows up as unhandled rather than
+// being silently mapped to something plausible.
+const char* VertexFormatName(uint32_t f) {
+    switch (f) {
+        case 6:  return "8_8_8_8";
+        case 37: return "32_32_FLOAT";
+        case 57: return "32_32_32_FLOAT";
+        case 38: return "32_32_32_32_FLOAT";
+        default: return "UNHANDLED";
+    }
+}
 
 const char* UsageName(uint8_t usage) {
     switch (usage) {
@@ -284,10 +326,95 @@ void OnShaderCreated(uint64_t container_hash, bool is_vertex) {
     g_shaders.emplace(container_hash, std::move(created));
 }
 
-void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash) {
+void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash,
+                    const uint8_t* code, uint32_t code_size) {
     if (!Enabled() || shader_object_ea == 0) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_shader_objects[shader_object_ea] = container_hash;
+    auto it = g_shaders.find(container_hash);
+    if (it == g_shaders.end()) return;
+    it->second.object_ea = shader_object_ea;
+    if (code != nullptr && code_size != 0 && it->second.code.empty()) {
+        it->second.code.assign(code, code + code_size);
+    }
+}
+
+void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
+    if (!Enabled() || resolve == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    uint32_t derived = 0, pending = 0;
+    for (auto& [hash, s] : g_shaders) {
+        if (s.entry == nullptr || !s.entry->is_vertex) continue;   // only vfetch matters
+        if (s.layout_done) { ++derived; continue; }
+        if (s.code.empty() || s.object_ea == 0) { ++pending; continue; }
+
+        // Locate the live microcode: scan the object's leading dwords for a
+        // pointer whose target matches the code captured at creation. Located,
+        // not hardcoded -- object+32 held for every vertex shader observed, but
+        // that is an observation, not a documented layout.
+        if (!s.located) {
+            const uint8_t* obj = resolve(s.object_ea, ctx);
+            if (obj == nullptr) { ++pending; continue; }
+            const size_t probe = s.code.size() < 32 ? s.code.size() : 32;
+            for (uint32_t i = 0; i < 32 && !s.located; ++i) {
+                const uint32_t cand = LoadBE32(obj + i * 4);
+                if (!PlausibleGuestPointer(cand)) continue;
+                const uint8_t* p = resolve(cand, ctx);
+                if (p != nullptr && std::memcmp(p, s.code.data(), probe) == 0) {
+                    s.code_ea = cand;
+                    s.located = true;
+                }
+            }
+            if (!s.located) { ++pending; continue; }
+        }
+
+        const uint8_t* code = resolve(s.code_ea, ctx);
+        if (code == nullptr) { ++pending; continue; }
+
+        // Decode one vfetch per declared vertex element. dt_shader_blobs carries
+        // each element's microcode instruction index in `address`, and each
+        // instruction is 3 dwords.
+        std::vector<FetchedAttribute> attrs;
+        bool all_patched = true;
+        for (uint32_t e = 0; e < s.entry->element_count; ++e) {
+            const auto& el = s.entry->elements[e];
+            const uint32_t d = uint32_t(el.address) * 3;
+            if ((d + 3) * 4 > s.code.size()) { all_patched = false; break; }
+            const uint32_t w1 = LoadBE32(code + (d + 1) * 4);
+            const uint32_t w2 = LoadBE32(code + (d + 2) * 4);
+            FetchedAttribute a;
+            a.usage = el.usage;
+            a.usage_index = el.usage_index;
+            a.instruction = el.address;
+            a.format = (w1 >> 16) & 0x3F;
+            a.num_format_all = ((w1 >> 13) & 1) != 0;
+            a.signed_all = ((w1 >> 14) & 1) != 0;
+            a.stride = (w2 & 0xFF) * 4;            // instruction stores dwords
+            a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
+            // format 0 and stride 0 is the unpatched placeholder the compiler
+            // emits; that shader simply has not been bound yet.
+            if (a.format == 0 && a.stride == 0) { all_patched = false; break; }
+            attrs.push_back(a);
+        }
+        if (!all_patched || attrs.empty()) { ++pending; continue; }
+
+        s.attributes = std::move(attrs);
+        s.layout_done = true;
+        ++derived;
+
+        REXLOG_WARN("plume: vertex layout for {} (microcode @{:08X})", s.entry->name, s.code_ea);
+        for (const auto& a : s.attributes) {
+            REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {}",
+                        UsageName(a.usage), a.usage_index, a.instruction,
+                        a.format, VertexFormatName(a.format), a.stride, a.offset);
+        }
+    }
+    if (derived || pending) {
+        REXLOG_WARN("plume: vertex layouts ({}) -- derived {} / pending {} "
+                    "(pending = shader not bound yet, so not patched yet)",
+                    reason, derived, pending);
+    }
 }
 
 void OnSetVertexShader(uint32_t shader_ea) {

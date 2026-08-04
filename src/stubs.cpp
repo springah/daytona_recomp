@@ -264,6 +264,11 @@ REX_HOOK_RAW(sub_82233C80) {
             dt_shader_patchtest::Check(frames == 600 ? "frame 600" : "frame 3600",
                                        PatchTestResolve, base);
         }
+        // Layouts only exist once the runtime has patched a shader, which only
+        // happens when the game binds it, so keep retrying as content changes.
+        if ((frames % 600) == 0) {
+            dt_plume::DeriveVertexLayouts("periodic", PatchTestResolve, base);
+        }
     }
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDeviceSwap, ctx);
 
@@ -370,9 +375,10 @@ DT_TRACE_HOOK_AFTER(sub_82241740, daytona_debug::HookId::kUiTextureSizeB)       
     REX_HOOK_RAW(name) {                                                       \
         const uint32_t fn = ctx.r3.u32;                                        \
         uint64_t hash = 0;                                                     \
+        uint32_t vsz = 0, psz = 0;                                             \
         if (fn != 0) {                                                         \
-            const uint32_t vsz = REX_LOAD_U32(fn + 4);                         \
-            const uint32_t psz = REX_LOAD_U32(fn + 8);                         \
+            vsz = REX_LOAD_U32(fn + 4);                                        \
+            psz = REX_LOAD_U32(fn + 8);                                        \
             hash = dt_shader_dump::Record((is_vertex), fn, vsz, psz,           \
                                           REX_RAW_ADDR(fn));                   \
             if (hash != 0) {                                                   \
@@ -382,7 +388,10 @@ DT_TRACE_HOOK_AFTER(sub_82241740, daytona_debug::HookId::kUiTextureSizeB)       
         }                                                                      \
         __imp__##name(ctx, base);                                              \
         if (hash != 0) {                                                       \
-            dt_plume::OnShaderObject(ctx.r3.u32, hash);                        \
+            /* Microcode = the container's physical region, kept so the LIVE */ \
+            /* patched copy can be located inside the shader object later.  */ \
+            dt_plume::OnShaderObject(ctx.r3.u32, hash,                         \
+                                     REX_RAW_ADDR(fn) + vsz, psz);             \
             dt_shader_patchtest::RememberObject(hash, ctx.r3.u32);             \
         }                                                                      \
         uint32_t n = daytona_debug::RecordHook((id), ctx);                     \
