@@ -20,7 +20,7 @@
     }
 
 
-DT_D3D9_TRACE(sub_8213DB98, 0)  // (unidentified)
+DT_D3D9_TRACE(sub_8213DB98, 0)  // NOT-D3D9:CoproPopPolarPair
 DT_D3D9_TRACE(sub_82161FE0, 1)  // (unidentified)
 DT_D3D9_TRACE(sub_821B7000, 2)  // ??0Disassembler@D3D@@QAA@P6AJPAXPBDK@Z0P6AJ0KI0I@Z0@Z
 DT_D3D9_TRACE(sub_821C29D0, 3)  // ?DoPrint@Disassembler@D3D@@AAAXPBDPAD@Z

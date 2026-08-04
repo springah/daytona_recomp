@@ -587,19 +587,53 @@
 // Dispatch on r3, slot +28
 #define ObjDispatch_r3_28            sub_821ED648
 
-// ── Sound / cue system (0x8213DCxx / 0x821E9Cxx) ─────────────────────────────
-// Looks up sound definition by ID in table at image_base+11368; returns 1 if found
-#define SoundLookup                  sub_8213DC50
-// Writes one entry into the sound ring buffer; returns whether free slots remain
-#define SoundQueueWrite              sub_8213DC90
-// Reads remaining-count from the sound ring buffer (used after lookup)
-#define SoundQueueRead               sub_8213DCE0
-// Trigger a sound cue: lookup by (r3>>4 bits), queue if found, store to global
-#define SoundCueTrigger              sub_821E9CC8
-// Poll sound cue with a different lookup path (no explicit ID in r3)
-#define SoundCuePoll                 sub_821E9D18
-// Dequeue one entry from the sound ring buffer (ring-buffer pop)
-#define SoundDequeue                 sub_821E9D60
+// ── Geometry coprocessor (0x82139xxx-0x8213Exxx, API at 0x821E9Cxx) ──────────
+// NOT sound. This whole block was previously mislabelled as a "sound / cue
+// system"; the record at image_base+11368 holds a FUNCTION POINTER at +0 that
+// sub_8213DCE0 calls through `bctrl`, which a sound definition does not.
+//
+// It is a software implementation of a FIFO-fed geometry coprocessor (the
+// Model 2 TGP programming model), preserved from the arcade original:
+//
+//   * opcode dispatch table @ 0x82002C68 (image_base+11368), 16-byte records
+//     of { void (*fn)(); u32 n_input_words; ... }
+//   * input  FIFO @ 0x82B2BE18 -- 256 u32 ring, head +1024, count +1028,
+//     pending-arg countdown +1032
+//   * output FIFO @ 0x82B2C230 -- same layout; drained by sub_82139E10
+//   * result buffer @ 0x82E288A8 -- what the guest-facing API pops from
+//   * 65,536-entry float sine table @ 0x82003130, indexed by a 16-bit BAM
+//     angle; cos is the same table read at (angle + 16384)
+//
+// 34 opcode bodies live in 0x82139000-0x8213F000, reachable ONLY through the
+// dispatch table (no direct callers): scalar add/sub/mul, matrix load/move,
+// 3x3 matrix multiply, rotate-about-X/Y/Z, cross/dot + compare, polar convert.
+// Callers of the API are the ~28 game functions in 0x82166xxx-0x82172xxx.
+
+// Select an opcode: table[r3] -> current record, load its input-word count.
+// Returns 1 when the opcode takes NO arguments (caller may execute at once).
+#define CoproSelectOp                sub_8213DC50   // was mislabelled "SoundLookup"
+// Push one word into the input FIFO. Returns 1 when the pending-arg countdown
+// reaches zero, i.e. the opcode is now ready to execute.
+#define CoproPushArgWord             sub_8213DC90   // was mislabelled "SoundQueueWrite"
+// Execute: call the current record's function pointer via bctrl, reset the
+// input FIFO, then drain the output FIFO. NOT a read of anything.
+#define CoproExecuteOp               sub_8213DCE0   // was mislabelled "SoundQueueRead"
+// Guest-facing API: submit opcode (passed pre-shifted <<4), auto-execute if arity 0
+#define CoproCommand                 sub_821E9CC8   // was mislabelled "SoundCueTrigger"
+// Guest-facing API: push one argument word, auto-execute once arity is satisfied
+#define CoproPushArg                 sub_821E9D18   // was mislabelled "SoundCuePoll"
+// Guest-facing API: pop one result word; resets the buffer when drained
+#define CoproPopResult               sub_821E9D60   // was mislabelled "SoundDequeue"
+
+// sin/cos from a 16-bit BAM angle: *r3 = SIN[r5], *r4 = SIN[r5+16384] = COS[r5]
+#define CoproSinCos                  sub_8213EE58
+// Pop (angle16, magnitude_f32) off the input FIFO and convert polar->cartesian:
+// *r3 = magnitude * sin(angle), *r4 = magnitude * cos(angle).
+// Helper shared by three opcode bodies (sub_8213E008/E098/E2C0), NOT a D3D9
+// entry point -- it was hooked only because a signature scan mis-matched it to
+// d3d9.lib's __FusionFlushVertexCache. Its 59 calls/frame during a race are
+// guest geometry math and touch no GPU state.
+#define CoproPopPolarPair            sub_8213DB98
 
 // ── GPU draw-call dispatch layer (0x8225xxxx-0x8226xxxx) ─────────────────────
 // Validates vertex/index buffer sizes before a draw; returns error if overflow

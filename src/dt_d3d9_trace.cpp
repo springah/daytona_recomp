@@ -13,7 +13,7 @@
 namespace dt_d3d9_trace {
 
 const Entry kEntries[kEntryCount] = {
-    {0x8213DB98, "sub_8213DB98", "", 45, 3},
+    {0x8213DB98, "sub_8213DB98", "NOT-D3D9:CoproPopPolarPair", 45, 3},
     {0x82161FE0, "sub_82161FE0", "", 64, 5},
     {0x821B7000, "sub_821B7000", "??0Disassembler@D3D@@QAA@P6AJPAXPBDK@Z0P6AJ0KI0I@Z0@Z", 21, 2},
     {0x821C29D0, "sub_821C29D0", "?DoPrint@Disassembler@D3D@@AAAXPBDPAD@Z", 63, 3},
