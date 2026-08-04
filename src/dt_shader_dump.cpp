@@ -1,5 +1,7 @@
 #include "dt_shader_dump.h"
 
+#include "dt_plume.h"
+
 #include <rex/logging.h>
 
 #include <atomic>
@@ -50,7 +52,10 @@ void Record(bool is_vertex,
             uint32_t physical_size,
             const uint8_t* raw) {
     (is_vertex ? g_vs_calls : g_ps_calls).fetch_add(1, std::memory_order_relaxed);
-    if (!Enabled() || raw == nullptr) return;
+    // The hash is needed by the plume renderer too (it keys dt_shader_blobs), so
+    // validate and hash whenever EITHER consumer is on -- only the file write is
+    // gated on DT_DUMP_SHADERS.
+    if (raw == nullptr || (!Enabled() && !dt_plume::Enabled())) return;
 
     const uint64_t total64 = static_cast<uint64_t>(virtual_size) + physical_size;
     if (total64 < kMinBlob || total64 > kMaxBlob) {
@@ -65,6 +70,12 @@ void Record(bool is_vertex,
     }
     const size_t total = static_cast<size_t>(total64);
     const uint64_t hash = Fnv1a(raw, total);
+
+    // Hand the shader to the native renderer before the dump bookkeeping, so it
+    // still sees every shader when DT_DUMP_SHADERS is off.
+    dt_plume::OnShaderCreated(hash, is_vertex);
+
+    if (!Enabled()) return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_seen.insert(hash).second) return;   // already dumped this exact blob

@@ -6,6 +6,7 @@
 #include "daytona_symbols.h"
 #include "dt_d3d9_trace.h"
 #include "dt_shader_dump.h"
+#include "dt_plume.h"
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/system/xtypes.h>
@@ -219,6 +220,7 @@ REX_HOOK_RAW(sub_82233C80) {
         static uint32_t frames = 0;
         if ((++frames % 1800) == 0) daytona_debug::LogCensus("periodic");
         if ((frames % 1800) == 0) dt_shader_dump::Dump("periodic");
+        if ((frames % 1800) == 0) dt_plume::Dump("periodic");
     }
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDeviceSwap, ctx);
 

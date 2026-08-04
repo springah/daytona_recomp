@@ -25,7 +25,19 @@ set(DAYTONA_SOURCES
     # DT_NOAUDIO: silent-but-functional audio for unattended runs.
     src/dt_null_audio.cpp
     src/dt_shader_dump.cpp
+    # Native renderer (spike): plume bring-up + the game's 9 precompiled shaders.
+    # dt_shader_blobs.cpp is GENERATED -- see _tools/daytona_d3d9_sigscan/gen_shader_blobs.py.
+    src/dt_shader_blobs.cpp
+    src/dt_plume.cpp
 )
+
+# plume (renderbag) -- the RHI the native renderer targets, replacing rexglue's
+# Xenos GPU emulation. Vendored as a submodule with its own contrib deps (volk,
+# Vulkan-Headers, VulkanMemoryAllocator, D3D12MemoryAllocator), so this does not
+# depend on the UnleashedRecomp checkout. D3D12 is the first backend: the shader
+# blobs are signed DXIL and verified.
+set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(thirdparty/plume EXCLUDE_FROM_ALL)
 
 # Embed the application icon + VERSIONINFO resource (visible in Explorer /
 # taskbar) via a Windows resource script generated with the absolute .ico path
@@ -54,6 +66,13 @@ rexglue_setup_target(daytona)
 # Version for the window title (see main.cpp OnPreLaunchModule). Passed unquoted
 # and stringized in-source so it survives both the clang-cl and clang++ drivers.
 target_compile_definitions(daytona PRIVATE DAYTONA_VERSION=${PROJECT_VERSION})
+
+# plume. Linked but inert unless DT_PLUME is set in the environment -- see
+# src/dt_plume.cpp.
+target_link_libraries(daytona PRIVATE plume)
+if(WIN32)
+    target_link_libraries(daytona PRIVATE d3d12 dxgi)
+endif()
 
 # ppc_config.h / ppc_detail.h are daytona's local PPC context detail headers,
 # pulled in when PPC_INCLUDE_DETAIL is set.
