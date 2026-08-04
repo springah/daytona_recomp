@@ -54,7 +54,9 @@ struct Created {
     uint32_t code_ea = 0;        // where the LIVE copy lives, once located
     bool located = false;
     bool layout_done = false;
-    bool diagnosed = false;
+    bool diagnosed_stored = false;      // DeriveVertexLayouts' unpatched dump
+    bool diagnosed_incremental = false; // OnIncrementalPatch's anchor dump
+    bool logged_placeholder = false;    // ucode still holds placeholder operands
     std::vector<FetchedAttribute> attributes;
 };
 std::unordered_map<uint64_t, Created> g_shaders;
@@ -391,9 +393,22 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
     // Log the first few unconditionally: "no output" must be distinguishable
     // from "never called". The menu takes DirectShaderPatch, so zero calls there
     // is the expected result, not a broken hook.
-    if (g_incremental_calls <= 4) {
-        REXLOG_WARN("plume: IncrementalShaderPatchAndLoad #{} shader={:08X} decl={:08X} ucode={:08X}",
-                    g_incremental_calls, shader_ea, decl_ea, ucode_ea);
+    {
+        auto oit = g_shader_objects.find(shader_ea);
+        const char* who = "(unknown object)";
+        if (oit != g_shader_objects.end()) {
+            auto e = dt_shader_blobs::Find(oit->second);
+            if (e) who = e->name;
+        }
+        // Log the first call FOR EACH DISTINCT SHADER, not just the first few
+        // overall -- the shader that matters may not be among the first.
+        static std::unordered_map<uint32_t, bool> seen;
+        if (!seen[shader_ea]) {
+            seen[shader_ea] = true;
+            REXLOG_WARN("plume: IncrementalShaderPatchAndLoad first call for {} "
+                        "(shader={:08X} decl={:08X} ucode={:08X})",
+                        who, shader_ea, decl_ea, ucode_ea);
+        }
     }
     if (ucode_ea == 0 || resolve == nullptr) return;
 
@@ -423,8 +438,8 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
         }
     }
     if (base_dword < 0) {
-        if (!s.diagnosed) {
-            s.diagnosed = true;
+        if (!s.diagnosed_incremental) {
+            s.diagnosed_incremental = true;
             REXLOG_WARN("plume: {} incremental patch -- anchor {:08X} not found in ucode@{:08X}; "
                         "first 12 dwords: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
                         "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
@@ -452,7 +467,17 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
         a.signed_all = ((w1 >> 14) & 1) != 0;
         a.stride = (w2 & 0xFF) * 4;
         a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
-        if (a.format == 0 && a.stride == 0) return;   // still placeholder
+        if (a.format == 0 && a.stride == 0) {
+            if (!s.logged_placeholder) {
+                s.logged_placeholder = true;
+                REXLOG_WARN("plume: {} incremental ucode@{:08X}+{} STILL PLACEHOLDER at "
+                            "insn {} (w1={:08X} w2={:08X}) -- r8 is likely the SOURCE "
+                            "ucode, with the patched copy going into the PM4 stream",
+                            s.entry->name, ucode_ea, base_dword, el.address,
+                            LoadBE32(ucode + (d + 1) * 4), LoadBE32(ucode + (d + 2) * 4));
+            }
+            return;
+        }
         attrs.push_back(a);
     }
     if (attrs.empty()) return;
@@ -539,8 +564,8 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
             // this path has decl=NULL. Dump what is actually there, and every
             // other plausible pointer in the object, in case the runtime keeps
             // a second (patched) microcode copy per declaration.
-            if (!s.diagnosed) {
-                s.diagnosed = true;
+            if (!s.diagnosed_stored) {
+                s.diagnosed_stored = true;
                 REXLOG_WARN("plume: {} NOT PATCHED -- diagnostic (object@{:08X} code@{:08X})",
                             s.entry->name, s.object_ea, s.code_ea);
                 for (uint32_t e = 0; e < s.entry->element_count; ++e) {
