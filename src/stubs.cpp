@@ -106,11 +106,31 @@ const char* DeclUsageName(uint8_t usage) {
 // sub_8212F598, which stores Stream/Offset with sth and Method/Usage/UsageIndex
 // with stb into a stack frame). Logged at WARN so it survives the shipped
 // log_level=warn.
-void DumpVertexElements(uint32_t elements_ea, uint8_t* base) {
-    static bool dumped = false;
-    if (dumped || elements_ea == 0) return;
-    dumped = true;   // Daytona creates exactly one declaration; see dt_d3d9_trace
-    REXLOG_WARN("===== D3DVERTEXELEMENT9[] @ {:08X} =====", elements_ea);
+// `decl_object_ea` is what CreateVertexDeclaration RETURNED -- the handle
+// SetVertexDeclaration later binds -- so the layout can be tied to the draws
+// that use it (dt_plume's census reports declarations by that address).
+//
+// This used to dump only the first declaration, on the belief that Daytona
+// created exactly one. Measured 2026-08-04 under race load: FOUR distinct
+// declarations are bound (A570EBC0, A570EB20, A570EC60 and NULL), and the one
+// the first-created guard captured was the menu's, not the one behind 94.6% of
+// drawing. Dump every distinct one.
+void DumpVertexElements(uint32_t elements_ea, uint32_t decl_object_ea, uint8_t* base) {
+    static uint32_t seen[16];
+    static uint32_t seen_count = 0;
+    if (elements_ea == 0) return;
+    for (uint32_t i = 0; i < seen_count; ++i) {
+        if (seen[i] == decl_object_ea) return;
+    }
+    if (seen_count < 16) {
+        seen[seen_count++] = decl_object_ea;
+    } else {
+        return;   // 16 distinct declarations would itself be news; don't spam
+    }
+
+    REXLOG_WARN("===== D3DVERTEXELEMENT9[] #{} decl={:08X} elements@{:08X} =====",
+                seen_count, decl_object_ea, elements_ea);
+    uint32_t max_end[8] = {};   // per-stream high-water mark, to recover the stride
     for (uint32_t i = 0; i < 64; ++i) {
         const uint32_t p      = elements_ea + i * 12;
         const uint16_t stream = REX_LOAD_U16(p);
@@ -118,10 +138,18 @@ void DumpVertexElements(uint32_t elements_ea, uint8_t* base) {
             REXLOG_WARN("   [{:2}] END (stream=0x{:X})", i, stream);
             break;
         }
+        const uint16_t offset = REX_LOAD_U16(p + 2);
+        const uint32_t type   = REX_LOAD_U32(p + 4);
         REXLOG_WARN("   [{:2}] stream={:<2} offset={:<4} type=0x{:08X} method={} usage={} ({}) index={}",
-                    i, stream, REX_LOAD_U16(p + 2), REX_LOAD_U32(p + 4),
+                    i, stream, offset, type,
                     REX_LOAD_U8(p + 8), REX_LOAD_U8(p + 9),
                     DeclUsageName(REX_LOAD_U8(p + 9)), REX_LOAD_U8(p + 10));
+        if (stream < 8 && offset > max_end[stream]) max_end[stream] = offset;
+    }
+    // The stream strides come from SetStreamSource, not from here; printing the
+    // highest offset per stream is enough to sanity-check them against it.
+    for (uint32_t s = 0; s < 8; ++s) {
+        if (max_end[s]) REXLOG_WARN("   stream {} highest element offset = {}", s, max_end[s]);
     }
     REXLOG_WARN("===== end D3DVERTEXELEMENT9[] =====");
 }
@@ -283,9 +311,12 @@ DT_TRACE_HOOK_AFTER(sub_822207F8, daytona_debug::HookId::kBootUnlockAllocA)   //
 // so capture it before calling through. The trace shows Daytona binds only ONE
 // declaration game-wide, so this dump is the whole vertex format.
 REX_HOOK_RAW(sub_82223EA8) {
+    // D3DDevice_CreateVertexDeclaration(CONST D3DVERTEXELEMENT9* pVertexElements)
+    // -- one argument in r3, returns the D3DVertexDeclaration* in r3 (XDK 20500
+    // d3d9.h:2274; identity confirmed by an exact bit-field signature match).
     const uint32_t elements = ctx.r3.u32;
     __imp__sub_82223EA8(ctx, base);
-    DumpVertexElements(elements, base);
+    DumpVertexElements(elements, ctx.r3.u32, base);
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kBootMakeDraw, ctx);
     if (ShouldLog(n)) {
         LogGuestCall("CreateVertexDeclaration", n, ctx);
