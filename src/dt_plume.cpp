@@ -193,6 +193,7 @@ bool PlausibleGuestPointer(uint32_t v) {
 const char* VertexFormatName(uint32_t f) {
     switch (f) {
         case 6:  return "8_8_8_8";
+        case 36: return "32_FLOAT";
         case 37: return "32_32_FLOAT";
         case 57: return "32_32_32_FLOAT";
         case 38: return "32_32_32_32_FLOAT";
@@ -208,6 +209,8 @@ plume::RenderFormat ToRenderFormat(uint32_t gpu_format, bool num_format_all, boo
     switch (gpu_format) {
         case 57:  // 32_32_32_FLOAT
             return plume::RenderFormat::R32G32B32_FLOAT;
+        case 36:  // 32_FLOAT -- Daytona's DEPTH0 attribute
+            return plume::RenderFormat::R32_FLOAT;
         case 37:  // 32_32_FLOAT
             return plume::RenderFormat::R32G32_FLOAT;
         case 38:  // 32_32_32_32_FLOAT
