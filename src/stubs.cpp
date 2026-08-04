@@ -269,6 +269,7 @@ REX_HOOK_RAW(sub_82233C80) {
         if ((frames % 600) == 0) {
             dt_plume::DeriveVertexLayouts("periodic", PatchTestResolve, base);
             dt_plume::BuildPipelines("periodic");
+            dt_plume::BuildIndexBuffers();
         }
     }
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDeviceSwap, ctx);

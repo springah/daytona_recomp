@@ -31,6 +31,16 @@ bool g_init_ok = false;
 std::unique_ptr<plume::RenderInterface> g_interface;
 std::unique_ptr<plume::RenderDevice> g_device;
 std::unique_ptr<plume::RenderPipelineLayout> g_pipeline_layout;
+
+// Static expansion index buffers. Neither depends on vertex data, so one per
+// topology serves every draw. Peak observed VertexCount is 1624 (census);
+// 4096 leaves headroom and still fits 16-bit indices.
+enum class IndexState { kNone, kReady, kFailed };
+constexpr uint32_t kMaxExpandVerts = 4096;
+constexpr uint32_t kSnapshotsPerShader = 2;
+IndexState g_index_state = IndexState::kNone;
+std::unique_ptr<plume::RenderBuffer> g_quad_indices;
+std::unique_ptr<plume::RenderBuffer> g_fan_indices;
 plume::RenderShaderFormat g_shader_format = plume::RenderShaderFormat::UNKNOWN;
 const char* g_backend = "none";
 
@@ -64,6 +74,8 @@ struct Created {
     bool diagnosed_incremental = false; // OnIncrementalPatch's anchor dump
     bool logged_placeholder = false;    // ucode still holds placeholder operands
     std::vector<FetchedAttribute> attributes;
+    uint32_t snapshots = 0;
+    bool snapshot_overflow = false;
 };
 std::unordered_map<uint64_t, Created> g_shaders;
 
@@ -119,6 +131,13 @@ StreamBinding g_streams[kMaxStreams];
 uint32_t g_cur_vs_ea = 0;
 uint32_t g_cur_ps_ea = 0;
 uint32_t g_cur_decl_ea = 0;
+uint32_t g_device_ea = 0;   // guest CDevice*, r3 on every D3D9 entry point
+// Latched by OnDrawVertices BEFORE __imp__ runs. The post-draw snapshot
+// cannot re-read g_cur_vs_ea: the draw flushes state through these same
+// hooks, so by then it names whatever the flush bound last.
+uint64_t g_draw_vs = 0;
+uint32_t g_draw_start = 0;
+uint32_t g_draw_count = 0;
 Combo g_combos[kMaxCombos];
 uint32_t g_combo_count = 0;
 uint64_t g_draws = 0;
@@ -247,6 +266,18 @@ plume::RenderFormat ToRenderFormat(uint32_t gpu_format, bool num_format_all, boo
 // attribute has 8- or 16-bit components the pattern differs per attribute --
 // which is precisely why the derived layout is needed for the UPLOAD path, not
 // only for the input layout.
+// Total bytes an attribute occupies, needed to bound the swap.
+uint32_t AttributeBytes(uint32_t gpu_format) {
+    switch (gpu_format) {
+        case 6:  return 4;    // 8_8_8_8
+        case 36: return 4;    // 32_FLOAT
+        case 37: return 8;    // 32_32_FLOAT
+        case 57: return 12;   // 32_32_32_FLOAT
+        case 38: return 16;   // 32_32_32_32_FLOAT
+        default: return 0;
+    }
+}
+
 uint32_t ComponentBytes(uint32_t gpu_format) {
     switch (gpu_format) {
         case 57: case 37: case 38: return 4;
@@ -555,6 +586,141 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
     }
 }
 
+bool BuildIndexBuffers() {
+    if (!Enabled() || !g_init_ok) return false;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_index_state != IndexState::kNone) return g_index_state == IndexState::kReady;
+
+    // Peak observed VertexCount is 1624 (census). kMaxExpandVerts is the ceiling
+    // this supports; a draw beyond it is reported, never silently clipped.
+    std::vector<uint16_t> quad, fan;
+    quad.reserve((kMaxExpandVerts / 4) * 6);
+    for (uint32_t q = 0; q + 4 <= kMaxExpandVerts; q += 4) {
+        // Split on the 0-2 diagonal, preserving perimeter winding.
+        const uint16_t b = uint16_t(q);
+        quad.insert(quad.end(), {b, uint16_t(b + 1), uint16_t(b + 2),
+                                 b, uint16_t(b + 2), uint16_t(b + 3)});
+    }
+    fan.reserve((kMaxExpandVerts - 2) * 3);
+    for (uint32_t i = 1; i + 1 < kMaxExpandVerts; ++i) {
+        fan.insert(fan.end(), {0, uint16_t(i), uint16_t(i + 1)});
+    }
+
+    auto upload = [&](const std::vector<uint16_t>& src,
+                      std::unique_ptr<plume::RenderBuffer>& dst) -> bool {
+        const uint64_t bytes = src.size() * sizeof(uint16_t);
+        dst = g_device->createBuffer(plume::RenderBufferDesc::IndexBuffer(
+            bytes, plume::RenderHeapType::UPLOAD));
+        if (dst == nullptr) return false;
+        void* p = dst->map();
+        if (p == nullptr) return false;
+        std::memcpy(p, src.data(), size_t(bytes));
+        dst->unmap();
+        return true;
+    };
+
+    if (!upload(quad, g_quad_indices) || !upload(fan, g_fan_indices)) {
+        g_index_state = IndexState::kFailed;
+        REXLOG_WARN("plume: failed to create the expansion index buffers");
+        return false;
+    }
+    g_index_state = IndexState::kReady;
+    REXLOG_WARN("plume: index buffers ready -- quad {} indices ({} quads), fan {} indices, "
+                "max {} vertices/draw",
+                quad.size(), quad.size() / 6, fan.size(), kMaxExpandVerts);
+    return true;
+}
+
+void SnapshotDrawVertices(const uint8_t* base) {
+    const uint32_t start_vertex = g_draw_start;
+    const uint32_t vertex_count = g_draw_count;
+    if (!Enabled() || !g_init_ok || base == nullptr || vertex_count == 0) return;
+    const auto resolve = [base](uint32_t ea) -> const uint8_t* {
+        return ea ? base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u) : nullptr;
+    };
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    // Find the combination this draw belongs to; it carries the layout and the
+    // bindings. Only the current one is needed, and only a few times.
+    auto sit = g_shaders.find(g_draw_vs);
+    if (sit == g_shaders.end() || !sit->second.layout_done) return;
+    Created& s = sit->second;
+    if (s.snapshots >= kSnapshotsPerShader) return;
+
+    if (vertex_count > kMaxExpandVerts) {
+        if (!s.snapshot_overflow) {
+            s.snapshot_overflow = true;
+            REXLOG_WARN("plume: {} draw of {} vertices exceeds the {}-vertex expansion ceiling",
+                        s.entry->name, vertex_count, kMaxExpandVerts);
+        }
+        return;
+    }
+
+    ++s.snapshots;
+    REXLOG_WARN("plume: vertex snapshot {} for {} (start {}, {} verts)",
+                s.snapshots, s.entry->name, start_vertex, vertex_count);
+
+    // ⚠ SetStreamSource's pStreamData is a D3DVertexBuffer OBJECT, not the data.
+    // Reading it as vertices yields the object header (a refcount reads as
+    // "80 00 00 00"). The real byte address is BaseAddress in the vertex fetch
+    // constant, which the runtime programs from SetStreamSource -- exactly what
+    // rexglue's translator does ("extract the byte address from the fetch
+    // constant", masking off the low 2 bits).
+    //
+    // The fetch constant array is at device+1152: SetVertexShader computes it as
+    // `addi r28,r30,1152`, and it is the same array the sampler work found at
+    // device+(sampler+48)*24 -- a texture constant is 24 bytes, i.e. three
+    // 8-byte vertex constants.
+    if (g_device_ea == 0) {
+        REXLOG_WARN("   (no device pointer latched -- snapshot cannot resolve anything)");
+        return;
+    }
+    for (const auto& a : s.attributes) {
+        const uint32_t stream = (a.fetch_const <= 95u) ? (95u - a.fetch_const) : UINT32_MAX;
+        const uint8_t* fc = resolve(g_device_ea + 1152u + a.fetch_const * 8u);
+        if (fc == nullptr) continue;
+        const uint32_t base_addr = LoadBE32(fc) & ~uint32_t(3);
+        if (base_addr == 0) {
+            // Never silently skip: every early exit in a diagnostic must say why.
+            REXLOG_WARN("   {}{} fetch const {} @{:08X} reads {:08X} {:08X} -- BaseAddress is 0, "
+                        "so device+1152+fc*8 is not where this title keeps them",
+                        UsageName(a.usage), a.usage_index, a.fetch_const,
+                        g_device_ea + 1152u + a.fetch_const * 8u,
+                        LoadBE32(fc), LoadBE32(fc + 4));
+            continue;
+        }
+        const uint32_t stride = (stream < kMaxStreams && g_streams[stream].stride)
+                                    ? g_streams[stream].stride : a.stride;
+        const uint32_t comp = ComponentBytes(a.format);
+        const uint32_t ea = base_addr + start_vertex * stride + a.offset;
+        const uint8_t* p = resolve(ea);
+        if (p == nullptr || comp == 0) continue;
+
+        // Byte-swap the first vertex's worth of this attribute and print it, so
+        // the swap width can be checked against plausible values rather than
+        // assumed correct.
+        uint8_t v[16] = {};
+        const uint32_t width = AttributeBytes(a.format);
+        if (width == 0 || width > sizeof(v)) continue;
+        for (uint32_t b = 0; b < width; ++b) {
+            const uint32_t grp = b / comp, idx = b % comp;
+            v[b] = p[grp * comp + (comp - 1 - idx)];   // reverse WITHIN each component
+        }
+        if (a.format == 57 || a.format == 37 || a.format == 36 || a.format == 38) {
+            float f[4] = {};
+            std::memcpy(f, v, width);
+            REXLOG_WARN("   {}{} s{} @{:08X} stride {} -> {:.4f} {:.4f} {:.4f} {:.4f}",
+                        UsageName(a.usage), a.usage_index, stream, ea, stride,
+                        f[0], width > 4 ? f[1] : 0.0f, width > 8 ? f[2] : 0.0f,
+                        width > 12 ? f[3] : 0.0f);
+        } else {
+            REXLOG_WARN("   {}{} s{} @{:08X} stride {} -> {:02X} {:02X} {:02X} {:02X}",
+                        UsageName(a.usage), a.usage_index, stream, ea, stride,
+                        v[0], v[1], v[2], v[3]);
+        }
+    }
+}
+
 void BuildPipelines(const char* reason) {
     if (!Enabled() || !g_init_ok) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -858,13 +1024,17 @@ void OnSetStreamSource(uint32_t stream, uint32_t buffer_ea, uint32_t offset, uin
     g_streams[stream] = {buffer_ea, offset, stride};
 }
 
-void OnDrawVertices(uint32_t primitive_type, uint32_t start_vertex, uint32_t vertex_count) {
+void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_vertex,
+                    uint32_t vertex_count, const uint8_t* base) {
     if (!Enabled()) return;
+    g_device_ea = device_ea;
     if (!OnRenderThread()) return;
-    (void)start_vertex;
     ++g_draws;
 
     const uint64_t vs = HashOf(g_cur_vs_ea);
+    g_draw_vs = vs;
+    g_draw_start = start_vertex;
+    g_draw_count = vertex_count;
     const uint64_t ps = HashOf(g_cur_ps_ea);
     if (vs == ~0ull || ps == ~0ull) ++g_draws_unresolved;
 
@@ -912,6 +1082,9 @@ void OnDrawVertices(uint32_t primitive_type, uint32_t start_vertex, uint32_t ver
         }
         found->streams[found->stream_count++] = {s, g_streams[s].stride};
     }
+
+    // Bounded: a couple of draws per shader, purely to validate the endian swap
+    // against plausible values before it becomes load-bearing.
 }
 
 void Dump(const char* reason) {
@@ -977,6 +1150,9 @@ void Shutdown() {
     g_shaders.clear();
     for (uint32_t i = 0; i < g_combo_count; ++i) g_combos[i].pipeline.reset();
     g_pipeline_layout.reset();
+    g_quad_indices.reset();
+    g_fan_indices.reset();
+    g_index_state = IndexState::kNone;
     g_device.reset();
     g_interface.reset();
     g_init_ok = false;

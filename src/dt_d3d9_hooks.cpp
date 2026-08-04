@@ -30,6 +30,24 @@
         __imp__##sub(ctx, base);              \
     }
 
+// Two calls: `pre` runs BEFORE __imp__, `post` after.
+//
+// The draw-state census must be `pre`. __imp__ re-enters these same hooks -- a
+// draw flushes state through SetVertexShader/SetStreamSource internally -- so a
+// census taken afterwards attributes the draw to whatever the flush left behind.
+// Doing that blew the combination table straight past its 64-entry ceiling.
+//
+// Anything reading device state the draw APPLIES must be `post`: the vertex
+// fetch constants hold the only real vertex buffer address, are written by that
+// same flush, and read as zero beforehand.
+#define DT_D3D9_TRACE_SEM2(sub, idx, pre, post) \
+    REX_HOOK_RAW(sub) {                         \
+        dt_d3d9_trace::Record((idx), ctx);      \
+        pre;                                    \
+        __imp__##sub(ctx, base);                \
+        post;                                   \
+    }
+
 
 DT_D3D9_TRACE(sub_8213DB98, 0)  // NOT-D3D9:CoproPopPolarPair
 DT_D3D9_TRACE(sub_82161FE0, 1)  // (unidentified)
@@ -70,7 +88,7 @@ DT_D3D9_TRACE(sub_8221FC20, 35)  // D3DDevice_SetViewport
 DT_D3D9_TRACE(sub_822203C0, 36)  // D3DResource_GetType
 DT_D3D9_TRACE(sub_82221700, 37)  // D3DResource_Release
 DT_D3D9_TRACE(sub_82221818, 38)  // D3DDevice_InvalidateGpuCache
-DT_D3D9_TRACE_SEM(sub_82221918, 39, dt_plume::OnDrawVertices(ctx.r4.u32, ctx.r5.u32, ctx.r6.u32))  // D3DDevice_DrawVertices
+DT_D3D9_TRACE_SEM2(sub_82221918, 39, dt_plume::OnDrawVertices(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, base), dt_plume::SnapshotDrawVertices(base))  // D3DDevice_DrawVertices
 DT_D3D9_TRACE(sub_82222B70, 40)  // (unidentified)
 DT_D3D9_TRACE(sub_82222B90, 41)  // (unidentified)
 DT_D3D9_TRACE(sub_82222BB0, 42)  // (unidentified)

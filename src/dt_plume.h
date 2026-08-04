@@ -66,6 +66,21 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
 // layout is known. Safe to call repeatedly; already-built ones are skipped.
 void BuildPipelines(const char* reason);
 
+// Create the static expansion index buffers. QUADLIST and TRIANGLEFAN do not
+// exist in D3D12/Vulkan, and neither depends on the vertex data, so one index
+// buffer per topology serves every draw.
+bool BuildIndexBuffers();
+
+// Snapshot a draw's vertex data into a plume buffer, byte-swapping per
+// component. Guest data is big-endian, and the swap width differs per attribute
+// (a blanket dword swap would reverse the 8-8-8-8 COLOR channels), so this needs
+// the derived layout. Bounded: only the first few draws per combination are
+// captured, since the point is to validate the path, not to feed a renderer yet.
+// Takes only `base`: start/count/shader are latched by OnDrawVertices before
+// __imp__ runs. Argument registers are volatile, so r5/r6 read after the call
+// are clobbered, and the draw's internal flush rewrites the bound shader.
+void SnapshotDrawVertices(const uint8_t* base);
+
 // ── Draw-state shadow ────────────────────────────────────────────────────────
 // Argument decoding lives in gen_trace.py's SEMANTIC map, from the XDK 20500
 // d3d9.h prototypes. These run on the game's render thread at up to ~885
@@ -74,7 +89,9 @@ void OnSetVertexShader(uint32_t shader_ea);
 void OnSetPixelShader(uint32_t shader_ea);
 void OnSetVertexDeclaration(uint32_t decl_ea);
 void OnSetStreamSource(uint32_t stream, uint32_t buffer_ea, uint32_t offset, uint32_t stride);
-void OnDrawVertices(uint32_t primitive_type, uint32_t start_vertex, uint32_t vertex_count);
+// `base` is the guest memory base, needed by the bounded vertex snapshot.
+void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_vertex,
+                    uint32_t vertex_count, const uint8_t* base);
 
 // Log what resolved and what did not.
 void Dump(const char* reason);
