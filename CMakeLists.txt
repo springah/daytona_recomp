@@ -29,6 +29,7 @@ set(DAYTONA_SOURCES
     # dt_shader_blobs.cpp is GENERATED -- see _tools/daytona_d3d9_sigscan/gen_shader_blobs.py.
     src/dt_shader_blobs.cpp
     src/dt_plume.cpp
+    src/dt_shader_patchtest.cpp
 )
 
 # plume (renderbag) -- the RHI the native renderer targets, replacing rexglue's

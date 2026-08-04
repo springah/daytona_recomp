@@ -7,6 +7,7 @@
 #include "dt_d3d9_trace.h"
 #include "dt_shader_dump.h"
 #include "dt_plume.h"
+#include "dt_shader_patchtest.h"
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/system/xtypes.h>
@@ -154,6 +155,14 @@ void DumpVertexElements(uint32_t elements_ea, uint32_t decl_object_ea, uint8_t* 
     REXLOG_WARN("===== end D3DVERTEXELEMENT9[] =====");
 }
 
+// Guest ea -> host pointer, mirroring REX_RAW_ADDR (which needs `base` in
+// scope and so cannot be used from a free function).
+const uint8_t* PatchTestResolve(uint32_t ea, void* ctx) {
+    const uint8_t* base = static_cast<const uint8_t*>(ctx);
+    if (base == nullptr || ea == 0) return nullptr;
+    return base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u);
+}
+
 }  // namespace
 
 #define DT_TRACE_HOOK(name, id)                         \
@@ -249,6 +258,12 @@ REX_HOOK_RAW(sub_82233C80) {
         if ((++frames % 1800) == 0) daytona_debug::LogCensus("periodic");
         if ((frames % 1800) == 0) dt_shader_dump::Dump("periodic");
         if ((frames % 1800) == 0) dt_plume::Dump("periodic");
+        // Re-read the shader containers well after creation, once the game
+        // has been drawing, to see whether the runtime patched them.
+        if (frames == 600 || frames == 3600) {
+            dt_shader_patchtest::Check(frames == 600 ? "frame 600" : "frame 3600",
+                                       PatchTestResolve, base);
+        }
     }
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DDeviceSwap, ctx);
 
@@ -356,13 +371,20 @@ DT_TRACE_HOOK_AFTER(sub_82241740, daytona_debug::HookId::kUiTextureSizeB)       
         const uint32_t fn = ctx.r3.u32;                                        \
         uint64_t hash = 0;                                                     \
         if (fn != 0) {                                                         \
-            hash = dt_shader_dump::Record((is_vertex), fn,                     \
-                                          REX_LOAD_U32(fn + 4),                \
-                                          REX_LOAD_U32(fn + 8),                \
+            const uint32_t vsz = REX_LOAD_U32(fn + 4);                         \
+            const uint32_t psz = REX_LOAD_U32(fn + 8);                         \
+            hash = dt_shader_dump::Record((is_vertex), fn, vsz, psz,           \
                                           REX_RAW_ADDR(fn));                   \
+            if (hash != 0) {                                                   \
+                dt_shader_patchtest::Remember(hash, (is_vertex), fn, vsz, psz, \
+                                              REX_RAW_ADDR(fn));               \
+            }                                                                  \
         }                                                                      \
         __imp__##name(ctx, base);                                              \
-        if (hash != 0) dt_plume::OnShaderObject(ctx.r3.u32, hash);             \
+        if (hash != 0) {                                                       \
+            dt_plume::OnShaderObject(ctx.r3.u32, hash);                        \
+            dt_shader_patchtest::RememberObject(hash, ctx.r3.u32);             \
+        }                                                                      \
         uint32_t n = daytona_debug::RecordHook((id), ctx);                     \
         if (ShouldLog(n)) LogGuestCall(#name, n, ctx);                         \
     }
