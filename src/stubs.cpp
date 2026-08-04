@@ -776,3 +776,32 @@ REX_HOOK_RAW(D3DDevice_EndTiling) {
         LogGuestCall("D3DDevice_EndTiling", n, ctx);
     __imp__sub_8222CB88(ctx, base);
 }
+
+// ── Shader patching: where the vertex layout actually lands ───────────────────
+//
+// D3D9 has TWO patch paths, tried in order inside SetPending_Shaders:
+//
+//   DirectShaderPatch(pDevice, pShader, pDecl, flags)   -- patches the shader's
+//       stored microcode IN PLACE. This is the one whose result is visible at
+//       shader_object+32, and it is why vs_bbb7/vs_e73e/vs_54cf show patched
+//       vfetch operands.
+//
+//   IncrementalShaderPatchAndLoad(pDevice, int, pShader, pProgramControl,
+//                                 pDecl, pVSUcode, pPSUcode, flags)
+//       -- the fallback when DirectShaderPatch returns 0. It patches into a
+//       SEPARATE ucode buffer (r8 at the call site, computed as
+//       shader + *(shader+896) + 872), leaving the stored microcode untouched.
+//
+// That second path is why vs_0f1a -- 94.6% of all draws, bound with a NULL
+// vertex declaration -- never appears patched no matter how long the game runs.
+// Its layout exists only in that ucode buffer.
+//
+// Identified by bit-field signature match against XDK 20500 d3d9.lib
+// (DirectShaderPatch 1.000, IncrementalShaderPatchAndLoad 0.944).
+REX_HOOK_RAW(sub_822324F8) {
+    const uint32_t shader_ea = ctx.r5.u32;
+    const uint32_t decl_ea   = ctx.r7.u32;
+    const uint32_t ucode_ea  = ctx.r8.u32;
+    __imp__sub_822324F8(ctx, base);
+    dt_plume::OnIncrementalPatch(shader_ea, decl_ea, ucode_ea, PatchTestResolve, base);
+}

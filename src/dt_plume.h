@@ -53,6 +53,14 @@ using GuestResolve = const uint8_t* (*)(uint32_t ea, void* ctx);
 // bound), so early calls simply report nothing yet.
 void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx);
 
+// D3D9 patches shaders two ways: DirectShaderPatch rewrites the stored microcode
+// in place, and IncrementalShaderPatchAndLoad (its fallback) writes into a
+// separate ucode buffer. The 94.6% path takes the second, which is why its
+// stored microcode never changes. This is called after that fallback runs, with
+// the ucode buffer it just filled -- the only place that layout is ever visible.
+void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
+                        GuestResolve resolve, void* ctx);
+
 // ── Draw-state shadow ────────────────────────────────────────────────────────
 // Argument decoding lives in gen_trace.py's SEMANTIC map, from the XDK 20500
 // d3d9.h prototypes. These run on the game's render thread at up to ~885

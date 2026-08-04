@@ -54,6 +54,7 @@ struct Created {
     uint32_t code_ea = 0;        // where the LIVE copy lives, once located
     bool located = false;
     bool layout_done = false;
+    bool diagnosed = false;
     std::vector<FetchedAttribute> attributes;
 };
 std::unordered_map<uint64_t, Created> g_shaders;
@@ -121,6 +122,7 @@ struct DeclBind {
 DeclBind g_decls[kMaxDecls];
 uint32_t g_decl_count = 0;
 uint32_t g_decl_overflow = 0;
+uint64_t g_incremental_calls = 0;
 
 unsigned long g_render_thread = 0;
 bool g_thread_warned = false;
@@ -193,6 +195,48 @@ const char* VertexFormatName(uint32_t f) {
         case 57: return "32_32_32_FLOAT";
         case 38: return "32_32_32_32_FLOAT";
         default: return "UNHANDLED";
+    }
+}
+
+// GPUVERTEXFORMAT -> plume vertex input format.
+//
+// Returns UNKNOWN for anything unseen rather than guessing: a wrong vertex
+// format is silent corruption, not a crash.
+plume::RenderFormat ToRenderFormat(uint32_t gpu_format, bool num_format_all, bool signed_all) {
+    switch (gpu_format) {
+        case 57:  // 32_32_32_FLOAT
+            return plume::RenderFormat::R32G32B32_FLOAT;
+        case 37:  // 32_32_FLOAT
+            return plume::RenderFormat::R32G32_FLOAT;
+        case 38:  // 32_32_32_32_FLOAT
+            return plume::RenderFormat::R32G32B32A32_FLOAT;
+        case 6:   // 8_8_8_8
+            // numFormatAll selects FRACTION (normalised) over INTEGER.
+            if (!num_format_all) {
+                return signed_all ? plume::RenderFormat::R8G8B8A8_SINT
+                                  : plume::RenderFormat::R8G8B8A8_UINT;
+            }
+            return signed_all ? plume::RenderFormat::R8G8B8A8_SNORM
+                              : plume::RenderFormat::R8G8B8A8_UNORM;
+        default:
+            return plume::RenderFormat::UNKNOWN;
+    }
+}
+
+// Bytes per component, which is what the endian swap needs.
+//
+// ⚠ Guest vertex data is BIG-ENDIAN. The swap is per COMPONENT, not a blanket
+// dword swap over the buffer: dword-swapping an 8_8_8_8 colour reverses its
+// channels (RGBA becomes ABGR) and there is no DXGI format to undo that. So an
+// all-32-bit layout happens to be a uniform dword swap, but the moment an
+// attribute has 8- or 16-bit components the pattern differs per attribute --
+// which is precisely why the derived layout is needed for the UPLOAD path, not
+// only for the input layout.
+uint32_t ComponentBytes(uint32_t gpu_format) {
+    switch (gpu_format) {
+        case 57: case 37: case 38: return 4;
+        case 6:                    return 1;
+        default:                   return 0;   // unknown: refuse to swap
     }
 }
 
@@ -339,6 +383,96 @@ void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash,
     }
 }
 
+void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
+                        GuestResolve resolve, void* ctx) {
+    if (!Enabled()) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_incremental_calls;
+    // Log the first few unconditionally: "no output" must be distinguishable
+    // from "never called". The menu takes DirectShaderPatch, so zero calls there
+    // is the expected result, not a broken hook.
+    if (g_incremental_calls <= 4) {
+        REXLOG_WARN("plume: IncrementalShaderPatchAndLoad #{} shader={:08X} decl={:08X} ucode={:08X}",
+                    g_incremental_calls, shader_ea, decl_ea, ucode_ea);
+    }
+    if (ucode_ea == 0 || resolve == nullptr) return;
+
+    auto it = g_shader_objects.find(shader_ea);
+    if (it == g_shader_objects.end()) return;
+    auto sit = g_shaders.find(it->second);
+    if (sit == g_shaders.end() || sit->second.entry == nullptr) return;
+    Created& s = sit->second;
+    if (!s.entry->is_vertex || s.layout_done) return;
+
+    const uint8_t* ucode = resolve(ucode_ea, ctx);
+    if (ucode == nullptr) return;
+
+    // The ucode buffer is not the container, so the instruction stream does not
+    // necessarily start at offset 0. Find it by locating the vfetch whose
+    // operands are the ones we know: dstRegister and constIndex survive
+    // patching, so the pre-patch word0 of the FIRST element is a reliable
+    // anchor, and everything else is at a fixed 3-dword stride from it.
+    const uint32_t anchor_d = uint32_t(s.entry->elements[0].address) * 3;
+    if ((anchor_d + 3) * 4 > s.code.size()) return;
+    const uint32_t anchor_w0 = LoadBE32(&s.code[anchor_d * 4]);
+
+    int32_t base_dword = -1;
+    for (uint32_t i = 0; i < 512 && base_dword < 0; ++i) {
+        if (LoadBE32(ucode + i * 4) == anchor_w0) {
+            base_dword = int32_t(i) - int32_t(anchor_d);
+        }
+    }
+    if (base_dword < 0) {
+        if (!s.diagnosed) {
+            s.diagnosed = true;
+            REXLOG_WARN("plume: {} incremental patch -- anchor {:08X} not found in ucode@{:08X}; "
+                        "first 12 dwords: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                        "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                        s.entry->name, anchor_w0, ucode_ea,
+                        LoadBE32(ucode +  0), LoadBE32(ucode +  4), LoadBE32(ucode +  8),
+                        LoadBE32(ucode + 12), LoadBE32(ucode + 16), LoadBE32(ucode + 20),
+                        LoadBE32(ucode + 24), LoadBE32(ucode + 28), LoadBE32(ucode + 32),
+                        LoadBE32(ucode + 36), LoadBE32(ucode + 40), LoadBE32(ucode + 44));
+        }
+        return;
+    }
+
+    std::vector<FetchedAttribute> attrs;
+    for (uint32_t e = 0; e < s.entry->element_count; ++e) {
+        const auto& el = s.entry->elements[e];
+        const uint32_t d = uint32_t(base_dword) + uint32_t(el.address) * 3;
+        const uint32_t w1 = LoadBE32(ucode + (d + 1) * 4);
+        const uint32_t w2 = LoadBE32(ucode + (d + 2) * 4);
+        FetchedAttribute a;
+        a.usage = el.usage;
+        a.usage_index = el.usage_index;
+        a.instruction = el.address;
+        a.format = (w1 >> 16) & 0x3F;
+        a.num_format_all = ((w1 >> 13) & 1) != 0;
+        a.signed_all = ((w1 >> 14) & 1) != 0;
+        a.stride = (w2 & 0xFF) * 4;
+        a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
+        if (a.format == 0 && a.stride == 0) return;   // still placeholder
+        attrs.push_back(a);
+    }
+    if (attrs.empty()) return;
+
+    s.attributes = std::move(attrs);
+    s.layout_done = true;
+    REXLOG_WARN("plume: vertex layout for {} via INCREMENTAL patch (ucode @{:08X}+{} dwords, decl={:08X})",
+                s.entry->name, ucode_ea, base_dword, decl_ea);
+    for (const auto& a : s.attributes) {
+        const auto rf = ToRenderFormat(a.format, a.num_format_all, a.signed_all);
+        REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {:<4} -> plume {}",
+                    UsageName(a.usage), a.usage_index, a.instruction,
+                    a.format, VertexFormatName(a.format), a.stride, a.offset,
+                    static_cast<uint32_t>(rf));
+        if (rf == plume::RenderFormat::UNKNOWN) {
+            REXLOG_WARN("      ^^ UNMAPPED GPUVERTEXFORMAT {}", a.format);
+        }
+    }
+}
+
 void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
     if (!Enabled() || resolve == nullptr) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -397,7 +531,43 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
             if (a.format == 0 && a.stride == 0) { all_patched = false; break; }
             attrs.push_back(a);
         }
-        if (!all_patched || attrs.empty()) { ++pending; continue; }
+        if (!all_patched || attrs.empty()) {
+            ++pending;
+            // vs_0f1a is bound for 94.6% of draws yet never patches, and the
+            // three shaders that DO patch are exactly the three binding a real
+            // vertex declaration -- so patching looks declaration-driven and
+            // this path has decl=NULL. Dump what is actually there, and every
+            // other plausible pointer in the object, in case the runtime keeps
+            // a second (patched) microcode copy per declaration.
+            if (!s.diagnosed) {
+                s.diagnosed = true;
+                REXLOG_WARN("plume: {} NOT PATCHED -- diagnostic (object@{:08X} code@{:08X})",
+                            s.entry->name, s.object_ea, s.code_ea);
+                for (uint32_t e = 0; e < s.entry->element_count; ++e) {
+                    const uint32_t d = uint32_t(s.entry->elements[e].address) * 3;
+                    if ((d + 3) * 4 > s.code.size()) continue;
+                    REXLOG_WARN("   insn {:<3} live {:08X} {:08X} {:08X}   created {:08X} {:08X} {:08X}",
+                                s.entry->elements[e].address,
+                                LoadBE32(code + d * 4), LoadBE32(code + (d + 1) * 4),
+                                LoadBE32(code + (d + 2) * 4),
+                                LoadBE32(&s.code[d * 4]), LoadBE32(&s.code[(d + 1) * 4]),
+                                LoadBE32(&s.code[(d + 2) * 4]));
+                }
+                const uint8_t* obj = resolve(s.object_ea, ctx);
+                if (obj != nullptr) {
+                    const size_t probe = s.code.size() < 32 ? s.code.size() : 32;
+                    for (uint32_t i = 0; i < 48; ++i) {
+                        const uint32_t cand = LoadBE32(obj + i * 4);
+                        if (!PlausibleGuestPointer(cand)) continue;
+                        const uint8_t* p = resolve(cand, ctx);
+                        const bool match = p != nullptr && std::memcmp(p, s.code.data(), probe) == 0;
+                        REXLOG_WARN("   object+{:<3} -> {:08X}{}", i * 4, cand,
+                                    match ? "   *** MICROCODE COPY ***" : "");
+                    }
+                }
+            }
+            continue;
+        }
 
         s.attributes = std::move(attrs);
         s.layout_done = true;
@@ -405,9 +575,17 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
 
         REXLOG_WARN("plume: vertex layout for {} (microcode @{:08X})", s.entry->name, s.code_ea);
         for (const auto& a : s.attributes) {
-            REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {}",
+            const auto rf = ToRenderFormat(a.format, a.num_format_all, a.signed_all);
+            const uint32_t comp = ComponentBytes(a.format);
+            REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {:<4} "
+                        "-> plume {} , endian swap {}",
                         UsageName(a.usage), a.usage_index, a.instruction,
-                        a.format, VertexFormatName(a.format), a.stride, a.offset);
+                        a.format, VertexFormatName(a.format), a.stride, a.offset,
+                        static_cast<uint32_t>(rf), comp ? comp : 0);
+            if (rf == plume::RenderFormat::UNKNOWN) {
+                REXLOG_WARN("      ^^ UNMAPPED GPUVERTEXFORMAT {} -- a wrong vertex format is "
+                            "silent corruption, so this attribute is not usable yet", a.format);
+            }
         }
     }
     if (derived || pending) {
@@ -537,8 +715,8 @@ void Dump(const char* reason) {
                     dt_shader_blobs::kEntryCount - g_resolved, dt_shader_blobs::kEntryCount);
     }
 
-    REXLOG_WARN("   draws={} unresolved={} decl changes={} combos={}",
-                g_draws, g_draws_unresolved, g_decl_changes, g_combo_count);
+    REXLOG_WARN("   draws={} unresolved={} decl changes={} combos={} incremental-patches={}",
+                g_draws, g_draws_unresolved, g_decl_changes, g_combo_count, g_incremental_calls);
     if (g_combo_overflow) {
         REXLOG_WARN("   WARNING: {} draws fell outside the {}-combo table -- the census below "
                     "is INCOMPLETE, raise kMaxCombos", g_combo_overflow, kMaxCombos);
