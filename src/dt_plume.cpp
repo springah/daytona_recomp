@@ -713,7 +713,6 @@ void SnapshotDrawVertices(const uint8_t* base) {
         const uint32_t stride = (stream < kMaxStreams && g_streams[stream].stride)
                                     ? g_streams[stream].stride : a.stride;
         const uint32_t comp = ComponentBytes(a.format);
-        const uint32_t ea = base_addr + start_vertex * stride + a.offset;
 
         // Byte-swap the first vertex's worth of this attribute and print it, so
         // the swap width can be checked against plausible values rather than
@@ -721,18 +720,21 @@ void SnapshotDrawVertices(const uint8_t* base) {
         uint8_t v[16] = {};
         const uint32_t width = AttributeBytes(a.format);
         if (width == 0 || width > sizeof(v) || comp == 0) continue;
-        const uint8_t* p = resolve(ea, width);
-        if (p == nullptr) {
-            // A nonzero BaseAddress that does not resolve is the interesting
-            // failure: it means the fetch constant was read from the wrong
-            // place and happened to contain data. Name the address -- that is
-            // what makes the next run diagnostic instead of fatal.
-            REXLOG_WARN("   {}{} s{} BaseAddress {:08X} -> vertex @{:08X} (stride {}, start {}) "
-                        "is not readable -- the fetch constant at {:08X} is not a fetch constant",
-                        UsageName(a.usage), a.usage_index, stream, base_addr, ea, stride,
-                        start_vertex, fc_ea);
+
+        // BaseAddress is PHYSICAL. Reading it as a virtual address is what used
+        // to fault here -- and what made device+1152+fc*8 look like the wrong
+        // offset when it was right all along.
+        const uint32_t span = start_vertex * stride + a.offset + width;
+        const uint32_t va = dt_guest_mem::PhysicalToVirtual(base_addr, span);
+        if (va == 0) {
+            REXLOG_WARN("   {}{} s{} physical BaseAddress {:08X} (+{} bytes) is not readable "
+                        "through any physical alias -- fetch constant @{:08X}",
+                        UsageName(a.usage), a.usage_index, stream, base_addr, span, fc_ea);
             continue;
         }
+        const uint32_t ea = va + start_vertex * stride + a.offset;
+        const uint8_t* p = resolve(ea, width);
+        if (p == nullptr) continue;
         for (uint32_t b = 0; b < width; ++b) {
             const uint32_t grp = b / comp, idx = b % comp;
             v[b] = p[grp * comp + (comp - 1 - idx)];   // reverse WITHIN each component

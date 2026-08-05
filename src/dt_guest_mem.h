@@ -39,4 +39,17 @@ bool Readable(uint32_t ea, uint32_t size);
 // better than no check at all.
 const uint8_t* Resolve(const uint8_t* base, uint32_t ea, uint32_t size);
 
+// A Xenos fetch constant's BaseAddress is a PHYSICAL address -- the GPU
+// addresses physical memory -- while every other guest pointer the hooks see is
+// virtual. Returns a virtual alias for `phys` through which [.., size) is
+// readable, or 0 if none is.
+//
+// The 360 aliases the same physical memory into several windows that differ
+// only in page size and cacheability (0x8.., 0xA.., 0xC.., 0xE..), and which
+// one is mapped depends on the heap the title allocated from. Rather than
+// assume, this tries them and logs which one answered the first time -- that is
+// a fact about how Daytona allocates vertex memory, and worth learning once
+// instead of hardcoding a guess.
+uint32_t PhysicalToVirtual(uint32_t phys, uint32_t size);
+
 }  // namespace dt_guest_mem

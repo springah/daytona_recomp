@@ -1,5 +1,6 @@
 #include "dt_guest_mem.h"
 
+#include <rex/logging.h>
 #include <rex/memory/utils.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
@@ -23,6 +24,29 @@ bool Readable(uint32_t ea, uint32_t size) {
     const auto access = heap->QueryRangeAccess(ea, ea + size - 1);
     return (static_cast<uint32_t>(access) &
             static_cast<uint32_t>(rex::memory::PageAccess::kReadOnly)) != 0;
+}
+
+uint32_t PhysicalToVirtual(uint32_t phys, uint32_t size) {
+    // Physical memory is 512 MB; anything above that is not a physical address
+    // and must not be silently masked into one.
+    if (phys >= 0x20000000u || size == 0) return 0;
+
+    // Ordered by how the 360 lays them out: 64 KB pages, 16 MB pages, uncached,
+    // then the cached title window.
+    static constexpr uint32_t kAliases[] = {0xA0000000u, 0xC0000000u, 0xE0000000u, 0x80000000u};
+    for (uint32_t alias : kAliases) {
+        const uint32_t va = alias | phys;
+        if (!Readable(va, size)) continue;
+        static uint32_t reported = 0;
+        if (reported != alias) {
+            reported = alias;
+            REXLOG_WARN("dt_guest_mem: physical {:08X} reads through the {:08X} alias "
+                        "({} bytes) -- this is where Daytona's GPU-visible memory lives",
+                        phys, alias, size);
+        }
+        return va;
+    }
+    return 0;
 }
 
 const uint8_t* Resolve(const uint8_t* base, uint32_t ea, uint32_t size) {
