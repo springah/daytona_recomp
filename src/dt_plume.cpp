@@ -1,5 +1,6 @@
 #include "dt_plume.h"
 
+#include "dt_guest_mem.h"
 #include "dt_shader_blobs.h"
 
 #include <rex/logging.h>
@@ -505,8 +506,19 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
     Created& s = sit->second;
     if (!s.entry->is_vertex || s.layout_done) return;
 
-    const uint8_t* ucode = resolve(ucode_ea, ctx);
-    if (ucode == nullptr) return;
+    // The anchor search below reads up to 512 dwords, so ask for all of it: a
+    // 4-byte check in front of a 2 KB scan would not have caught anything.
+    constexpr uint32_t kAnchorScanDwords = 512;
+    const uint8_t* ucode = resolve(ucode_ea, kAnchorScanDwords * 4, ctx);
+    if (ucode == nullptr) {
+        if (!s.diagnosed_incremental) {
+            s.diagnosed_incremental = true;
+            REXLOG_WARN("plume: {} incremental patch -- ucode@{:08X} is not {} bytes of "
+                        "readable guest memory, so the layout cannot be read from it",
+                        s.entry->name, ucode_ea, kAnchorScanDwords * 4);
+        }
+        return;
+    }
 
     // The ucode buffer is not the container, so the instruction stream does not
     // necessarily start at offset 0. Find it by locating the vfetch whose
@@ -635,8 +647,12 @@ void SnapshotDrawVertices(const uint8_t* base) {
     const uint32_t start_vertex = g_draw_start;
     const uint32_t vertex_count = g_draw_count;
     if (!Enabled() || !g_init_ok || base == nullptr || vertex_count == 0) return;
-    const auto resolve = [base](uint32_t ea) -> const uint8_t* {
-        return ea ? base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u) : nullptr;
+    // Every address below is derived from an offset that is still being
+    // reverse-engineered, so none of them may be dereferenced unguarded. This
+    // used to be a bare `base + ea` and it segfaulted the moment the fetch
+    // constant read garbage instead of zero.
+    const auto resolve = [base](uint32_t ea, uint32_t size) -> const uint8_t* {
+        return dt_guest_mem::Resolve(base, ea, size);
     };
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -677,15 +693,20 @@ void SnapshotDrawVertices(const uint8_t* base) {
     }
     for (const auto& a : s.attributes) {
         const uint32_t stream = (a.fetch_const <= 95u) ? (95u - a.fetch_const) : UINT32_MAX;
-        const uint8_t* fc = resolve(g_device_ea + 1152u + a.fetch_const * 8u);
-        if (fc == nullptr) continue;
+        const uint32_t fc_ea = g_device_ea + 1152u + a.fetch_const * 8u;
+        const uint8_t* fc = resolve(fc_ea, 8u);   // a fetch constant is 2 dwords
+        if (fc == nullptr) {
+            REXLOG_WARN("   {}{} fetch const {} @{:08X} is not readable guest memory -- "
+                        "device+1152+fc*8 is not where this title keeps them",
+                        UsageName(a.usage), a.usage_index, a.fetch_const, fc_ea);
+            continue;
+        }
         const uint32_t base_addr = LoadBE32(fc) & ~uint32_t(3);
         if (base_addr == 0) {
             // Never silently skip: every early exit in a diagnostic must say why.
             REXLOG_WARN("   {}{} fetch const {} @{:08X} reads {:08X} {:08X} -- BaseAddress is 0, "
                         "so device+1152+fc*8 is not where this title keeps them",
-                        UsageName(a.usage), a.usage_index, a.fetch_const,
-                        g_device_ea + 1152u + a.fetch_const * 8u,
+                        UsageName(a.usage), a.usage_index, a.fetch_const, fc_ea,
                         LoadBE32(fc), LoadBE32(fc + 4));
             continue;
         }
@@ -693,15 +714,25 @@ void SnapshotDrawVertices(const uint8_t* base) {
                                     ? g_streams[stream].stride : a.stride;
         const uint32_t comp = ComponentBytes(a.format);
         const uint32_t ea = base_addr + start_vertex * stride + a.offset;
-        const uint8_t* p = resolve(ea);
-        if (p == nullptr || comp == 0) continue;
 
         // Byte-swap the first vertex's worth of this attribute and print it, so
         // the swap width can be checked against plausible values rather than
         // assumed correct.
         uint8_t v[16] = {};
         const uint32_t width = AttributeBytes(a.format);
-        if (width == 0 || width > sizeof(v)) continue;
+        if (width == 0 || width > sizeof(v) || comp == 0) continue;
+        const uint8_t* p = resolve(ea, width);
+        if (p == nullptr) {
+            // A nonzero BaseAddress that does not resolve is the interesting
+            // failure: it means the fetch constant was read from the wrong
+            // place and happened to contain data. Name the address -- that is
+            // what makes the next run diagnostic instead of fatal.
+            REXLOG_WARN("   {}{} s{} BaseAddress {:08X} -> vertex @{:08X} (stride {}, start {}) "
+                        "is not readable -- the fetch constant at {:08X} is not a fetch constant",
+                        UsageName(a.usage), a.usage_index, stream, base_addr, ea, stride,
+                        start_vertex, fc_ea);
+            continue;
+        }
         for (uint32_t b = 0; b < width; ++b) {
             const uint32_t grp = b / comp, idx = b % comp;
             v[b] = p[grp * comp + (comp - 1 - idx)];   // reverse WITHIN each component
@@ -871,13 +902,17 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
         // not hardcoded -- object+32 held for every vertex shader observed, but
         // that is an observation, not a documented layout.
         if (!s.located) {
-            const uint8_t* obj = resolve(s.object_ea, ctx);
+            constexpr uint32_t kObjectProbeDwords = 32;
+            const uint8_t* obj = resolve(s.object_ea, kObjectProbeDwords * 4, ctx);
             if (obj == nullptr) { ++pending; continue; }
             const size_t probe = s.code.size() < 32 ? s.code.size() : 32;
-            for (uint32_t i = 0; i < 32 && !s.located; ++i) {
+            for (uint32_t i = 0; i < kObjectProbeDwords && !s.located; ++i) {
                 const uint32_t cand = LoadBE32(obj + i * 4);
                 if (!PlausibleGuestPointer(cand)) continue;
-                const uint8_t* p = resolve(cand, ctx);
+                // Candidates come from scanning an object's raw dwords, so most
+                // of them are NOT pointers at all -- this is the single most
+                // likely place to dereference an arbitrary address.
+                const uint8_t* p = resolve(cand, uint32_t(probe), ctx);
                 if (p != nullptr && std::memcmp(p, s.code.data(), probe) == 0) {
                     s.code_ea = cand;
                     s.located = true;
@@ -886,7 +921,7 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
             if (!s.located) { ++pending; continue; }
         }
 
-        const uint8_t* code = resolve(s.code_ea, ctx);
+        const uint8_t* code = resolve(s.code_ea, uint32_t(s.code.size()), ctx);
         if (code == nullptr) { ++pending; continue; }
 
         // Decode one vfetch per declared vertex element. dt_shader_blobs carries
@@ -938,13 +973,14 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
                                 LoadBE32(&s.code[d * 4]), LoadBE32(&s.code[(d + 1) * 4]),
                                 LoadBE32(&s.code[(d + 2) * 4]));
                 }
-                const uint8_t* obj = resolve(s.object_ea, ctx);
+                constexpr uint32_t kObjectDumpDwords = 48;
+                const uint8_t* obj = resolve(s.object_ea, kObjectDumpDwords * 4, ctx);
                 if (obj != nullptr) {
                     const size_t probe = s.code.size() < 32 ? s.code.size() : 32;
-                    for (uint32_t i = 0; i < 48; ++i) {
+                    for (uint32_t i = 0; i < kObjectDumpDwords; ++i) {
                         const uint32_t cand = LoadBE32(obj + i * 4);
                         if (!PlausibleGuestPointer(cand)) continue;
-                        const uint8_t* p = resolve(cand, ctx);
+                        const uint8_t* p = resolve(cand, uint32_t(probe), ctx);
                         const bool match = p != nullptr && std::memcmp(p, s.code.data(), probe) == 0;
                         REXLOG_WARN("   object+{:<3} -> {:08X}{}", i * 4, cand,
                                     match ? "   *** MICROCODE COPY ***" : "");

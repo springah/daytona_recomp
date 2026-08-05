@@ -45,7 +45,13 @@ void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash,
 
 // Resolve a guest address to a host pointer. The caller owns `base`, which the
 // REX_RAW_ADDR macro needs in scope, so it is supplied as a callback.
-using GuestResolve = const uint8_t* (*)(uint32_t ea, void* ctx);
+//
+// `size` is how many bytes the caller will read. It is not advisory: these
+// addresses come from offsets that are still being reverse-engineered, so a
+// wrong one is arbitrary, and most of the 4 GB guest reservation is
+// uncommitted. The callback returns nullptr unless the WHOLE range is readable
+// (see dt_guest_mem.h for why a crash here is the expensive failure mode).
+using GuestResolve = const uint8_t* (*)(uint32_t ea, uint32_t size, void* ctx);
 
 // Locate each shader's live microcode and decode the patched vfetch operands
 // into a vertex input layout. Safe to call repeatedly; a layout is only derived

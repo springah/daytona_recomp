@@ -5,6 +5,7 @@
 #include "daytona_debug.h"
 #include "daytona_symbols.h"
 #include "dt_d3d9_trace.h"
+#include "dt_guest_mem.h"
 #include "dt_shader_dump.h"
 #include "dt_plume.h"
 #include "dt_shader_patchtest.h"
@@ -156,11 +157,18 @@ void DumpVertexElements(uint32_t elements_ea, uint32_t decl_object_ea, uint8_t* 
 }
 
 // Guest ea -> host pointer, mirroring REX_RAW_ADDR (which needs `base` in
-// scope and so cannot be used from a free function).
+// scope and so cannot be used from a free function). Both forms go through
+// dt_guest_mem so a wrong offset yields nullptr, not a segfault.
+const uint8_t* GuestResolveSized(uint32_t ea, uint32_t size, void* ctx) {
+    return dt_guest_mem::Resolve(static_cast<const uint8_t*>(ctx), ea, size);
+}
+
+// dt_shader_patchtest reads container-sized blocks through a size-less
+// callback. It can at least not fault on the first dword; it is DT_PATCHTEST-
+// gated and not on the live path, so it does not warrant its own signature
+// change.
 const uint8_t* PatchTestResolve(uint32_t ea, void* ctx) {
-    const uint8_t* base = static_cast<const uint8_t*>(ctx);
-    if (base == nullptr || ea == 0) return nullptr;
-    return base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u);
+    return GuestResolveSized(ea, sizeof(uint32_t), ctx);
 }
 
 }  // namespace
@@ -267,7 +275,7 @@ REX_HOOK_RAW(sub_82233C80) {
         // Layouts only exist once the runtime has patched a shader, which only
         // happens when the game binds it, so keep retrying as content changes.
         if ((frames % 600) == 0) {
-            dt_plume::DeriveVertexLayouts("periodic", PatchTestResolve, base);
+            dt_plume::DeriveVertexLayouts("periodic", GuestResolveSized, base);
             dt_plume::BuildPipelines("periodic");
             dt_plume::BuildIndexBuffers();
         }
@@ -805,5 +813,5 @@ REX_HOOK_RAW(sub_822324F8) {
     const uint32_t decl_ea   = ctx.r7.u32;
     const uint32_t ucode_ea  = ctx.r8.u32;
     __imp__sub_822324F8(ctx, base);
-    dt_plume::OnIncrementalPatch(shader_ea, decl_ea, ucode_ea, PatchTestResolve, base);
+    dt_plume::OnIncrementalPatch(shader_ea, decl_ea, ucode_ea, GuestResolveSized, base);
 }

@@ -33,6 +33,9 @@ set(DAYTONA_SOURCES
     # DT_NOAUDIO: silent-but-functional audio for unattended runs.
     src/dt_null_audio.cpp
     src/dt_shader_dump.cpp
+    # Guarded guest-memory reads: a wrong reverse-engineered offset must log,
+    # not segfault.
+    src/dt_guest_mem.cpp
     # Native renderer (spike): plume bring-up + the game's 9 precompiled shaders.
     # dt_shader_blobs.cpp is GENERATED -- see _tools/daytona_d3d9_sigscan/gen_shader_blobs.py.
     src/dt_shader_blobs.cpp
