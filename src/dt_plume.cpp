@@ -67,8 +67,19 @@ struct FetchedAttribute {
     uint32_t format = 0;        // GPUVERTEXFORMAT
     uint32_t stride = 0;        // bytes (the instruction stores dwords)
     uint32_t offset = 0;        // bytes
-    bool num_format_all = false;
-    bool signed_all = false;
+    // ⚠ Both of these are decoded from the vfetch word, and both were wrong.
+    // Ground truth is rexglue's own rex/graphics/format/ucode.h:716-718:
+    //     is_signed()     { return fomat_comp_all == 1; }   // bit 12
+    //     is_normalized() { return num_format_all == 0; }   // bit 13
+    // and the XDK agrees on the polarity: GPUNUMFORMAT_FRACTION = 0,
+    // GPUNUMFORMAT_INTEGER = 1 (d3d9gpu.h:609-610).
+    //
+    // Stored as the QUESTIONS ASKED rather than as raw bit names, because
+    // "num_format_all" tells you nothing about which way round it goes and
+    // that is precisely how it came to be inverted.
+    bool normalized = false;   // num_format_all == 0
+    bool is_signed = false;    // fomat_comp_all == 1, bit 12 -- NOT bit 14,
+                               // which is signed_rf_mode_all (a rounding mode)
     // Fetch constant = constIndex*3 + constIndexSelect. It identifies the
     // STREAM, which is what an input slot must key on. Keying on stride
     // instead collapses a de-interleaved layout: every attribute sits at
@@ -264,7 +275,7 @@ const char* VertexFormatName(uint32_t f) {
 //
 // Returns UNKNOWN for anything unseen rather than guessing: a wrong vertex
 // format is silent corruption, not a crash.
-plume::RenderFormat ToRenderFormat(uint32_t gpu_format, bool num_format_all, bool signed_all) {
+plume::RenderFormat ToRenderFormat(uint32_t gpu_format, bool normalized, bool is_signed) {
     switch (gpu_format) {
         case 57:  // 32_32_32_FLOAT
             return plume::RenderFormat::R32G32B32_FLOAT;
@@ -275,13 +286,24 @@ plume::RenderFormat ToRenderFormat(uint32_t gpu_format, bool num_format_all, boo
         case 38:  // 32_32_32_32_FLOAT
             return plume::RenderFormat::R32G32B32A32_FLOAT;
         case 6:   // 8_8_8_8
-            // numFormatAll selects FRACTION (normalised) over INTEGER.
-            if (!num_format_all) {
-                return signed_all ? plume::RenderFormat::R8G8B8A8_SINT
-                                  : plume::RenderFormat::R8G8B8A8_UINT;
+            // ⚠ This was inverted, and it is why every draw came out black.
+            //
+            // D3DCOLOR / UBYTE4N are FRACTION, i.e. num_format_all == 0, i.e.
+            // NORMALISED -- so the correct format is UNORM. Binding UINT means
+            // D3D12's input assembler hands the shader raw 0..255 as integers
+            // in a float register: those bit patterns are denormals (~1e-43)
+            // and flush to zero. Every menu pixel shader multiplies by COLOR0
+            // (verified in the generated HLSL), so COLOR0 == 0 makes every
+            // output exactly zero in all four channels -- no API error, every
+            // pipeline builds, and the readback reports full coverage with no
+            // colour. Textures, samplers and constants are all irrelevant to
+            // it, which is exactly why the controls kept coming back clean.
+            if (normalized) {
+                return is_signed ? plume::RenderFormat::R8G8B8A8_SNORM
+                                 : plume::RenderFormat::R8G8B8A8_UNORM;
             }
-            return signed_all ? plume::RenderFormat::R8G8B8A8_SNORM
-                              : plume::RenderFormat::R8G8B8A8_UNORM;
+            return is_signed ? plume::RenderFormat::R8G8B8A8_SINT
+                             : plume::RenderFormat::R8G8B8A8_UINT;
         default:
             return plume::RenderFormat::UNKNOWN;
     }
@@ -617,8 +639,8 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
         a.usage_index = el.usage_index;
         a.instruction = el.address;
         a.format = (w1 >> 16) & 0x3F;
-        a.num_format_all = ((w1 >> 13) & 1) != 0;
-        a.signed_all = ((w1 >> 14) & 1) != 0;
+        a.normalized = ((w1 >> 13) & 1) == 0;   // num_format_all == 0
+        a.is_signed = ((w1 >> 12) & 1) != 0;    // fomat_comp_all
         a.stride = (w2 & 0xFF) * 4;
         a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
         a.fetch_const = ((w0 >> 20) & 0x1F) * 3 + ((w0 >> 25) & 0x3);
@@ -642,7 +664,7 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
     REXLOG_WARN("plume: vertex layout for {} via INCREMENTAL patch (ucode @{:08X}+{} dwords, decl={:08X})",
                 s.entry->name, ucode_ea, base_dword, decl_ea);
     for (const auto& a : s.attributes) {
-        const auto rf = ToRenderFormat(a.format, a.num_format_all, a.signed_all);
+        const auto rf = ToRenderFormat(a.format, a.normalized, a.is_signed);
         REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {:<4} -> plume {}",
                     UsageName(a.usage), a.usage_index, a.instruction,
                     a.format, VertexFormatName(a.format), a.stride, a.offset,
@@ -1738,11 +1760,26 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     // SrcImage_Texture2DDescriptorIndex at c0.x and its sampler index at c12.x.
     // Without these the shader samples heap slot 0 and the picture is whatever
     // happens to be there.
+    // Layout confirmed against the emitter (XenosRecomp shader_recompiler.cpp,
+    // the SharedConstants block) rather than inferred from one shader:
+    //   sN_Texture2DDescriptorIndex     c(N/4)[N%4]        -> s0 = c0.x
+    //   sN_Texture3DDescriptorIndex     c(4 + N/4)[N%4]
+    //   sN_TextureCubeDescriptorIndex   c(8 + N/4)[N%4]
+    //   sN_SamplerDescriptorIndex       c(12 + N/4)[N%4]   -> s0 = c12.x
+    //   g_Booleans c16.x, g_SwappedTexcoords c16.y,
+    //   g_HalfPixelOffset c16.zw, g_AlphaThreshold c17.x
+    //
+    // The tail may stay zero for now: these shaders are built with the
+    // ALPHA_TEST-off variant, and g_HalfPixelOffset only shifts the picture.
+    //
+    // ⚠ Every sampler, not just 0. ps_e785a247caf76ef9 declares SrcImage1 at
+    // c0.y/c12.y; filling only s0 left it reading heap slot 0.
     uint32_t shared[64][4] = {};
-    const uint32_t texture_slot = EnsureTexture(0, base);
-    if (texture_slot != UINT32_MAX) {
-        shared[0][0] = texture_slot;
-        shared[12][0] = 0;   // the one sampler
+    for (uint32_t s_i = 0; s_i < 8; ++s_i) {
+        const uint32_t slot = EnsureTexture(s_i, base);
+        if (slot == UINT32_MAX) continue;
+        shared[s_i / 4][s_i % 4] = slot;
+        shared[12 + s_i / 4][s_i % 4] = 0;   // the one sampler serves them all
     }
     if (!upload_constants(g_vs_constants, sizeof(g_vs_constants), vs_cb) ||
         !upload_constants(g_ps_constants, sizeof(g_ps_constants), ps_cb) ||
@@ -1882,6 +1919,39 @@ void EndFrame() {
     if (pixels == nullptr) {
         REXLOG_WARN("plume: frame readback map failed");
         return;
+    }
+
+    // DT_PLUME_DUMP=<frame> writes that reported frame out as a BMP. A pixel
+    // count says a picture exists; only a picture says it is the right one,
+    // and this spike has twice been misled by a number that was true.
+    // BMP because it needs no library: bottom-up rows of the BGRA we already
+    // have, which is exactly what the 32-bit format stores.
+    {
+        static const char* want = std::getenv("DT_PLUME_DUMP");
+        if (want != nullptr && g_frame_index == uint32_t(std::atoi(want))) {
+            const char* path = "plume_frame.bmp";
+            if (FILE* f = std::fopen(path, "wb")) {
+                const uint32_t image = kFrameW * kFrameH * 4;
+                const uint32_t offset = 14 + 40;
+                uint8_t header[54] = {};
+                header[0] = 'B'; header[1] = 'M';
+                auto put32 = [&](uint32_t at, uint32_t v) {
+                    header[at] = uint8_t(v); header[at + 1] = uint8_t(v >> 8);
+                    header[at + 2] = uint8_t(v >> 16); header[at + 3] = uint8_t(v >> 24);
+                };
+                put32(2, offset + image);
+                put32(10, offset);
+                put32(14, 40);
+                put32(18, kFrameW);
+                put32(22, uint32_t(-int32_t(kFrameH)));   // negative = top-down
+                header[26] = 1; header[28] = 32;          // 1 plane, 32 bpp
+                put32(34, image);
+                std::fwrite(header, 1, sizeof(header), f);
+                std::fwrite(pixels, 1, image, f);
+                std::fclose(f);
+                REXLOG_WARN("plume: wrote frame {} to {}", g_frame_index, path);
+            }
+        }
     }
     // "Differs from the clear", not "is not black": a shader that outputs black
     // is drawing, and counting non-black pixels once reported NOTHING DREW for
@@ -2023,7 +2093,7 @@ void BuildPipelines(const char* reason) {
         std::vector<plume::RenderInputElement> elements;
         bool usable = true;
         for (const auto& a : vs->second.attributes) {
-            const auto fmt = ToRenderFormat(a.format, a.num_format_all, a.signed_all);
+            const auto fmt = ToRenderFormat(a.format, a.normalized, a.is_signed);
             if (fmt == plume::RenderFormat::UNKNOWN) {
                 REXLOG_WARN("plume: combo {} unusable -- {}{} has unmapped GPUVERTEXFORMAT {}",
                             i, UsageName(a.usage), a.usage_index, a.format);
@@ -2219,8 +2289,8 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
             a.usage_index = el.usage_index;
             a.instruction = el.address;
             a.format = (w1 >> 16) & 0x3F;
-            a.num_format_all = ((w1 >> 13) & 1) != 0;
-            a.signed_all = ((w1 >> 14) & 1) != 0;
+            a.normalized = ((w1 >> 13) & 1) == 0;   // num_format_all == 0
+            a.is_signed = ((w1 >> 12) & 1) != 0;    // fomat_comp_all
             a.stride = (w2 & 0xFF) * 4;            // instruction stores dwords
             a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
             a.fetch_const = ((w0 >> 20) & 0x1F) * 3 + ((w0 >> 25) & 0x3);
@@ -2274,7 +2344,7 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
 
         REXLOG_WARN("plume: vertex layout for {} (microcode @{:08X})", s.entry->name, s.code_ea);
         for (const auto& a : s.attributes) {
-            const auto rf = ToRenderFormat(a.format, a.num_format_all, a.signed_all);
+            const auto rf = ToRenderFormat(a.format, a.normalized, a.is_signed);
             const uint32_t comp = ComponentBytes(a.format);
             REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {:<4} "
                         "-> plume {} , endian swap {}",
