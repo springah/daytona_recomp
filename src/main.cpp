@@ -433,7 +433,18 @@ protected:
         // headless; daytona always renders through the Xenos plugin. An
         // explicit --gpu_plugin (cvar non-empty by now) still takes precedence.
         if (config.gpu_plugin.empty()) {
-            config.gpu_plugin = "xenos";
+            // DT_PLUME_NOGPU=1 leaves it empty, i.e. genuinely headless: no
+            // Xenos emulation at all, with DT_PLUME's native renderer the only
+            // thing drawing. That is the end state this port is aiming at, and
+            // it is worth being able to reach it with an env var rather than a
+            // rebuild -- it says immediately what the native renderer would
+            // still have to supply (the vblank tick, the GPU MMIO range, and
+            // draining the PM4 ring so the guest does not stall on a full one).
+            if (std::getenv("DT_PLUME_NOGPU") != nullptr) {
+                REXLOG_WARN("DT_PLUME_NOGPU: no GPU plugin -- Xenos emulation is OFF");
+            } else {
+                config.gpu_plugin = "xenos";
+            }
         }
 
         // DT_NOAUDIO=1 swaps the SDL audio backend for the SDK's no-op one.
