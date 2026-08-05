@@ -70,7 +70,7 @@ endif()
 # Links rex::runtime, adds the generated entrypoint sources + SDK windowed-app
 # main, and applies platform settings (see generated/rexglue.cmake ->
 # rexglue_configure_target).
-rexglue_setup_target(daytona)
+rexglue_setup_target(daytona GPU_PLUGINS xenos)
 
 # Version for the window title (see main.cpp OnPreLaunchModule). Passed unquoted
 # and stringized in-source so it survives both the clang-cl and clang++ drivers.

@@ -425,6 +425,13 @@ protected:
         daytona_debug::SetStage(daytona_debug::AppStage::kPreSetup);
         REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
 
+        // Since the SDK's v0.9 GPU-plugin split an empty gpu_plugin means
+        // headless; daytona always renders through the Xenos plugin. An
+        // explicit --gpu_plugin (cvar non-empty by now) still takes precedence.
+        if (config.gpu_plugin.empty()) {
+            config.gpu_plugin = "xenos";
+        }
+
         // DT_NOAUDIO=1 swaps the SDL audio backend for the SDK's no-op one.
         //
         // Why this exists: the guest treats audio-device init failure as FATAL --
