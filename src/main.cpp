@@ -423,7 +423,11 @@ protected:
 
     void OnPreSetup(rex::RuntimeConfig& config) override {
         daytona_debug::SetStage(daytona_debug::AppStage::kPreSetup);
-        REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
+        // By-name set: this cvar's storage moved into the rexgpu-xenos plugin
+        // DLL with the SDK's v0.9 GPU split, so the link-time REXCVAR_SET
+        // macro can no longer reach it. The v0.9 deferred-registration cvar
+        // semantics apply the value when the plugin registers the flag.
+        rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
 
         // Since the SDK's v0.9 GPU-plugin split an empty gpu_plugin means
         // headless; daytona always renders through the Xenos plugin. An
@@ -477,11 +481,11 @@ protected:
         // (post-SDK-fixes). No env => current behavior.
         if (!std::getenv("DT_NO_READBACK")) {
 #if REX_HAS_D3D12
-        REXCVAR_SET(d3d12_readback_memexport, true);
-        REXCVAR_SET(d3d12_readback_resolve, true);
+        rex::cvar::SetFlagByName("d3d12_readback_memexport", "true");
+        rex::cvar::SetFlagByName("d3d12_readback_resolve", "true");
 #elif REX_HAS_VULKAN
-        REXCVAR_SET(vulkan_readback_memexport, true);
-        REXCVAR_SET(vulkan_readback_resolve, true);
+        rex::cvar::SetFlagByName("vulkan_readback_memexport", "true");
+        rex::cvar::SetFlagByName("vulkan_readback_resolve", "true");
 #endif
         }
 
@@ -500,7 +504,7 @@ protected:
         // to override and re-test FSI on Mac once that MoltenVK bug is fixed.
 #if REX_PLATFORM_MAC
         if (std::getenv("DT_FORCE_FSI")) {
-            REXCVAR_SET(render_target_path_vulkan, "fsi");
+            rex::cvar::SetFlagByName("render_target_path_vulkan", "fsi");
         }
 #else
         // DIAGNOSTIC escape (Deck perf investigation 2026-06-22): DT_RT_HOST=1 skips
@@ -508,7 +512,7 @@ protected:
         // host render-target path (like Mac) -- to measure perf + whether z-fighting
         // is now tolerable/fixed. No env => current behavior (FSI forced).
         if (!std::getenv("DT_RT_HOST")) {
-            REXCVAR_SET(render_target_path_vulkan, "fsi");
+            rex::cvar::SetFlagByName("render_target_path_vulkan", "fsi");
         }
 #endif
 
