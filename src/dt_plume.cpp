@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -898,6 +899,104 @@ void FlushConstants(const uint8_t* base) {
     g_pending_const_count = 0;
 }
 
+// ── Textures ─────────────────────────────────────────────────────────────────
+// The shaders sample bindlessly: `g_Texture2DDescriptorHeap[index]` with the
+// index read out of SharedConstants (the pixel shader declares
+// `SrcImage_Texture2DDescriptorIndex : packoffset(c0.x)` and its sampler index
+// at c12.x). So a texture reaches a draw by being placed in the space0
+// descriptor set and having its slot number written into b2.
+//
+// The source of truth for what to upload is the guest's Xenos texture fetch
+// constant. The fetch constant file sits at device+1152 in 24-byte slots -- the
+// same array the vertex fetch constants come from, since a slot is either one
+// texture constant (6 dwords) or three vertex constants (2 dwords each). That
+// is why vertex constant N is at +N*8 and sampler S is at +S*24.
+struct DecodedTexture {
+    uint32_t base_address = 0;   // physical
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t format = 0;
+    uint32_t pitch = 0;
+    bool tiled = false;
+    bool valid = false;
+};
+
+DecodedTexture ReadTextureFetchConstant(uint32_t sampler, const uint8_t* base) {
+    DecodedTexture out;
+    if (g_device_ea == 0 || sampler >= 8) return out;
+    const uint32_t ea = g_device_ea + 1152u + sampler * 24u;
+    const uint8_t* p = dt_guest_mem::Resolve(base, ea, 24);
+    if (p == nullptr) return out;
+
+    uint32_t d[6];
+    for (uint32_t i = 0; i < 6; ++i) d[i] = LoadBE32(p + i * 4);
+
+    // Layout per rex/graphics/xenos.h xe_gpu_texture_fetch_t. Decoded by hand
+    // rather than by including that header so the app does not depend on a
+    // plugin-internal type; the field positions are quoted alongside.
+    const uint32_t type = d[0] & 0x3;                   // FetchConstantType
+    out.pitch = (d[0] >> 22) & 0x1FF;                   // dword_0 +22, rows>>5
+    out.tiled = ((d[0] >> 31) & 0x1) != 0;              // dword_0 +31
+    out.format = d[1] & 0x3F;                           // dword_1 +0
+    out.base_address = ((d[1] >> 12) & 0xFFFFF) << 12;  // dword_1 +12, >>12
+    out.width = ((d[2] >> 0) & 0x1FFF) + 1;             // size_2d, stored -1
+    out.height = ((d[2] >> 13) & 0x1FFF) + 1;
+    // type 2 == kTexture; anything else is not a texture binding.
+    out.valid = (type == 2) && out.base_address != 0 && out.width > 0 && out.height > 0;
+    return out;
+}
+
+// Xenos 2D tiled address. Copied from rexglue's
+// graphics/pipeline/texture/util.cpp GetTiledOffset2D -- it is declared in a
+// public SDK header but DEFINED inside the rexgpu-xenos plugin, whose symbols
+// are hidden, so the app cannot link it.
+int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytes_per_block_log2) {
+    pitch = (pitch + 31u) & ~31u;   // align to the 32-block tile
+    int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (bytes_per_block_log2 + 7);
+    int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << bytes_per_block_log2;
+    int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+    return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+           (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+// Untile (if needed) and byte-swap one 32-bit-per-pixel texture into RGBA.
+//
+// Only 4-byte formats are handled; anything else is reported and skipped rather
+// than uploaded as garbage. Daytona's menu binds a 1920x1080 tiled k_8_8_8_8,
+// which is the case that matters first.
+bool ReadTexturePixels(const DecodedTexture& t, const uint8_t* base,
+                       std::vector<uint8_t>& out) {
+    constexpr uint32_t kFormat_8_8_8_8 = 6;
+    if (t.format != kFormat_8_8_8_8) return false;
+
+    const uint32_t pitch_texels = t.pitch * 32u;
+    const uint32_t src_pitch = std::max(pitch_texels, t.width);
+    const uint32_t needed = t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * 4u)
+                                    : (src_pitch * t.height * 4u);
+    const uint32_t va = dt_guest_mem::PhysicalToVirtual(t.base_address, needed);
+    if (va == 0) return false;
+    const uint8_t* src = dt_guest_mem::Resolve(base, va, needed);
+    if (src == nullptr) return false;
+
+    out.resize(size_t(t.width) * t.height * 4);
+    for (uint32_t y = 0; y < t.height; ++y) {
+        for (uint32_t x = 0; x < t.width; ++x) {
+            const uint32_t src_off =
+                t.tiled ? uint32_t(TiledOffset2D(int32_t(x), int32_t(y), src_pitch, 2))
+                        : ((y * src_pitch + x) * 4u);
+            if (src_off + 4 > needed) continue;
+            // Guest is big-endian ARGB; DXGI R8G8B8A8_UNORM wants R,G,B,A.
+            const uint32_t px = LoadBE32(src + src_off);
+            uint8_t* d = out.data() + (size_t(y) * t.width + x) * 4;
+            d[0] = uint8_t((px >> 16) & 0xFF);   // R
+            d[1] = uint8_t((px >> 8) & 0xFF);    // G
+            d[2] = uint8_t((px >> 0) & 0xFF);    // B
+            d[3] = uint8_t((px >> 24) & 0xFF);   // A
+        }
+    }
+    return true;
+}
+
 // ── Offscreen proof draw ─────────────────────────────────────────────────────
 // The point of this stage is to prove the whole path end to end -- guest vertex
 // data -> endian swap -> plume buffer -> the pipeline built from the derived
@@ -925,6 +1024,89 @@ std::unique_ptr<plume::RenderFramebuffer> g_framebuffer;
 std::unique_ptr<plume::RenderBuffer> g_readback;
 enum class OffscreenState { kNone, kReady, kFailed };
 OffscreenState g_offscreen = OffscreenState::kNone;
+
+std::unique_ptr<plume::RenderDescriptorSet> g_texture_set;
+std::unique_ptr<plume::RenderDescriptorSet> g_sampler_set;
+std::unique_ptr<plume::RenderSampler> g_sampler;
+std::vector<std::unique_ptr<plume::RenderTexture>> g_textures;
+std::unordered_map<uint32_t, uint32_t> g_texture_index;   // guest base address -> heap slot
+
+// Upload the texture bound to `sampler` and return its slot in the bindless
+// heap, or UINT32_MAX. Cached by guest base address: the menu rebinds the same
+// 1920x1080 surface every draw, and untiling it each time would be absurd.
+uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
+    const DecodedTexture t = ReadTextureFetchConstant(sampler, base);
+    if (!t.valid) return UINT32_MAX;
+    auto it = g_texture_index.find(t.base_address);
+    if (it != g_texture_index.end()) return it->second;
+
+    std::vector<uint8_t> pixels;
+    if (!ReadTexturePixels(t, base, pixels)) {
+        static std::set<uint32_t> reported;
+        if (reported.insert(t.format).second) {
+            REXLOG_WARN("plume: texture format {} ({}x{}, {}) not handled yet -- not uploaded",
+                        t.format, t.width, t.height, t.tiled ? "tiled" : "linear");
+        }
+        return UINT32_MAX;
+    }
+
+    // Is the source actually black, or did untiling produce zeros? Those need
+    // completely different fixes, and the readback cannot tell them apart.
+    {
+        size_t nonzero = 0;
+        for (size_t i = 0; i < pixels.size(); i += 4) {
+            if (pixels[i] | pixels[i + 1] | pixels[i + 2]) ++nonzero;
+        }
+        REXLOG_WARN("plume: untiled {}x{}: {} of {} texels have colour; centre = "
+                    "{:02X}{:02X}{:02X}{:02X}",
+                    t.width, t.height, nonzero, pixels.size() / 4,
+                    pixels[(size_t(t.height / 2) * t.width + t.width / 2) * 4 + 0],
+                    pixels[(size_t(t.height / 2) * t.width + t.width / 2) * 4 + 1],
+                    pixels[(size_t(t.height / 2) * t.width + t.width / 2) * 4 + 2],
+                    pixels[(size_t(t.height / 2) * t.width + t.width / 2) * 4 + 3]);
+    }
+
+    auto texture = g_device->createTexture(plume::RenderTextureDesc::Texture2D(
+        t.width, t.height, 1, plume::RenderFormat::R8G8B8A8_UNORM));
+    if (texture == nullptr) return UINT32_MAX;
+
+    // D3D12 wants each row of a buffer->texture copy 256-byte aligned, so the
+    // staging copy is repacked to that pitch rather than the texture's own.
+    const uint32_t row_bytes = t.width * 4;
+    const uint32_t padded = (row_bytes + 255u) & ~255u;
+    auto staging = g_device->createBuffer(
+        plume::RenderBufferDesc::UploadBuffer(uint64_t(padded) * t.height));
+    if (staging == nullptr) return UINT32_MAX;
+    auto* dst = static_cast<uint8_t*>(staging->map());
+    if (dst == nullptr) return UINT32_MAX;
+    for (uint32_t y = 0; y < t.height; ++y) {
+        std::memcpy(dst + size_t(y) * padded, pixels.data() + size_t(y) * row_bytes, row_bytes);
+    }
+    staging->unmap();
+
+    g_cmd->begin();
+    const plume::RenderTextureBarrier to_dst(texture.get(), plume::RenderTextureLayout::COPY_DEST);
+    g_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_dst, 1);
+    g_cmd->copyTextureRegion(
+        plume::RenderTextureCopyLocation::Subresource(texture.get()),
+        plume::RenderTextureCopyLocation::PlacedFootprint(
+            staging.get(), plume::RenderFormat::R8G8B8A8_UNORM, t.width, t.height, 1, padded / 4));
+    const plume::RenderTextureBarrier to_read(texture.get(),
+                                              plume::RenderTextureLayout::SHADER_READ);
+    g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
+    g_cmd->end();
+    const plume::RenderCommandList* lists[] = {g_cmd.get()};
+    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
+    g_queue->waitForCommandFence(g_fence.get());
+
+    const uint32_t slot = uint32_t(g_textures.size());
+    g_texture_set->setTexture(slot, texture.get(), plume::RenderTextureLayout::SHADER_READ);
+    g_textures.push_back(std::move(texture));
+    g_texture_index[t.base_address] = slot;
+    REXLOG_WARN("plume: uploaded texture {}x{} format {} {} base {:08X} -> heap slot {}",
+                t.width, t.height, t.format, t.tiled ? "tiled" : "linear", t.base_address, slot);
+    return slot;
+}
 
 bool EnsureOffscreen() {
     if (g_offscreen != OffscreenState::kNone) return g_offscreen == OffscreenState::kReady;
@@ -966,6 +1148,30 @@ bool EnsureOffscreen() {
         REXLOG_WARN("plume: readback buffer failed");
         return false;
     }
+
+    // The bindless heaps the shaders declare. Textures land in set 0 (space0);
+    // sets 1 and 2 (Texture3D/TextureCube) exist so the root signature matches
+    // the shaders, but Daytona binds neither.
+    plume::RenderDescriptorSetBuilder tex;
+    tex.begin();
+    tex.addTexture(0, kTextureDescriptorSize);
+    tex.end(true, kTextureDescriptorSize);
+    g_texture_set = tex.create(g_device.get());
+
+    plume::RenderDescriptorSetBuilder smp;
+    smp.begin();
+    smp.addSampler(0, kSamplerDescriptorSize);
+    smp.end(true, kSamplerDescriptorSize);
+    g_sampler_set = smp.create(g_device.get());
+
+    plume::RenderSamplerDesc sampler_desc;
+    g_sampler = g_device->createSampler(sampler_desc);
+    if (g_texture_set == nullptr || g_sampler_set == nullptr || g_sampler == nullptr) {
+        REXLOG_WARN("plume: descriptor sets/sampler failed -- textures={} samplers={} sampler={}",
+                    g_texture_set != nullptr, g_sampler_set != nullptr, g_sampler != nullptr);
+        return false;
+    }
+    g_sampler_set->setSampler(0, g_sampler.get());
 
     g_offscreen = OffscreenState::kReady;
     REXLOG_WARN("plume: offscreen target ready -- {}x{} {} + depth, with readback",
@@ -1112,6 +1318,15 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         return;
     }
     if (g_offscreen_verbose) {
+        // What is bound to each sampler? The shaders index a bindless heap, so
+        // this is the list of textures the draw would need uploaded.
+        for (uint32_t sampler = 0; sampler < 8; ++sampler) {
+            const DecodedTexture t = ReadTextureFetchConstant(sampler, base);
+            if (!t.valid) continue;
+            REXLOG_WARN("plume: sampler {} -> texture {}x{} format {} {} base {:08X} pitch {}",
+                        sampler, t.width, t.height, t.format,
+                        t.tiled ? "TILED" : "linear", t.base_address, t.pitch * 32);
+        }
         // Positive control against REX_DUMP_ALUCONST's ground truth for c72..c75:
         // {2,0,0,0 / 0,2,0,0 / 0,0,-1,0 / -1,-1,0,1}.
         for (uint32_t r = 72; r <= 75; ++r) {
@@ -1136,10 +1351,19 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     // Nothing this stage draws samples a texture and the shaders are built with
     // alpha test off, so zeros are correct here -- but the buffer must exist,
     // because an unbound root CBV reads undefined data.
-    static const float kZeroShared[64][4] = {};
+    // SharedConstants carries the bindless indices: the pixel shader declares
+    // SrcImage_Texture2DDescriptorIndex at c0.x and its sampler index at c12.x.
+    // Without these the shader samples heap slot 0 and the picture is whatever
+    // happens to be there.
+    uint32_t shared[64][4] = {};
+    const uint32_t texture_slot = EnsureTexture(0, base);
+    if (texture_slot != UINT32_MAX) {
+        shared[0][0] = texture_slot;
+        shared[12][0] = 0;   // the one sampler
+    }
     if (!upload_constants(g_vs_constants, sizeof(g_vs_constants), vs_cb) ||
         !upload_constants(g_ps_constants, sizeof(g_ps_constants), ps_cb) ||
-        !upload_constants(kZeroShared, sizeof(kZeroShared), shared_cb)) {
+        !upload_constants(shared, sizeof(shared), shared_cb)) {
         REXLOG_WARN("plume: could not upload the shader constant buffers");
         return;
     }
@@ -1177,6 +1401,9 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     g_cmd->setGraphicsRootDescriptor(vs_cb->at(0), 0);
     g_cmd->setGraphicsRootDescriptor(ps_cb->at(0), 1);
     g_cmd->setGraphicsRootDescriptor(shared_cb->at(0), 2);
+    Step("setGraphicsDescriptorSet x2");
+    g_cmd->setGraphicsDescriptorSet(g_texture_set.get(), 0);   // space0 Texture2D
+    g_cmd->setGraphicsDescriptorSet(g_sampler_set.get(), 3);   // space3 SamplerState
     Step("setViewports/setScissors");
     g_cmd->setViewports(&viewport, 1);
     g_cmd->setScissors(&scissor, 1);
@@ -1211,14 +1438,21 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         return;
     }
     uint32_t touched = 0;
+    uint32_t nonblack = 0;
     constexpr uint32_t kClear = 0xFFFF00FFu;   // B8G8R8A8 magenta, as stored
     uint32_t sample = 0;
     for (uint32_t i = 0; i < kOffscreenW * kOffscreenH; ++i) {
         const uint32_t px = (uint32_t(pixels[i * 4 + 0]) << 0) | (uint32_t(pixels[i * 4 + 1]) << 8) |
                             (uint32_t(pixels[i * 4 + 2]) << 16) | (uint32_t(pixels[i * 4 + 3]) << 24);
         if (px != kClear) {
-            if (touched == 0) sample = px;
             ++touched;
+            // "Covered" and "shaded something visible" are different questions.
+            // The first pixel of a texture is often legitimately black, so
+            // report the first pixel with actual colour separately.
+            if ((px & 0x00FFFFFFu) != 0) {
+                if (nonblack == 0) sample = px;
+                ++nonblack;
+            }
         }
     }
     g_readback->unmap();
@@ -1227,9 +1461,9 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
 
     if (touched != 0) {
         REXLOG_WARN("plume: OFFSCREEN DRAW {} + {} -- {} verts -> {} indices, {} slots; "
-                    "{} of {} pixels written, first {:08X}",
+                    "{} of {} pixels covered, {} with colour, first {:08X}",
                     s.entry->name, TopologyName(c.topology), vertex_count, index_count,
-                    views.size(), touched, kOffscreenW * kOffscreenH, sample);
+                    views.size(), touched, kOffscreenW * kOffscreenH, nonblack, sample);
     } else {
         // Every call above succeeds for a draw that covers nothing, so this is
         // the only thing that distinguishes "drew" from "ran".
