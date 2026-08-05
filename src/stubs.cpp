@@ -249,8 +249,48 @@ REX_HOOK_RAW(sub_82131088) {
 }
 DT_TRACE_HOOK(sub_8223CF68, daytona_debug::HookId::kD3DWorkerThread)  // D3D_WorkerThread (xps.obj)
 DT_TRACE_HOOK(sub_82233C78, daytona_debug::HookId::kD3DSyncToPresentation)      // D3DDevice_SynchronizeToPresentationInterval (swap.obj)
+// The boot present's wait loop. sub_82130D68 calls this repeatedly and spins
+// until the third dword it writes reaches zero:
+//
+//   loc_82130D90: sub_822337C0(device, &out); if (out[2] != 0) goto loc_82130D90;
+//
+// and this function computes out[2] = [device+16840] - [device+16848], i.e.
+// SUBMITTED minus RETIRED. So the guest is waiting for the GPU to retire what
+// it has queued, and something has to advance the retired counter.
+//
+// Logged because that difference is the whole question when the port hangs
+// here: a difference that never moves says the GPU never reported completion;
+// one that moves and stops says it reported the wrong thing.
 REX_HOOK_RAW(sub_822337C0) {
+    const uint32_t device = ctx.r3.u32;
+    const uint32_t out = ctx.r4.u32;
     __imp__sub_822337C0(ctx, base);
+    // ⚠ ON CHANGE ONLY. This is a spin loop running at millions of iterations a
+    // second: a "log every 20000 calls" throttle rotated the log file five
+    // times in two seconds and destroyed the startup lines this was meant to
+    // be read alongside. An instrument that floods the log deletes the
+    // evidence it exists to provide.
+    static uint32_t last_diff = 0xFFFFFFFFu;
+    static uint32_t last_vbl = 0xFFFFFFFFu;
+    const uint32_t submitted = REX_LOAD_U32(out + 4);
+    const uint32_t diff = REX_LOAD_U32(out + 8);
+    // device+16824 is the guest's OWN vblank counter, incremented by
+    // sub_82233448 on every vblank interrupt it accepts; the retire loop in
+    // that same function compares it against each queued entry's target and
+    // bumps device+16848 when one is due. Reporting it here says whether the
+    // interrupt is reaching the guest at all -- a frozen counter means the
+    // vblank never arrives, a climbing one means it arrives and the queue is
+    // the problem. Those need opposite fixes.
+    const uint32_t guest_vblanks = REX_LOAD_U32(device + 16824);
+    const uint32_t queue_head = REX_LOAD_U32(device + 16980);
+    const uint32_t queue_tail = REX_LOAD_U32(device + 16984);
+    if (diff != last_diff || (guest_vblanks / 60) != (last_vbl / 60)) {
+        last_diff = diff;
+        last_vbl = guest_vblanks;
+        REXLOG_WARN("Daytona present-wait: submitted={} outstanding={} guest-vblanks={} "
+                    "queue head={} tail={} (device {:08X})",
+                    submitted, diff, guest_vblanks, queue_head, queue_tail, device);
+    }
 }
 DT_TRACE_HOOK(sub_82235B20, daytona_debug::HookId::kD3DKickOff)  // D3D_CDevice_KickOff (ring.obj)
 DT_TRACE_HOOK(sub_82235D58, daytona_debug::HookId::kD3DBeginRingBig)  // D3D_CDevice_BeginRingBig (ring.obj)

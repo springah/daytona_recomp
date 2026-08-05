@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -183,6 +184,15 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
 
   uint32_t ReadRegister(uint32_t addr) {
     const uint32_t r = (addr & 0xFFFF) / 4;
+    // A guest that is stuck polling a register reads the SAME one thousands of
+    // times. Nothing else in this plugin can see that, and it is the cheapest
+    // way to tell "waiting on us" from "waiting on something else entirely".
+    if (r < kRegisterCount) {
+      if (++reg_reads_[r] == 2000) {
+        REXLOG_WARN("rexgpu-plume: guest has read register {:04X} 2000 times (value {:08X}) "
+                    "-- it is probably spinning on it", r, registers_[r]);
+      }
+    }
     switch (r) {
       case kReg_RB_EDRAM_TIMING:
         return 0x08100748;
@@ -324,22 +334,44 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
     // Type 3.
     if (reader->read_count() < count * sizeof(uint32_t)) return false;
     const uint32_t opcode = (packet >> 8) & 0x7F;
+    // What the guest actually submits is the whole question when it waits for
+    // work it believes is outstanding. Log the opcodes once each.
+    if (opcode < 128 && !opcode_seen_[opcode]) {
+      opcode_seen_[opcode] = true;
+      REXLOG_WARN("rexgpu-plume: first PM4 type-3 opcode {:02X} ({} words)", opcode, count);
+    }
     const size_t end = reader->read_offset() + count * sizeof(uint32_t);
 
     switch (opcode) {
       case 0x3F:      // INDIRECT_BUFFER
       case 0x37: {    // INDIRECT_BUFFER_PFD
         // Its contents can write memory too, so follow it rather than skip it.
-        const uint32_t list_ptr = reader->ReadAndSwap<uint32_t>();
+        // ⚠ The pointer must be masked to the physical range before it is
+        // translated: rexglue round-trips it through CpuToGpu (p & 0x1FFFFFFF)
+        // for exactly this reason. Passing the raw pointer translates to the
+        // wrong place, the sub-buffer decodes as garbage, and every packet
+        // inside it -- which is ALL the real work, since the ring itself only
+        // ever carries ME_INIT and INDIRECT_BUFFER -- is silently lost.
+        const uint32_t list_ptr = reader->ReadAndSwap<uint32_t>() & 0x1FFFFFFF;
         const uint32_t list_words = reader->ReadAndSwap<uint32_t>() & 0xFFFFF;
+        if (indirect_buffers_ < 4) {
+          REXLOG_WARN("rexgpu-plume: indirect buffer at {:08X}, {} words", list_ptr, list_words);
+        }
+        ++indirect_buffers_;
         if (list_words != 0 && indirect_depth_ < 4) {
           ++indirect_depth_;
           rex::memory::RingBuffer sub(memory_->TranslatePhysical(list_ptr),
                                       list_words * sizeof(uint32_t));
           sub.set_write_offset(list_words * sizeof(uint32_t));
-          while (sub.read_count() >= sizeof(uint32_t)) {
+          // ⚠ do/while, NOT while. set_write_offset takes the offset modulo
+          // the capacity, so a buffer that is exactly full sets write_offset
+          // to 0 -- and read_count() then reads 0 == 0 as EMPTY. A pre-test
+          // loop therefore executes nothing at all, silently, which is how
+          // every packet in every indirect buffer went missing while the walk
+          // looked like it was running. rexglue's do/while is load-bearing.
+          do {
             if (!ExecutePacket(&sub)) break;
-          }
+          } while (sub.read_count() >= sizeof(uint32_t));
           --indirect_depth_;
         }
         break;
@@ -376,6 +408,10 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         // the thing it is waiting for. The CPU also comes from the packet's
         // mask rather than being assumed.
         const uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+        if (cs_interrupts_ < 4) {
+          REXLOG_WARN("rexgpu-plume: command-stream INTERRUPT, cpu mask {:02X}", cpu_mask);
+        }
+        ++cs_interrupts_;
         for (uint32_t n = 0; n < 6; ++n) {
           if (cpu_mask & (1u << n)) DispatchInterrupt(1, n);
         }
@@ -451,6 +487,10 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // the drain thread's stack.
   uint32_t indirect_depth_ = 0;
   uint64_t packets_ = 0;
+  uint64_t indirect_buffers_ = 0;
+  uint64_t cs_interrupts_ = 0;
+  bool opcode_seen_[128] = {};
+  std::vector<uint32_t> reg_reads_ = std::vector<uint32_t>(kRegisterCount, 0);
   uint64_t wptr_writes_ = 0;
 
   uint64_t vblanks_ = 0;
