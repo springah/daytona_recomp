@@ -522,7 +522,7 @@ protected:
         // texture fetches to explicit (non-gradient) LOD removes the seams. Native
         // Vulkan is unaffected, so this is macOS-only.
 #if REX_PLATFORM_MAC
-        REXCVAR_SET(pixel_shader_explicit_lod, true);
+        rex::cvar::SetFlagByName("pixel_shader_explicit_lod", "true");
 #endif
 #endif
     }
