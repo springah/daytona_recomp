@@ -17,13 +17,24 @@ struct VertexElement {
     uint16_t address;
 };
 
+// One compiled specialisation. XenosRecomp targets lib_6_3 whenever a shader
+// uses spec constants, and D3D12 will not accept a library as a pipeline
+// shader -- so each value g_SpecConstants() can take is compiled ahead of
+// time to a real vs_6_0/ps_6_0. Daytona needs 2 per pixel shader (ALPHA_TEST).
+struct Variant {
+    uint32_t spec_constants;   // what g_SpecConstants() returns in this build
+    uint32_t dxil_offset, dxil_size;
+};
+
 struct Entry {
     uint64_t hash;                       // FNV-1a of the guest shader container
     const char* name;
     bool is_vertex;
-    uint32_t dxil_offset, dxil_size;
-    uint32_t spirv_offset, spirv_size;   // smol-v encoded
+    uint32_t spirv_offset, spirv_size;   // smol-v encoded; Vulkan takes spec
+                                         // constants natively, so it is unsplit
     uint32_t spec_constants_mask;
+    const Variant* variants;
+    uint32_t variant_count;
     const VertexElement* elements;       // vertex shaders only
     uint32_t element_count;
 };
@@ -37,5 +48,9 @@ extern const size_t kSpirvSize;
 
 // nullptr when no shader with that container hash is known.
 const Entry* Find(uint64_t hash);
+
+// The specialisation for these spec-constant values, or nullptr. Bits outside
+// the shader's own mask are ignored, so a caller may pass its whole state.
+const Variant* FindVariant(const Entry& entry, uint32_t spec_constants);
 
 }  // namespace dt_shader_blobs

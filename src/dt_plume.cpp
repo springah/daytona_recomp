@@ -342,6 +342,10 @@ uint32_t VulkanLocation(uint8_t usage, uint8_t index) {
 // Sizes of the unbounded descriptor arrays the translated shaders declare. The
 // game binds 8 samplers and, per the trace, has ~536 distinct textures; these
 // are ceilings for the heap, not a measured requirement.
+// Which shader specialisation to use. 0 = every spec constant off; the only one
+// Daytona's shaders declare is ALPHA_TEST. See the note at the pick site.
+constexpr uint32_t kSpecConstants = 0;
+
 constexpr uint32_t kTextureDescriptorSize = 1024;
 constexpr uint32_t kSamplerDescriptorSize = 64;
 
@@ -441,8 +445,24 @@ void OnShaderCreated(uint64_t container_hash, bool is_vertex) {
     const void* data = nullptr;
     uint64_t size = 0;
     if (g_shader_format == plume::RenderShaderFormat::DXIL) {
-        data = dt_shader_blobs::kDxil + entry->dxil_offset;
-        size = entry->dxil_size;
+        // Pick the specialisation. Every pixel shader here has an ALPHA_TEST
+        // spec constant, and D3D12 will not take the lib_6_3 that XenosRecomp
+        // emits for those, so the table carries a real ps_6_0 per value.
+        //
+        // ⚠ PROVISIONAL: alpha test is a guest render state we do not shadow
+        // yet, so this always takes the alpha-test-OFF build. Correct for the
+        // geometry, wrong for anything that clips -- wire it to the shadow
+        // state when the draw path reads render states.
+        const auto* variant = dt_shader_blobs::FindVariant(*entry, kSpecConstants);
+        if (variant == nullptr) {
+            ++g_failed;
+            REXLOG_WARN("plume: {} has no specialisation for spec constants {:#x} "
+                        "(mask {:#x}, {} variants)", entry->name, kSpecConstants,
+                        entry->spec_constants_mask, entry->variant_count);
+            return;
+        }
+        data = dt_shader_blobs::kDxil + variant->dxil_offset;
+        size = variant->dxil_size;
     } else {
         // SPIR-V in the table is smol-v encoded; decoding it needs smol-v, which
         // is not linked yet. D3D12 is the first target, so this is a stub.
