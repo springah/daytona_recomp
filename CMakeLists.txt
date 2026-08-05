@@ -73,7 +73,23 @@ endif()
 # Links rex::runtime, adds the generated entrypoint sources + SDK windowed-app
 # main, and applies platform settings (see generated/rexglue.cmake ->
 # rexglue_configure_target).
-rexglue_setup_target(daytona GPU_PLUGINS xenos)
+# rexgpu-plume -- the GPU plugin for the native renderer. It supplies the
+# guest-side bookkeeping a GPU owes the game (vblank + interrupt callback, the
+# register window, draining the ring) and executes no packets: the drawing
+# arrives through the D3D9 hooks instead. Staged next to the exe by
+# rexglue_setup_target's GPU_PLUGINS below, so --gpu_plugin=plume vs xenos is a
+# no-rebuild A/B. See src/gpu_plume/plugin.cpp for why it does not draw.
+#
+# Links rexruntime ONLY: it already contains the rexcore/rexui object
+# libraries, and linking those again duplicates every symbol in them.
+add_library(rexgpu-plume SHARED src/gpu_plume/plugin.cpp)
+set_target_properties(rexgpu-plume PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+target_link_libraries(rexgpu-plume PRIVATE rexruntime)
+
+rexglue_setup_target(daytona GPU_PLUGINS xenos plume)
 
 # Version for the window title (see main.cpp OnPreLaunchModule). Passed unquoted
 # and stringized in-source so it survives both the clang-cl and clang++ drivers.
