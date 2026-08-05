@@ -933,6 +933,10 @@ struct DecodedTexture {
     uint32_t format = 0;
     uint32_t pitch = 0;
     bool tiled = false;
+    // Endian (xenos.h): 0 none, 1 8in16, 2 8in32, 3 16in32. Read rather than
+    // assumed -- the swap width is a property of the binding, and picking it by
+    // convention is how a texture comes out plausible but wrong.
+    uint32_t endianness = 0;
     bool valid = false;
 };
 
@@ -953,6 +957,7 @@ DecodedTexture ReadTextureFetchConstant(uint32_t sampler, const uint8_t* base) {
     out.pitch = (d[0] >> 22) & 0x1FF;                   // dword_0 +22, rows>>5
     out.tiled = ((d[0] >> 31) & 0x1) != 0;              // dword_0 +31
     out.format = d[1] & 0x3F;                           // dword_1 +0
+    out.endianness = (d[1] >> 6) & 0x3;                 // dword_1 +6
     out.base_address = ((d[1] >> 12) & 0xFFFFF) << 12;  // dword_1 +12, >>12
     out.width = ((d[2] >> 0) & 0x1FFF) + 1;             // size_2d, stored -1
     out.height = ((d[2] >> 13) & 0x1FFF) + 1;
@@ -974,27 +979,29 @@ int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytes_per_b
            (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
 }
 
-// Untile (if needed) and byte-swap one 32-bit-per-pixel texture into RGBA.
+// One texture ready to upload: rows packed tightly, in a format plume takes.
 //
-// Only 4-byte formats are handled; anything else is reported and skipped rather
-// than uploaded as garbage. Daytona's menu binds a 1920x1080 tiled k_8_8_8_8,
-// which is the case that matters first.
-bool ReadTexturePixels(const DecodedTexture& t, const uint8_t* base,
-                       std::vector<uint8_t>& out) {
-    constexpr uint32_t kFormat_8_8_8_8 = 6;
-    if (t.format != kFormat_8_8_8_8) return false;
+// Rows are rows of BLOCKS, not of texels, so the compressed and uncompressed
+// paths share the staging and copy code below. For an uncompressed format the
+// block is 1x1 and the two are the same thing.
+struct TextureUpload {
+    std::vector<uint8_t> data;
+    plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
+    uint32_t row_bytes = 0;   // bytes in one row of blocks
+    uint32_t rows = 0;        // rows of blocks
+    uint32_t block = 1;       // texels per block edge
+};
 
-    const uint32_t pitch_texels = t.pitch * 32u;
-    const uint32_t src_pitch = std::max(pitch_texels, t.width);
-    const uint32_t needed = t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * 4u)
-                                    : (src_pitch * t.height * 4u);
-    // PhysicalToVirtual returns the FIRST readable alias, which was right for
-    // vertex data but proves nothing for a render target: the 360 maps the same
-    // physical memory into several windows, and a mapped-but-stale one reads as
-    // zeros. Pick the alias that actually HAS content, and say which.
+// Where a texture's bytes actually live.
+//
+// PhysicalToVirtual returns the FIRST readable alias, which was right for
+// vertex data but proves nothing for a surface: the 360 maps the same physical
+// memory into several windows, and a mapped-but-stale one reads as zeros. Pick
+// the alias that actually HAS content, and say which.
+const uint8_t* ResolveTextureMemory(const DecodedTexture& t, const uint8_t* base,
+                                    uint32_t needed) {
     static constexpr uint32_t kAliases[] = {0xA0000000u, 0xC0000000u, 0xE0000000u, 0x80000000u};
     const uint8_t* src = nullptr;
-    uint32_t chosen = 0;
     for (uint32_t alias : kAliases) {
         const uint8_t* p = dt_guest_mem::Resolve(base, alias | t.base_address, needed);
         if (p == nullptr) continue;
@@ -1007,14 +1014,110 @@ bool ReadTexturePixels(const DecodedTexture& t, const uint8_t* base,
         }
         if (src == nullptr || nonzero != 0) {
             src = p;
-            chosen = alias;
             if (nonzero != 0) break;
         }
     }
-    if (src == nullptr) return false;
-    (void)chosen;
+    return src;
+}
 
-    out.resize(size_t(t.width) * t.height * 4);
+// Undo the GPU-side endian swap the fetch constant asks for. The width is a
+// property of the BINDING, so it is read from the constant rather than assumed:
+// a 16-bit swap applied to 32-bit data produces a texture that looks plausible
+// and is wrong, which is the expensive kind of wrong.
+void ApplyEndianSwap(uint8_t* p, size_t bytes, uint32_t endianness) {
+    switch (endianness) {
+        case 1:   // k8in16
+            for (size_t i = 0; i + 2 <= bytes; i += 2) std::swap(p[i], p[i + 1]);
+            break;
+        case 2:   // k8in32
+            for (size_t i = 0; i + 4 <= bytes; i += 4) {
+                std::swap(p[i], p[i + 3]);
+                std::swap(p[i + 1], p[i + 2]);
+            }
+            break;
+        case 3:   // k16in32
+            for (size_t i = 0; i + 4 <= bytes; i += 4) {
+                std::swap(p[i], p[i + 2]);
+                std::swap(p[i + 1], p[i + 3]);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+// Read one texture out of guest memory into something uploadable.
+//
+// The DXT formats are passed through COMPRESSED rather than decoded: D3D12 and
+// Vulkan both take BC1/2/3 natively, the block layout is identical to the
+// guest's, and decoding would cost a decompressor plus 8x the memory to arrive
+// at the same picture. Only the endian swap is undone.
+//
+// Anything else is reported and skipped rather than uploaded as garbage.
+bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& out) {
+    constexpr uint32_t kFormat_8_8_8_8 = 6;
+    constexpr uint32_t kFormat_DXT1 = 18, kFormat_DXT2_3 = 19, kFormat_DXT4_5 = 20;
+
+    if (t.format == kFormat_DXT1 || t.format == kFormat_DXT2_3 || t.format == kFormat_DXT4_5) {
+        const uint32_t block_bytes = (t.format == kFormat_DXT1) ? 8u : 16u;
+        out.format = (t.format == kFormat_DXT1)   ? plume::RenderFormat::BC1_UNORM
+                     : (t.format == kFormat_DXT2_3) ? plume::RenderFormat::BC2_UNORM
+                                                    : plume::RenderFormat::BC3_UNORM;
+        out.block = 4;
+
+        // `pitch` is in texels (stored >>5) even for a block format, and it can
+        // exceed the width -- linear textures are padded to 256 bytes a row.
+        const uint32_t src_texels = std::max(t.pitch * 32u, t.width);
+        const uint32_t src_blocks = (src_texels + 3u) / 4u;
+        out.rows = (t.height + 3u) / 4u;
+        const uint32_t dst_blocks = (t.width + 3u) / 4u;
+        out.row_bytes = dst_blocks * block_bytes;
+
+        // Tiling for a compressed format is the SAME swizzle, applied over
+        // blocks instead of texels: the pitch counts blocks and the element
+        // size is the block size. Getting that wrong produces a picture that is
+        // recognisably the right texture, shuffled -- so it is worth stating
+        // that this is the block interpretation and not a second algorithm.
+        const uint32_t block_log2 = (block_bytes == 8u) ? 3u : 4u;
+        const uint32_t needed =
+            t.tiled ? (((src_blocks + 31u) & ~31u) * ((out.rows + 31u) & ~31u) * block_bytes)
+                    : (src_blocks * block_bytes * out.rows);
+        const uint8_t* src = ResolveTextureMemory(t, base, needed);
+        if (src == nullptr) return false;
+
+        out.data.resize(size_t(out.row_bytes) * out.rows);
+        for (uint32_t by = 0; by < out.rows; ++by) {
+            uint8_t* dst_row = out.data.data() + size_t(by) * out.row_bytes;
+            if (!t.tiled) {
+                std::memcpy(dst_row, src + size_t(by) * src_blocks * block_bytes, out.row_bytes);
+                continue;
+            }
+            for (uint32_t bx = 0; bx < dst_blocks; ++bx) {
+                const uint32_t off = uint32_t(
+                    TiledOffset2D(int32_t(bx), int32_t(by), src_blocks, block_log2));
+                if (off + block_bytes > needed) continue;
+                std::memcpy(dst_row + size_t(bx) * block_bytes, src + off, block_bytes);
+            }
+        }
+        ApplyEndianSwap(out.data.data(), out.data.size(), t.endianness);
+        return true;
+    }
+
+    if (t.format != kFormat_8_8_8_8) return false;
+
+    out.format = plume::RenderFormat::R8G8B8A8_UNORM;
+    out.block = 1;
+    out.row_bytes = t.width * 4u;
+    out.rows = t.height;
+
+    const uint32_t pitch_texels = t.pitch * 32u;
+    const uint32_t src_pitch = std::max(pitch_texels, t.width);
+    const uint32_t needed = t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * 4u)
+                                    : (src_pitch * t.height * 4u);
+    const uint8_t* src = ResolveTextureMemory(t, base, needed);
+    if (src == nullptr) return false;
+
+    out.data.resize(size_t(t.width) * t.height * 4);
     for (uint32_t y = 0; y < t.height; ++y) {
         for (uint32_t x = 0; x < t.width; ++x) {
             const uint32_t src_off =
@@ -1023,7 +1126,7 @@ bool ReadTexturePixels(const DecodedTexture& t, const uint8_t* base,
             if (src_off + 4 > needed) continue;
             // Guest is big-endian ARGB; DXGI R8G8B8A8_UNORM wants R,G,B,A.
             const uint32_t px = LoadBE32(src + src_off);
-            uint8_t* d = out.data() + (size_t(y) * t.width + x) * 4;
+            uint8_t* d = out.data.data() + (size_t(y) * t.width + x) * 4;
             d[0] = uint8_t((px >> 16) & 0xFF);   // R
             d[1] = uint8_t((px >> 8) & 0xFF);    // G
             d[2] = uint8_t((px >> 0) & 0xFF);    // B
@@ -1058,8 +1161,13 @@ constexpr uint32_t kFrameH = 720;
 // A safety ceiling, not a sampling limit: the census peak is ~885 draws/frame,
 // so this only ever trips if something loops.
 constexpr uint32_t kMaxDrawsPerFrame = 8192;
-// How many frames get the full readback + coverage report before it goes quiet.
+// Which frames get the full readback + coverage report. The first few, and
+// then periodically forever: the interesting content arrives long after boot
+// (the menu's real textures only load once the attract sequence advances), and
+// a measurement that stops at frame 8 goes blind exactly when it starts to
+// matter.
 constexpr uint32_t kReportedFrames = 8;
+constexpr uint32_t kReportInterval = 300;
 
 // The frame clear. Dark blue-grey: not black (a shader that outputs black is
 // still drawing, and "count the non-black pixels" once reported NOTHING DREW
@@ -1110,18 +1218,22 @@ std::unique_ptr<plume::RenderDescriptorSet> g_sampler_set;
 std::unique_ptr<plume::RenderSampler> g_sampler;
 std::vector<std::unique_ptr<plume::RenderTexture>> g_textures;
 std::unordered_map<uint32_t, uint32_t> g_texture_index;   // guest base address -> heap slot
+// DT_PLUME_TEXCONTROL: the whole heap is the control checker, so guest textures
+// must not be uploaded over it.
+bool g_control_texture_only = false;
 
 // Upload the texture bound to `sampler` and return its slot in the bindless
 // heap, or UINT32_MAX. Cached by guest base address: the menu rebinds the same
 // 1920x1080 surface every draw, and untiling it each time would be absurd.
 uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
+    if (g_control_texture_only) return 0;   // every slot is the checker
     const DecodedTexture t = ReadTextureFetchConstant(sampler, base);
     if (!t.valid) return UINT32_MAX;
     auto it = g_texture_index.find(t.base_address);
     if (it != g_texture_index.end()) return it->second;
 
-    std::vector<uint8_t> pixels;
-    if (!ReadTexturePixels(t, base, pixels)) {
+    TextureUpload up;
+    if (!ReadTexture(t, base, up)) {
         static std::set<uint32_t> reported;
         if (reported.insert(t.format).second) {
             REXLOG_WARN("plume: texture format {} ({}x{}, {}) not handled yet -- not uploaded",
@@ -1130,39 +1242,43 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
         return UINT32_MAX;
     }
 
-    // Is the source actually black, or did untiling produce zeros? Those need
+    // Is the source actually black, or did the read produce zeros? Those need
     // completely different fixes, and the readback cannot tell them apart.
+    // Counted over raw bytes so it means something for compressed data too,
+    // where there are no texels to inspect without a decompressor.
     {
         size_t nonzero = 0;
-        for (size_t i = 0; i < pixels.size(); i += 4) {
-            if (pixels[i] | pixels[i + 1] | pixels[i + 2]) ++nonzero;
-        }
-        REXLOG_WARN("plume: untiled {}x{}: {} of {} texels have colour; centre = "
-                    "{:02X}{:02X}{:02X}{:02X}",
-                    t.width, t.height, nonzero, pixels.size() / 4,
-                    pixels[(size_t(t.height / 2) * t.width + t.width / 2) * 4 + 0],
-                    pixels[(size_t(t.height / 2) * t.width + t.width / 2) * 4 + 1],
-                    pixels[(size_t(t.height / 2) * t.width + t.width / 2) * 4 + 2],
-                    pixels[(size_t(t.height / 2) * t.width + t.width / 2) * 4 + 3]);
+        for (uint8_t byte : up.data) nonzero += (byte != 0);
+        REXLOG_WARN("plume: texture {:08X} {}x{} read as {} rows x {} B: {} of {} bytes non-zero "
+                    "(endian {})",
+                    t.base_address, t.width, t.height, up.rows, up.row_bytes, nonzero,
+                    up.data.size(), t.endianness);
     }
 
-    auto texture = g_device->createTexture(plume::RenderTextureDesc::Texture2D(
-        t.width, t.height, 1, plume::RenderFormat::R8G8B8A8_UNORM));
+    auto texture = g_device->createTexture(
+        plume::RenderTextureDesc::Texture2D(t.width, t.height, 1, up.format));
     if (texture == nullptr) return UINT32_MAX;
 
     // D3D12 wants each row of a buffer->texture copy 256-byte aligned, so the
     // staging copy is repacked to that pitch rather than the texture's own.
-    const uint32_t row_bytes = t.width * 4;
-    const uint32_t padded = (row_bytes + 255u) & ~255u;
+    const uint32_t padded = (up.row_bytes + 255u) & ~255u;
     auto staging = g_device->createBuffer(
-        plume::RenderBufferDesc::UploadBuffer(uint64_t(padded) * t.height));
+        plume::RenderBufferDesc::UploadBuffer(uint64_t(padded) * up.rows));
     if (staging == nullptr) return UINT32_MAX;
     auto* dst = static_cast<uint8_t*>(staging->map());
     if (dst == nullptr) return UINT32_MAX;
-    for (uint32_t y = 0; y < t.height; ++y) {
-        std::memcpy(dst + size_t(y) * padded, pixels.data() + size_t(y) * row_bytes, row_bytes);
+    for (uint32_t y = 0; y < up.rows; ++y) {
+        std::memcpy(dst + size_t(y) * padded, up.data.data() + size_t(y) * up.row_bytes,
+                    up.row_bytes);
     }
     staging->unmap();
+
+    // plume takes the footprint pitch in TEXELS and converts: it divides by the
+    // block edge and multiplies by the format's block size. So the padded byte
+    // pitch has to be expressed back in texels, which for a block format means
+    // padded/blockBytes blocks, each `block` texels wide.
+    const uint32_t block_bytes = (up.block == 1) ? 4u : (up.row_bytes / ((t.width + 3u) / 4u));
+    const uint32_t footprint_texels = (padded / block_bytes) * up.block;
 
     g_upload_cmd->begin();
     const plume::RenderTextureBarrier to_dst(texture.get(), plume::RenderTextureLayout::COPY_DEST);
@@ -1170,7 +1286,7 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     g_upload_cmd->copyTextureRegion(
         plume::RenderTextureCopyLocation::Subresource(texture.get()),
         plume::RenderTextureCopyLocation::PlacedFootprint(
-            staging.get(), plume::RenderFormat::R8G8B8A8_UNORM, t.width, t.height, 1, padded / 4));
+            staging.get(), up.format, t.width, t.height, 1, footprint_texels));
     const plume::RenderTextureBarrier to_read(texture.get(),
                                               plume::RenderTextureLayout::SHADER_READ);
     g_upload_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
@@ -1183,8 +1299,10 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     g_texture_set->setTexture(slot, texture.get(), plume::RenderTextureLayout::SHADER_READ);
     g_textures.push_back(std::move(texture));
     g_texture_index[t.base_address] = slot;
-    REXLOG_WARN("plume: uploaded texture {}x{} format {} {} base {:08X} -> heap slot {}",
-                t.width, t.height, t.format, t.tiled ? "tiled" : "linear", t.base_address, slot);
+    REXLOG_WARN("plume: uploaded texture {}x{} guest format {} as plume format {} {} base {:08X} "
+                "-> heap slot {}",
+                t.width, t.height, t.format, static_cast<uint32_t>(up.format),
+                t.tiled ? "tiled" : "linear", t.base_address, slot);
     return slot;
 }
 
@@ -1315,6 +1433,68 @@ bool EnsureOffscreen() {
         return false;
     }
     g_sampler_set->setSampler(0, g_sampler.get());
+
+    // ── Positive control for the bindless path ───────────────────────────────
+    // Heap slot 0 is a 2x2 magenta/green checker that no guest texture can
+    // produce, uploaded before any of them so real textures start at slot 1.
+    //
+    // It answers a question the frame readback cannot. Every draw currently
+    // comes out black, and there are two very different reasons that could be
+    // true: the shaders are sampling the texture we point them at and it is
+    // black, or the descriptor index never reaches them and they are all
+    // sampling slot 0. If the frame turns into the checker, it is the second.
+    {
+        static const uint8_t kCheck[16] = {
+            255, 0, 255, 255,   0, 255, 0, 255,
+            0, 255, 0, 255,     255, 0, 255, 255,
+        };
+        auto control = g_device->createTexture(
+            plume::RenderTextureDesc::Texture2D(2, 2, 1, plume::RenderFormat::R8G8B8A8_UNORM));
+        auto staging = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(256 * 2));
+        void* p = (control != nullptr && staging != nullptr) ? staging->map() : nullptr;
+        if (p != nullptr) {
+            std::memcpy(static_cast<uint8_t*>(p) + 0, kCheck + 0, 8);
+            std::memcpy(static_cast<uint8_t*>(p) + 256, kCheck + 8, 8);
+            staging->unmap();
+
+            g_upload_cmd->begin();
+            const plume::RenderTextureBarrier to_dst(control.get(),
+                                                     plume::RenderTextureLayout::COPY_DEST);
+            g_upload_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_dst, 1);
+            g_upload_cmd->copyTextureRegion(
+                plume::RenderTextureCopyLocation::Subresource(control.get()),
+                plume::RenderTextureCopyLocation::PlacedFootprint(
+                    staging.get(), plume::RenderFormat::R8G8B8A8_UNORM, 2, 2, 1, 64));
+            const plume::RenderTextureBarrier to_read(control.get(),
+                                                      plume::RenderTextureLayout::SHADER_READ);
+            g_upload_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
+            g_upload_cmd->end();
+            const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
+            g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_upload_fence.get());
+            g_queue->waitForCommandFence(g_upload_fence.get());
+
+            // DT_PLUME_TEXCONTROL=1 puts the checker in EVERY heap slot, so no
+            // descriptor index can be wrong. Putting it only in slot 0 answered
+            // a narrower question than it looked like it did: the frame stayed
+            // black, which rules out "everything samples slot 0" but not "the
+            // index points somewhere unbound". Filling the heap removes the
+            // index from the experiment entirely -- if the frame is STILL
+            // black, nothing about texture binding is the cause and the zero
+            // is coming from after the sample.
+            const char* all = std::getenv("DT_PLUME_TEXCONTROL");
+            const uint32_t fill = (all != nullptr && all[0] == '1') ? kTextureDescriptorSize : 1;
+            for (uint32_t i = 0; i < fill; ++i) {
+                g_texture_set->setTexture(i, control.get(), plume::RenderTextureLayout::SHADER_READ);
+            }
+            g_control_texture_only = (fill > 1);
+            g_textures.push_back(std::move(control));
+            REXLOG_WARN("plume: control checker in {} heap slot(s){}", fill,
+                        g_control_texture_only
+                            ? " -- DT_PLUME_TEXCONTROL: guest textures are NOT uploaded, so a "
+                              "black frame cannot be blamed on texture binding"
+                            : " (slot 0)");
+        }
+    }
 
 #ifdef _WIN32
     if (EnsureWindow()) {
@@ -1644,7 +1824,8 @@ void EndFrame() {
     g_frame_open = false;
     ++g_frame_index;
 
-    const bool report = g_frame_index <= kReportedFrames;
+    const bool report =
+        g_frame_index <= kReportedFrames || (g_frame_index % kReportInterval) == 0;
 
     uint32_t swap_index = 0;
     plume::RenderTexture* backbuffer = nullptr;
