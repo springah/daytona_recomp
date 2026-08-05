@@ -685,6 +685,7 @@ bool BuildIndexBuffers() {
 // Defined below, next to the offscreen target it renders into.
 void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
                    const uint8_t* base);
+void FlushConstants(const uint8_t* base);
 
 void SnapshotDrawVertices(const uint8_t* base) {
     const uint32_t start_vertex = g_draw_start;
@@ -704,6 +705,12 @@ void SnapshotDrawVertices(const uint8_t* base) {
     auto sit = g_shaders.find(g_draw_vs);
     if (sit == g_shaders.end() || !sit->second.layout_done) return;
     Created& s = sit->second;
+
+    // Constants arrive ~9 times a frame and the pending list is 64 deep, so it
+    // must be drained on EVERY draw. Draining only at the (once per
+    // combination) offscreen draw overflowed it within the first few frames and
+    // dropped every region, which looked exactly like "the constants are wrong".
+    FlushConstants(base);
 
     // The real work: upload this draw's vertex data and render it offscreen.
     // Kept ahead of the logging below because it is now the point, and it is
@@ -805,6 +812,92 @@ void SnapshotDrawVertices(const uint8_t* base) {
     }
 }
 
+// ── Shader constants ─────────────────────────────────────────────────────────
+// The game sets every float constant through D3DDevice_GpuBeginShaderConstantF4,
+// which returns a pointer for the game to write into. Nothing is shadowed in
+// D3DDevice -- searching 128 KB around it for a known matrix found nothing, and
+// SetPending_AluConstants' pointer argument moves per call and does not hold the
+// values either. So the only way to read them is to remember where each block
+// went and read it once the game has written it.
+//
+// Ground truth for cross-checking comes from REX_DUMP_ALUCONST in rexglue's D3D12
+// command processor, which prints what the translated shader actually receives:
+// vertex c72..c75 = {2,0,0,0 / 0,2,0,0 / 0,0,-1,0 / -1,-1,0,1}, a 2D ortho
+// matrix. That is what these constants must reproduce.
+
+constexpr uint32_t kConstRegisters = 256;   // float4s per stage, Xenos
+constexpr uint32_t kMaxPendingConst = 64;
+
+struct PendingConstants {
+    bool pixel = false;
+    uint32_t start = 0;
+    uint32_t count = 0;
+    uint32_t ea = 0;
+};
+PendingConstants g_pending_const[kMaxPendingConst];
+uint32_t g_pending_const_count = 0;
+uint32_t g_pending_const_dropped = 0;
+
+float g_vs_constants[kConstRegisters][4] = {};
+float g_ps_constants[kConstRegisters][4] = {};
+bool g_constants_seen = false;
+
+void OnGpuBeginShaderConstantF4(bool pixel_shader, uint32_t start_register, uint32_t count,
+                                uint32_t dest_ea, const uint8_t* base) {
+    if (!Enabled() || dest_ea == 0 || count == 0) return;
+    // ⚠ The pointer aims into the COMMAND BUFFER RING, which the game keeps
+    // advancing. Reading a block at the next DRAW was far too late: the bytes
+    // there had already become later PM4 packets (type-3 headers, physical
+    // addresses). Drain whatever is outstanding now instead -- one
+    // constant-set interval old, not a whole frame.
+    FlushConstants(base);
+    if (g_pending_const_count >= kMaxPendingConst) {
+        ++g_pending_const_dropped;   // reported, never silently lost
+        return;
+    }
+    g_pending_const[g_pending_const_count++] = {pixel_shader, start_register, count, dest_ea};
+    static bool logged_vs = false;
+    if (!pixel_shader && start_register == 72 && !logged_vs) {
+        logged_vs = true;
+        REXLOG_WARN("plume: first vertex constant block -- start={} count={} dest={:08X}",
+                    start_register, count, dest_ea);
+    }
+}
+
+// Read everything written since the last draw into the shadow. Done at draw
+// time on purpose: at the moment of the call the game has not written the
+// values yet, so reading then yields whatever the buffer held before.
+void FlushConstants(const uint8_t* base) {
+    for (uint32_t i = 0; i < g_pending_const_count; ++i) {
+        const PendingConstants& p = g_pending_const[i];
+        if (p.start >= kConstRegisters) continue;
+        const uint32_t count = std::min(p.count, kConstRegisters - p.start);
+        const uint8_t* src = dt_guest_mem::Resolve(base, p.ea, count * 16);
+        if (src == nullptr) continue;
+        if (!p.pixel && p.start == 72) {
+            static bool shown = false;
+            if (!shown) {
+                shown = true;
+                REXLOG_WARN("plume: raw dwords at {:08X} (vertex c72, {} regs):", p.ea, count);
+                for (uint32_t v = 0; v < count; ++v) {
+                    REXLOG_WARN("   {:08X} {:08X} {:08X} {:08X}",
+                                LoadBE32(src + v * 16 + 0), LoadBE32(src + v * 16 + 4),
+                                LoadBE32(src + v * 16 + 8), LoadBE32(src + v * 16 + 12));
+                }
+            }
+        }
+        auto* dst = p.pixel ? g_ps_constants : g_vs_constants;
+        for (uint32_t v = 0; v < count; ++v) {
+            for (uint32_t c = 0; c < 4; ++c) {
+                const uint32_t bits = LoadBE32(src + (v * 4 + c) * 4);
+                std::memcpy(&dst[p.start + v][c], &bits, sizeof(float));
+            }
+        }
+        g_constants_seen = true;
+    }
+    g_pending_const_count = 0;
+}
+
 // ── Offscreen proof draw ─────────────────────────────────────────────────────
 // The point of this stage is to prove the whole path end to end -- guest vertex
 // data -> endian swap -> plume buffer -> the pipeline built from the derived
@@ -818,7 +911,10 @@ void SnapshotDrawVertices(const uint8_t* base) {
 
 constexpr uint32_t kOffscreenW = 256;
 constexpr uint32_t kOffscreenH = 256;
-constexpr uint32_t kOffscreenDrawsPerCombo = 1;
+// Try several draws per combination: the first one a combination makes is not
+// necessarily representative, and a single degenerate quad is indistinguishable
+// from a broken pipeline when the only signal is "no pixels".
+constexpr uint32_t kOffscreenDrawsPerCombo = 8;
 
 std::unique_ptr<plume::RenderCommandQueue> g_queue;
 std::unique_ptr<plume::RenderCommandList> g_cmd;
@@ -973,7 +1069,24 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
                         "has no readable vertex data", sl, c.slot_consts[sl], c.slots[sl].stride);
             return;
         }
-        if (sl == 0) first_src_ea = src_ea;
+        if (sl == 0) {
+            first_src_ea = src_ea;
+            // What geometry is this actually? A degenerate quad draws nothing
+            // and looks identical to a broken pipeline from the readback alone.
+            if (c.offscreen_draws <= 2) {
+                std::string pos;
+                const uint32_t stride = c.slots[sl].stride;
+                for (uint32_t v = 0; v < vertex_count && v < 8; ++v) {
+                    float f[3] = {};
+                    for (uint32_t k = 0; k < 3 && (v * stride + k * 4 + 4) <= bytes.size(); ++k) {
+                        std::memcpy(&f[k], bytes.data() + v * stride + k * 4, sizeof(float));
+                    }
+                    pos += fmt::format("({:.3f},{:.3f},{:.3f}) ", f[0], f[1], f[2]);
+                }
+                REXLOG_WARN("plume: draw {} slot0 stride {} positions: {}",
+                            c.offscreen_draws, stride, pos);
+            }
+        }
         Step("createBuffer(vertex)");
         auto vb = g_device->createBuffer(
             plume::RenderBufferDesc::VertexBuffer(bytes.size(), plume::RenderHeapType::UPLOAD));
@@ -988,6 +1101,48 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     if (views.empty()) return;
 
     ++c.offscreen_draws;
+
+    // The constant buffers the translated shaders declare: b0 = vertex, b1 =
+    // pixel, b2 = shared, all in space4. The shaders index them by REGISTER
+    // (vs_bbb7 reads `float4 mvp[4] : packoffset(c72)`), so each buffer is the
+    // whole 256-register file rather than a packed subset.
+    if (!g_constants_seen) {
+        REXLOG_WARN("plume: no shader constants captured yet -- the draw would transform by "
+                    "whatever is in the buffer, so it is skipped");
+        return;
+    }
+    if (g_offscreen_verbose) {
+        // Positive control against REX_DUMP_ALUCONST's ground truth for c72..c75:
+        // {2,0,0,0 / 0,2,0,0 / 0,0,-1,0 / -1,-1,0,1}.
+        for (uint32_t r = 72; r <= 75; ++r) {
+            REXLOG_WARN("plume: captured vertex c{} = {:.4f} {:.4f} {:.4f} {:.4f}", r,
+                        g_vs_constants[r][0], g_vs_constants[r][1],
+                        g_vs_constants[r][2], g_vs_constants[r][3]);
+        }
+    }
+    auto upload_constants = [&](const void* src, uint64_t bytes,
+                                std::unique_ptr<plume::RenderBuffer>& out) -> bool {
+        out = g_device->createBuffer(
+            plume::RenderBufferDesc::UploadBuffer(bytes));
+        if (out == nullptr) return false;
+        void* p = out->map();
+        if (p == nullptr) return false;
+        std::memcpy(p, src, size_t(bytes));
+        out->unmap();
+        return true;
+    };
+    std::unique_ptr<plume::RenderBuffer> vs_cb, ps_cb, shared_cb;
+    // SharedConstants holds the alpha threshold and sampler descriptor indices.
+    // Nothing this stage draws samples a texture and the shaders are built with
+    // alpha test off, so zeros are correct here -- but the buffer must exist,
+    // because an unbound root CBV reads undefined data.
+    static const float kZeroShared[64][4] = {};
+    if (!upload_constants(g_vs_constants, sizeof(g_vs_constants), vs_cb) ||
+        !upload_constants(g_ps_constants, sizeof(g_ps_constants), ps_cb) ||
+        !upload_constants(kZeroShared, sizeof(kZeroShared), shared_cb)) {
+        REXLOG_WARN("plume: could not upload the shader constant buffers");
+        return;
+    }
 
     const plume::RenderViewport viewport(0.0f, 0.0f, float(kOffscreenW), float(kOffscreenH));
     const plume::RenderRect scissor(0, 0, int32_t(kOffscreenW), int32_t(kOffscreenH));
@@ -1004,15 +1159,24 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, to_write, 2);
     Step("setFramebuffer");
     g_cmd->setFramebuffer(g_framebuffer.get());
-    // Clear to opaque black so "a pixel changed" is unambiguous on readback.
+    // Clear to a colour the shader cannot plausibly produce. Black is the wrong
+    // choice: no texture is bound yet, so the pixel shader samples zero and
+    // legitimately outputs black -- and counting "non-black" pixels then reports
+    // NOTHING DREW for a draw that covered the whole target. The test has to be
+    // "differs from the clear", not "is not black".
     Step("clearColor");
-    g_cmd->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+    g_cmd->clearColor(0, plume::RenderColor(1.0f, 0.0f, 1.0f, 1.0f));
     Step("clearDepthStencil");
     g_cmd->clearDepthStencil();
     Step("setPipeline");
     g_cmd->setPipeline(c.pipeline.get());
     Step("setGraphicsPipelineLayout");
     g_cmd->setGraphicsPipelineLayout(g_pipeline_layout.get());
+    // Root descriptor order matches how the layout was built: b0, b1, b2.
+    Step("setGraphicsRootDescriptor x3");
+    g_cmd->setGraphicsRootDescriptor(vs_cb->at(0), 0);
+    g_cmd->setGraphicsRootDescriptor(ps_cb->at(0), 1);
+    g_cmd->setGraphicsRootDescriptor(shared_cb->at(0), 2);
     Step("setViewports/setScissors");
     g_cmd->setViewports(&viewport, 1);
     g_cmd->setScissors(&scissor, 1);
@@ -1047,11 +1211,12 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         return;
     }
     uint32_t touched = 0;
+    constexpr uint32_t kClear = 0xFFFF00FFu;   // B8G8R8A8 magenta, as stored
     uint32_t sample = 0;
     for (uint32_t i = 0; i < kOffscreenW * kOffscreenH; ++i) {
         const uint32_t px = (uint32_t(pixels[i * 4 + 0]) << 0) | (uint32_t(pixels[i * 4 + 1]) << 8) |
                             (uint32_t(pixels[i * 4 + 2]) << 16) | (uint32_t(pixels[i * 4 + 3]) << 24);
-        if ((px & 0x00FFFFFFu) != 0) {
+        if (px != kClear) {
             if (touched == 0) sample = px;
             ++touched;
         }

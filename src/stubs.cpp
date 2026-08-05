@@ -808,6 +808,17 @@ REX_HOOK_RAW(D3DDevice_EndTiling) {
 //
 // Identified by bit-field signature match against XDK 20500 d3d9.lib
 // (DirectShaderPatch 1.000, IncrementalShaderPatchAndLoad 0.944).
+// ?SetPending_AluConstants@D3D@@YAXPAVCDevice@1@_KKPAX@Z
+//
+// The game sets vertex shader constants through the INLINE
+// SetVertexShaderConstantF, which writes a shadow inside D3DDevice and emits no
+// call at all -- so no hook can see it, and the shadow's offset is not
+// documented anywhere we have. But DrawVertices flushes that shadow through
+// this function, which receives the array's address as an argument. It is the
+// one place the live constants are visible by pointer.
+//
+// Args (XDK 20500): r3 = CDevice*, r4 = pending mask (which registers are
+// dirty), r5 = the constant array, r6 = destination in the command buffer.
 REX_HOOK_RAW(sub_822324F8) {
     const uint32_t shader_ea = ctx.r5.u32;
     const uint32_t decl_ea   = ctx.r7.u32;

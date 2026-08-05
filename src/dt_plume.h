@@ -99,6 +99,17 @@ void OnSetStreamSource(uint32_t stream, uint32_t buffer_ea, uint32_t offset, uin
 void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_vertex,
                     uint32_t vertex_count, const uint8_t* base);
 
+// D3DDevice_GpuBeginShaderConstantF4 -- the game's ONLY route for float shader
+// constants. It hands back a pointer and the game writes the values into it, so
+// there is no device-side shadow to read: the address must be captured here, at
+// the call, and the values read later once the game has filled them.
+//
+// Measured: PixelShader=0 with StartRegister=72 Count=4 (the mvp matrix) and
+// PixelShader=1 with StartRegister=40 Count=4. `dest_ea` is the RETURN value,
+// so it can only be read after __imp__ runs.
+void OnGpuBeginShaderConstantF4(bool pixel_shader, uint32_t start_register, uint32_t count,
+                                uint32_t dest_ea, const uint8_t* base);
+
 // Log what resolved and what did not.
 void Dump(const char* reason);
 

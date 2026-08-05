@@ -139,7 +139,28 @@ DT_D3D9_TRACE(sub_822289D8, 86)  // (unidentified)
 DT_D3D9_TRACE(sub_822289E0, 87)  // (unidentified)
 DT_D3D9_TRACE(sub_82229388, 88)  // D3DDevice_Suspend
 DT_D3D9_TRACE(sub_82229420, 89)  // D3DDevice_Resume
-DT_D3D9_TRACE(sub_822298B0, 90)  // (unidentified)
+// D3DVECTOR4* D3DDevice_GpuBeginShaderConstantF4(D3DDevice*, BOOL PixelShader,
+//                                                UINT StartRegister, DWORD Vector4fCount)
+// (XDK 20500 d3d9.h:2685)
+//
+// This is how the game sets EVERY float shader constant -- measured
+// PixelShader=0/StartRegister=72/Count=4 (the mvp matrix vs_bbb7 reads) and
+// PixelShader=1/StartRegister=40/Count=4. There is no device-side shadow to read
+// instead: a 128 KB search around D3DDevice for a known constant matrix found
+// nothing. So the returned pointer has to be captured, and the values read later
+// once the game has written them.
+//
+// Hand-written rather than DT_D3D9_TRACE_SEM2 because the arguments must be
+// latched across __imp__: r3 carries the device in and the RETURN VALUE out, and
+// r4-r7 are volatile.
+REX_HOOK_RAW(sub_822298B0) {
+    dt_d3d9_trace::Record(90, ctx);
+    const bool pixel = ctx.r4.u32 != 0;
+    const uint32_t start = ctx.r5.u32;
+    const uint32_t count = ctx.r6.u32;
+    __imp__sub_822298B0(ctx, base);
+    dt_plume::OnGpuBeginShaderConstantF4(pixel, start, count, ctx.r3.u32, base);
+}
 DT_D3D9_TRACE(sub_82229A70, 91)  // (unidentified)
 DT_D3D9_TRACE(sub_82229AF8, 92)  // ?BlockSizeOfGpuFormat@D3D@@YAXKPAK0@Z
 DT_D3D9_TRACE(sub_82229C18, 93)  // ?AlignTextureDimensions@D3D@@YAKPAK00KKKH@Z
