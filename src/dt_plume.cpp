@@ -19,6 +19,16 @@
 #include "plume_render_interface.h"
 #include "plume_render_interface_builders.h"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace plume {
 // Defined in plume_d3d12.cpp / plume_vulkan.cpp; plume declares neither in a
 // public header, so the example does the same thing.
@@ -136,7 +146,12 @@ struct Combo {
     // cannot be recomputed from the shader alone.
     std::vector<plume::RenderInputSlot> slots;
     std::vector<uint32_t> slot_consts;   // slot -> fetch constant (i.e. stream)
-    uint32_t offscreen_draws = 0;
+    // Draws this combination has actually recorded into a frame -- distinct
+    // from `draws` above, which counts every draw the GAME made whether or not
+    // the renderer could reproduce it. Used only to bound logging now that
+    // every draw is recorded rather than sampled.
+    uint32_t recorded_draws = 0;
+    bool warned_unreadable = false;
 };
 
 std::unordered_map<uint32_t, uint64_t> g_shader_objects;   // guest object ea -> container hash
@@ -683,9 +698,10 @@ bool BuildIndexBuffers() {
     return true;
 }
 
-// Defined below, next to the offscreen target it renders into.
-void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
+// Defined below, next to the frame target they render into.
+void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
                    const uint8_t* base);
+void EndFrame();
 void FlushConstants(const uint8_t* base);
 
 void SnapshotDrawVertices(const uint8_t* base) {
@@ -713,11 +729,10 @@ void SnapshotDrawVertices(const uint8_t* base) {
     // dropped every region, which looked exactly like "the constants are wrong".
     FlushConstants(base);
 
-    // The real work: upload this draw's vertex data and render it offscreen.
-    // Kept ahead of the logging below because it is now the point, and it is
-    // separately bounded (per combination, not per shader).
+    // The real work: upload this draw's vertex data and record it into the
+    // frame. Kept ahead of the logging below because it is now the point.
     if (g_draw_combo < g_combo_count) {
-        DrawOffscreen(g_combos[g_draw_combo], s, start_vertex, vertex_count, base);
+        DrawIntoFrame(g_combos[g_draw_combo], s, start_vertex, vertex_count, base);
     }
 
     if (s.snapshots >= kSnapshotsPerShader) return;
@@ -1018,33 +1033,77 @@ bool ReadTexturePixels(const DecodedTexture& t, const uint8_t* base,
     return true;
 }
 
-// ── Offscreen proof draw ─────────────────────────────────────────────────────
-// The point of this stage is to prove the whole path end to end -- guest vertex
-// data -> endian swap -> plume buffer -> the pipeline built from the derived
-// layout -> expansion index buffer -> pixels -- WITHOUT taking the window from
-// rexglue, which is a separate and much larger problem (the swapchain stage).
+// ── Frame composition and presentation ───────────────────────────────────────
+// The previous stage rendered each draw into its own 256x256 target, cleared it
+// first, and read it straight back. That proved a single draw works, but it can
+// never produce a picture: every draw destroyed the one before it.
 //
-// So it renders into an offscreen target and reads it back. "It drew" then
-// means a measured count of pixels that differ from the clear colour, not a
-// clean return code. A draw that binds nothing and covers nothing also returns
-// success from every call below; only the readback can tell the difference.
+// This stage keeps ONE colour + depth target for the whole frame. The frame is
+// cleared once, every draw the game makes is recorded into the same open
+// command list, and the result is copied into a swapchain backbuffer at
+// D3DDevice_Swap. That is the point at which "it drew" stops being a pixel
+// count and becomes something a person can look at.
+//
+// The window is our own, deliberately. rexglue owns the main window and its
+// message loop, and taking that over is a much larger change than this spike
+// should make -- a second window costs nothing and keeps a normal run intact,
+// so the two renderers can be compared side by side rather than swapped.
+//
+// The readback survives as a measurement, now per FRAME instead of per draw:
+// a headless run (DT_PLUME_WINDOW=0) still has to be able to say what
+// happened, and a window nobody is looking at proves nothing on its own.
 
-constexpr uint32_t kOffscreenW = 256;
-constexpr uint32_t kOffscreenH = 256;
-// Try several draws per combination: the first one a combination makes is not
-// necessarily representative, and a single degenerate quad is indistinguishable
-// from a broken pipeline when the only signal is "no pixels".
-constexpr uint32_t kOffscreenDrawsPerCombo = 8;
+constexpr uint32_t kFrameW = 1280;
+constexpr uint32_t kFrameH = 720;
+// A safety ceiling, not a sampling limit: the census peak is ~885 draws/frame,
+// so this only ever trips if something loops.
+constexpr uint32_t kMaxDrawsPerFrame = 8192;
+// How many frames get the full readback + coverage report before it goes quiet.
+constexpr uint32_t kReportedFrames = 8;
+
+// The frame clear. Dark blue-grey: not black (a shader that outputs black is
+// still drawing, and "count the non-black pixels" once reported NOTHING DREW
+// for a draw that covered the whole target), and not magenta either -- that
+// was right when one draw owned the target, but it makes a composed frame
+// unreadable. The channels are exact 8-bit values so the readback below can
+// test equality instead of guessing how a float rounded.
+constexpr uint8_t kClearR8 = 16, kClearG8 = 16, kClearB8 = 24;
+constexpr float kClearR = kClearR8 / 255.0f;
+constexpr float kClearG = kClearG8 / 255.0f;
+constexpr float kClearB = kClearB8 / 255.0f;
 
 std::unique_ptr<plume::RenderCommandQueue> g_queue;
 std::unique_ptr<plume::RenderCommandList> g_cmd;
+// Texture uploads cannot share g_cmd: it is mid-recording for most of a frame,
+// and begin() on an already-open list is invalid.
+std::unique_ptr<plume::RenderCommandList> g_upload_cmd;
 std::unique_ptr<plume::RenderCommandFence> g_fence;
+// Uploads are submitted and waited on in the middle of a frame's recording, so
+// they get their own fence rather than racing the frame's.
+std::unique_ptr<plume::RenderCommandFence> g_upload_fence;
 std::unique_ptr<plume::RenderTexture> g_color_target;
 std::unique_ptr<plume::RenderTexture> g_depth_target;
 std::unique_ptr<plume::RenderFramebuffer> g_framebuffer;
 std::unique_ptr<plume::RenderBuffer> g_readback;
 enum class OffscreenState { kNone, kReady, kFailed };
 OffscreenState g_offscreen = OffscreenState::kNone;
+
+// The presentation window and its swapchain. Both are optional: if either
+// fails, the frame still composes and reads back, and only the picture is lost.
+std::unique_ptr<plume::RenderSwapChain> g_swapchain;
+#ifdef _WIN32
+HWND g_window = nullptr;
+#endif
+bool g_window_tried = false;
+
+// Frame state. `g_frame_buffers` holds every per-draw upload alive until the
+// frame's fence signals -- a vertex buffer freed while the GPU is still reading
+// it is a use-after-free that usually does not crash, which is worse.
+bool g_frame_open = false;
+uint32_t g_frame_index = 0;
+uint32_t g_frame_draws = 0;
+uint32_t g_frame_skipped = 0;
+std::vector<std::unique_ptr<plume::RenderBuffer>> g_frame_buffers;
 
 std::unique_ptr<plume::RenderDescriptorSet> g_texture_set;
 std::unique_ptr<plume::RenderDescriptorSet> g_sampler_set;
@@ -1105,20 +1164,20 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     }
     staging->unmap();
 
-    g_cmd->begin();
+    g_upload_cmd->begin();
     const plume::RenderTextureBarrier to_dst(texture.get(), plume::RenderTextureLayout::COPY_DEST);
-    g_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_dst, 1);
-    g_cmd->copyTextureRegion(
+    g_upload_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_dst, 1);
+    g_upload_cmd->copyTextureRegion(
         plume::RenderTextureCopyLocation::Subresource(texture.get()),
         plume::RenderTextureCopyLocation::PlacedFootprint(
             staging.get(), plume::RenderFormat::R8G8B8A8_UNORM, t.width, t.height, 1, padded / 4));
     const plume::RenderTextureBarrier to_read(texture.get(),
                                               plume::RenderTextureLayout::SHADER_READ);
-    g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
-    g_cmd->end();
-    const plume::RenderCommandList* lists[] = {g_cmd.get()};
-    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
-    g_queue->waitForCommandFence(g_fence.get());
+    g_upload_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
+    g_upload_cmd->end();
+    const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
+    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_upload_fence.get());
+    g_queue->waitForCommandFence(g_upload_fence.get());
 
     const uint32_t slot = uint32_t(g_textures.size());
     g_texture_set->setTexture(slot, texture.get(), plume::RenderTextureLayout::SHADER_READ);
@@ -1129,6 +1188,61 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     return slot;
 }
 
+// Create the presentation window, on whichever thread first draws. Windows
+// dispatches messages to the thread that created the window, so the pump in
+// EndFrame has to live on that same thread -- which it does, because both run
+// from the game's render thread.
+//
+// Opt out with DT_PLUME_WINDOW=0 for a headless run; the frame still composes
+// and still reads back, so the measurements are unaffected.
+bool EnsureWindow() {
+#ifdef _WIN32
+    if (g_window != nullptr) return true;
+    if (g_window_tried) return false;
+    g_window_tried = true;
+
+    const char* opt = std::getenv("DT_PLUME_WINDOW");
+    if (opt != nullptr && opt[0] == '0') {
+        REXLOG_WARN("plume: DT_PLUME_WINDOW=0 -- composing headless, no window");
+        return false;
+    }
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = [](HWND h, UINT msg, WPARAM w, LPARAM l) -> LRESULT {
+        // Closing the plume window must not tear down a renderer the game is
+        // still driving, so it only hides.
+        if (msg == WM_CLOSE) { ShowWindow(h, SW_HIDE); return 0; }
+        return DefWindowProcW(h, msg, w, l);
+    };
+    wc.hInstance = GetModuleHandleW(nullptr);
+    // IDC_ARROW is MAKEINTRESOURCEA here (this TU is not built with UNICODE),
+    // so the W-suffixed call needs the W-suffixed resource id.
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.lpszClassName = L"dt_plume_window";
+    RegisterClassExW(&wc);
+
+    // Fixed size: the frame is copied 1:1 into the backbuffer, and the
+    // swapchain takes its size from the client rect, so the two must agree.
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT r = {0, 0, LONG(kFrameW), LONG(kFrameH)};
+    AdjustWindowRect(&r, style, FALSE);
+    g_window = CreateWindowExW(0, wc.lpszClassName, L"Daytona USA -- plume native renderer",
+                               style, CW_USEDEFAULT, CW_USEDEFAULT,
+                               r.right - r.left, r.bottom - r.top,
+                               nullptr, nullptr, wc.hInstance, nullptr);
+    if (g_window == nullptr) {
+        REXLOG_WARN("plume: CreateWindowExW failed ({}), composing headless", GetLastError());
+        return false;
+    }
+    // NOACTIVATE: stealing focus from the game window would break input.
+    ShowWindow(g_window, SW_SHOWNOACTIVATE);
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool EnsureOffscreen() {
     if (g_offscreen != OffscreenState::kNone) return g_offscreen == OffscreenState::kReady;
     g_offscreen = OffscreenState::kFailed;   // set to ready only on the way out
@@ -1136,19 +1250,23 @@ bool EnsureOffscreen() {
     g_queue = g_device->createCommandQueue(plume::RenderCommandListType::DIRECT);
     // Command lists come from the queue they will run on, not the device.
     g_cmd = g_queue != nullptr ? g_queue->createCommandList() : nullptr;
+    g_upload_cmd = g_queue != nullptr ? g_queue->createCommandList() : nullptr;
     g_fence = g_device->createCommandFence();
-    if (g_queue == nullptr || g_cmd == nullptr || g_fence == nullptr) {
-        REXLOG_WARN("plume: offscreen setup failed -- queue={} list={} fence={}",
-                    g_queue != nullptr, g_cmd != nullptr, g_fence != nullptr);
+    g_upload_fence = g_device->createCommandFence();
+    if (g_queue == nullptr || g_cmd == nullptr || g_upload_cmd == nullptr ||
+        g_fence == nullptr || g_upload_fence == nullptr) {
+        REXLOG_WARN("plume: frame setup failed -- queue={} list={} upload={} fences={}/{}",
+                    g_queue != nullptr, g_cmd != nullptr, g_upload_cmd != nullptr,
+                    g_fence != nullptr, g_upload_fence != nullptr);
         return false;
     }
 
     g_color_target = g_device->createTexture(
-        plume::RenderTextureDesc::ColorTarget(kOffscreenW, kOffscreenH, kRenderTargetFormat));
+        plume::RenderTextureDesc::ColorTarget(kFrameW, kFrameH, kRenderTargetFormat));
     // The pixel shaders write SV_Depth, so the pipelines were compiled against a
     // depth target; the framebuffer must supply one or the draw is invalid.
     g_depth_target = g_device->createTexture(
-        plume::RenderTextureDesc::DepthTarget(kOffscreenW, kOffscreenH, kDepthTargetFormat));
+        plume::RenderTextureDesc::DepthTarget(kFrameW, kFrameH, kDepthTargetFormat));
     if (g_color_target == nullptr || g_depth_target == nullptr) {
         REXLOG_WARN("plume: offscreen targets failed -- color={} depth={}",
                     g_color_target != nullptr, g_depth_target != nullptr);
@@ -1163,8 +1281,12 @@ bool EnsureOffscreen() {
         return false;
     }
 
+    // 1280 * 4 = 5120 bytes/row, already a multiple of the 256 bytes D3D12
+    // requires of a texture->buffer copy footprint. A width that is not would
+    // need a padded pitch here and an unpadding read below.
+    static_assert((kFrameW * 4) % 256 == 0, "frame width needs a padded readback pitch");
     g_readback = g_device->createBuffer(
-        plume::RenderBufferDesc::ReadbackBuffer(uint64_t(kOffscreenW) * kOffscreenH * 4));
+        plume::RenderBufferDesc::ReadbackBuffer(uint64_t(kFrameW) * kFrameH * 4));
     if (g_readback == nullptr) {
         REXLOG_WARN("plume: readback buffer failed");
         return false;
@@ -1194,9 +1316,33 @@ bool EnsureOffscreen() {
     }
     g_sampler_set->setSampler(0, g_sampler.get());
 
+#ifdef _WIN32
+    if (EnsureWindow()) {
+        // maxFrameLatency must be at least 1: the swapchain is created with the
+        // waitable-object flag and SetMaximumFrameLatency(0) is invalid.
+        plume::RenderSwapChainDesc sc(g_window, kRenderTargetFormat, 2, false, 2);
+        g_swapchain = g_queue->createSwapChain(sc);
+        if (g_swapchain == nullptr || g_swapchain->isEmpty()) {
+            REXLOG_WARN("plume: swapchain creation failed -- composing headless");
+            g_swapchain.reset();
+        } else if (g_swapchain->getWidth() != kFrameW || g_swapchain->getHeight() != kFrameH) {
+            // The copy into the backbuffer is 1:1, so a mismatch would be a
+            // silently wrong picture rather than an error. Refuse it instead.
+            REXLOG_WARN("plume: swapchain is {}x{} but the frame is {}x{} -- not presenting",
+                        g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
+            g_swapchain.reset();
+        } else {
+            g_swapchain->setVsyncEnabled(false);
+            REXLOG_WARN("plume: swapchain ready -- {}x{}, 2 buffers, vsync off",
+                        g_swapchain->getWidth(), g_swapchain->getHeight());
+        }
+    }
+#endif
+
     g_offscreen = OffscreenState::kReady;
-    REXLOG_WARN("plume: offscreen target ready -- {}x{} {} + depth, with readback",
-                kOffscreenW, kOffscreenH, static_cast<uint32_t>(kRenderTargetFormat));
+    REXLOG_WARN("plume: frame target ready -- {}x{} format {} + depth, readback, {}",
+                kFrameW, kFrameH, static_cast<uint32_t>(kRenderTargetFormat),
+                g_swapchain != nullptr ? "presenting to a window" : "headless");
     return true;
 }
 
@@ -1263,12 +1409,34 @@ void Step(const char* what) {
     std::fflush(stderr);
 }
 
-void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
+// Open the frame's command list and clear it. Called lazily by the first draw
+// of a frame rather than at the previous Swap, so a frame in which the game
+// draws nothing costs nothing and does not present a stale picture.
+bool BeginFrame() {
+    if (g_frame_open) return true;
+    if (!EnsureOffscreen()) return false;
+
+    g_cmd->begin();
+    const plume::RenderTextureBarrier to_write[] = {
+        plume::RenderTextureBarrier(g_color_target.get(), plume::RenderTextureLayout::COLOR_WRITE),
+        plume::RenderTextureBarrier(g_depth_target.get(), plume::RenderTextureLayout::DEPTH_WRITE),
+    };
+    g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, to_write, 2);
+    g_cmd->setFramebuffer(g_framebuffer.get());
+    g_cmd->clearColor(0, plume::RenderColor(kClearR, kClearG, kClearB, 1.0f));
+    g_cmd->clearDepthStencil();
+    g_frame_open = true;
+    g_frame_draws = 0;
+    g_frame_skipped = 0;
+    return true;
+}
+
+void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
                    const uint8_t* base) {
     if (c.pipeline_state != PipelineState::kBuilt || c.pipeline == nullptr) return;
     if (g_index_state != IndexState::kReady) return;
-    if (c.offscreen_draws >= kOffscreenDrawsPerCombo) return;
-    if (!EnsureOffscreen()) return;
+    if (!BeginFrame()) return;
+    if (g_frame_draws >= kMaxDrawsPerFrame) { ++g_frame_skipped; return; }
 
     // QUADLIST expands 4 verts -> 6 indices; TRIANGLEFAN expands n -> (n-2)*3.
     const bool is_quad = (c.topology == 0x0D);
@@ -1292,15 +1460,22 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         uint32_t src_ea = 0;
         if (!BuildSlotBytes(s, c.slot_consts[sl], c.slots[sl].stride, start_vertex, vertex_count,
                             base, bytes, src_ea)) {
-            REXLOG_WARN("plume: offscreen draw skipped -- slot {} (fetch const {}, stride {}) "
-                        "has no readable vertex data", sl, c.slot_consts[sl], c.slots[sl].stride);
+            // Once per combination: this runs on every draw now, and a stream
+            // that is unreadable once is unreadable every frame.
+            if (!c.warned_unreadable) {
+                c.warned_unreadable = true;
+                REXLOG_WARN("plume: draws skipped -- slot {} (fetch const {}, stride {}) "
+                            "has no readable vertex data", sl, c.slot_consts[sl],
+                            c.slots[sl].stride);
+            }
+            ++g_frame_skipped;
             return;
         }
         if (sl == 0) {
             first_src_ea = src_ea;
             // What geometry is this actually? A degenerate quad draws nothing
             // and looks identical to a broken pipeline from the readback alone.
-            if (c.offscreen_draws <= 2) {
+            if (c.recorded_draws <= 2) {
                 std::string pos;
                 const uint32_t stride = c.slots[sl].stride;
                 for (uint32_t v = 0; v < vertex_count && v < 8; ++v) {
@@ -1311,7 +1486,7 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
                     pos += fmt::format("({:.3f},{:.3f},{:.3f}) ", f[0], f[1], f[2]);
                 }
                 REXLOG_WARN("plume: draw {} slot0 stride {} positions: {}",
-                            c.offscreen_draws, stride, pos);
+                            c.recorded_draws, stride, pos);
             }
         }
         Step("createBuffer(vertex)");
@@ -1323,19 +1498,26 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         std::memcpy(p, bytes.data(), bytes.size());
         vb->unmap();
         views.emplace_back(vb->at(0), uint32_t(bytes.size()));
-        vbs.push_back(std::move(vb));
+        // The GPU reads this buffer when the frame is submitted, not now, so it
+        // has to outlive this function -- ownership moves to the frame.
+        g_frame_buffers.push_back(std::move(vb));
     }
     if (views.empty()) return;
 
-    ++c.offscreen_draws;
+    ++c.recorded_draws;
 
     // The constant buffers the translated shaders declare: b0 = vertex, b1 =
     // pixel, b2 = shared, all in space4. The shaders index them by REGISTER
     // (vs_bbb7 reads `float4 mvp[4] : packoffset(c72)`), so each buffer is the
     // whole 256-register file rather than a packed subset.
     if (!g_constants_seen) {
-        REXLOG_WARN("plume: no shader constants captured yet -- the draw would transform by "
-                    "whatever is in the buffer, so it is skipped");
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            REXLOG_WARN("plume: no shader constants captured yet -- draws would transform by "
+                        "whatever is in the buffer, so they are skipped");
+        }
+        ++g_frame_skipped;
         return;
     }
     if (g_offscreen_verbose) {
@@ -1389,30 +1571,15 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         return;
     }
 
-    const plume::RenderViewport viewport(0.0f, 0.0f, float(kOffscreenW), float(kOffscreenH));
-    const plume::RenderRect scissor(0, 0, int32_t(kOffscreenW), int32_t(kOffscreenH));
+    const plume::RenderViewport viewport(0.0f, 0.0f, float(kFrameW), float(kFrameH));
+    const plume::RenderRect scissor(0, 0, int32_t(kFrameW), int32_t(kFrameH));
     const plume::RenderIndexBufferView ibv(ib->at(0), index_count * uint32_t(sizeof(uint16_t)),
                                            plume::RenderFormat::R16_UINT);
 
-    Step("cmd begin");
-    g_cmd->begin();
-    const plume::RenderTextureBarrier to_write[] = {
-        plume::RenderTextureBarrier(g_color_target.get(), plume::RenderTextureLayout::COLOR_WRITE),
-        plume::RenderTextureBarrier(g_depth_target.get(), plume::RenderTextureLayout::DEPTH_WRITE),
-    };
-    Step("barriers -> COLOR_WRITE/DEPTH_WRITE");
-    g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, to_write, 2);
-    Step("setFramebuffer");
-    g_cmd->setFramebuffer(g_framebuffer.get());
-    // Clear to a colour the shader cannot plausibly produce. Black is the wrong
-    // choice: no texture is bound yet, so the pixel shader samples zero and
-    // legitimately outputs black -- and counting "non-black" pixels then reports
-    // NOTHING DREW for a draw that covered the whole target. The test has to be
-    // "differs from the clear", not "is not black".
-    Step("clearColor");
-    g_cmd->clearColor(0, plume::RenderColor(1.0f, 0.0f, 1.0f, 1.0f));
-    Step("clearDepthStencil");
-    g_cmd->clearDepthStencil();
+    // From here it is pure recording into the frame's already-open list. No
+    // clear: the frame was cleared once in BeginFrame, and clearing per draw is
+    // exactly what stopped the previous stage from ever producing a picture.
+    ++g_frame_draws;
     Step("setPipeline");
     g_cmd->setPipeline(c.pipeline.get());
     Step("setGraphicsPipelineLayout");
@@ -1435,64 +1602,132 @@ void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     Step("drawIndexedInstanced");
     g_cmd->drawIndexedInstanced(index_count, 1, 0, 0, 0);
 
-    const plume::RenderTextureBarrier to_copy(g_color_target.get(),
-                                              plume::RenderTextureLayout::COPY_SOURCE);
-    g_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_copy, 1);
-    Step("copyTextureRegion");
-    g_cmd->copyTextureRegion(
-        plume::RenderTextureCopyLocation::PlacedFootprint(g_readback.get(), kRenderTargetFormat,
-                                                          kOffscreenW, kOffscreenH, 1, kOffscreenW),
-        plume::RenderTextureCopyLocation::Subresource(g_color_target.get()));
-    Step("cmd end");
-    g_cmd->end();
+    // The constant buffers are read at submit time like the vertex data, so
+    // they belong to the frame too.
+    g_frame_buffers.push_back(std::move(vs_cb));
+    g_frame_buffers.push_back(std::move(ps_cb));
+    g_frame_buffers.push_back(std::move(shared_cb));
 
-    const plume::RenderCommandList* lists[] = {g_cmd.get()};
-    Step("executeCommandLists");
-    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
-    Step("waitForCommandFence");
-    g_queue->waitForCommandFence(g_fence.get());
-
-    Step("readback map");
-    const uint8_t* pixels = static_cast<const uint8_t*>(g_readback->map());
-    if (pixels == nullptr) {
-        REXLOG_WARN("plume: offscreen readback map failed");
-        return;
-    }
-    uint32_t touched = 0;
-    uint32_t nonblack = 0;
-    constexpr uint32_t kClear = 0xFFFF00FFu;   // B8G8R8A8 magenta, as stored
-    uint32_t sample = 0;
-    for (uint32_t i = 0; i < kOffscreenW * kOffscreenH; ++i) {
-        const uint32_t px = (uint32_t(pixels[i * 4 + 0]) << 0) | (uint32_t(pixels[i * 4 + 1]) << 8) |
-                            (uint32_t(pixels[i * 4 + 2]) << 16) | (uint32_t(pixels[i * 4 + 3]) << 24);
-        if (px != kClear) {
-            ++touched;
-            // "Covered" and "shaded something visible" are different questions.
-            // The first pixel of a texture is often legitimately black, so
-            // report the first pixel with actual colour separately.
-            if ((px & 0x00FFFFFFu) != 0) {
-                if (nonblack == 0) sample = px;
-                ++nonblack;
-            }
-        }
-    }
-    g_readback->unmap();
-    // The sequence survived once; do not narrate it for every later combination.
+    // The sequence survived once; do not narrate it for every later draw.
     g_offscreen_verbose = false;
 
-    if (touched != 0) {
-        REXLOG_WARN("plume: OFFSCREEN DRAW {} + {} -- {} verts -> {} indices, {} slots; "
-                    "{} of {} pixels covered, {} with colour, first {:08X}",
-                    s.entry->name, TopologyName(c.topology), vertex_count, index_count,
-                    views.size(), touched, kOffscreenW * kOffscreenH, nonblack, sample);
-    } else {
-        // Every call above succeeds for a draw that covers nothing, so this is
-        // the only thing that distinguishes "drew" from "ran".
-        REXLOG_WARN("plume: OFFSCREEN DRAW {} + {} -- {} verts -> {} indices, {} slots; "
-                    "NOTHING DREW, the clear survived (vertex data @{:08X})",
+    if (c.recorded_draws == 1) {
+        REXLOG_WARN("plume: first draw of {} + {} recorded -- {} verts -> {} indices, {} slots "
+                    "(vertex data @{:08X})",
                     s.entry->name, TopologyName(c.topology), vertex_count, index_count,
                     views.size(), first_src_ea);
     }
+}
+
+#ifdef _WIN32
+// Our window's messages are delivered to the thread that created it, which is
+// this one. Without a pump it is marked unresponsive and never repaints.
+void PumpWindow() {
+    if (g_window == nullptr) return;
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+#endif
+
+// Close the frame: copy into the backbuffer, submit, present, and (for the
+// first few frames) measure what actually landed.
+//
+// The measurement is not redundant with the window. A window shows a person
+// what happened; the readback is what an unattended run, or a run on a machine
+// with no display, can still report -- and it is the thing that caught a
+// renderer reporting success while drawing nothing.
+void EndFrame() {
+    if (!g_frame_open) return;
+    g_frame_open = false;
+    ++g_frame_index;
+
+    const bool report = g_frame_index <= kReportedFrames;
+
+    uint32_t swap_index = 0;
+    plume::RenderTexture* backbuffer = nullptr;
+    if (g_swapchain != nullptr && !g_swapchain->needsResize() &&
+        g_swapchain->acquireTexture(nullptr, &swap_index)) {
+        backbuffer = g_swapchain->getTexture(swap_index);
+    }
+
+    // One barrier batch: the frame target stops being a render target, and the
+    // backbuffer becomes a copy destination.
+    std::vector<plume::RenderTextureBarrier> to_copy;
+    to_copy.emplace_back(g_color_target.get(), plume::RenderTextureLayout::COPY_SOURCE);
+    if (backbuffer != nullptr) {
+        to_copy.emplace_back(backbuffer, plume::RenderTextureLayout::COPY_DEST);
+    }
+    g_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, to_copy.data(),
+                    uint32_t(to_copy.size()));
+
+    if (backbuffer != nullptr) {
+        // 1:1 -- the window was created at exactly the frame size and the
+        // swapchain was rejected at startup if it did not agree.
+        g_cmd->copyTexture(backbuffer, g_color_target.get());
+        const plume::RenderTextureBarrier to_present(backbuffer,
+                                                     plume::RenderTextureLayout::PRESENT);
+        g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_present, 1);
+    }
+    if (report) {
+        g_cmd->copyTextureRegion(
+            plume::RenderTextureCopyLocation::PlacedFootprint(g_readback.get(), kRenderTargetFormat,
+                                                              kFrameW, kFrameH, 1, kFrameW),
+            plume::RenderTextureCopyLocation::Subresource(g_color_target.get()));
+    }
+    g_cmd->end();
+
+    const plume::RenderCommandList* lists[] = {g_cmd.get()};
+    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
+    // Waiting on every frame gives up all overlap, but it is what makes freeing
+    // the frame's buffers below safe without a per-frame ring. Correct first.
+    g_queue->waitForCommandFence(g_fence.get());
+
+    if (backbuffer != nullptr) {
+        g_swapchain->present(swap_index, nullptr, 0);
+    }
+#ifdef _WIN32
+    PumpWindow();
+#endif
+
+    const size_t buffers = g_frame_buffers.size();
+    g_frame_buffers.clear();
+
+    if (!report) return;
+
+    const uint8_t* pixels = static_cast<const uint8_t*>(g_readback->map());
+    if (pixels == nullptr) {
+        REXLOG_WARN("plume: frame readback map failed");
+        return;
+    }
+    // "Differs from the clear", not "is not black": a shader that outputs black
+    // is drawing, and counting non-black pixels once reported NOTHING DREW for
+    // a draw that covered the entire target.
+    //
+    // The clear channels are exact 8-bit values on purpose (kClearR/G/B), so
+    // this is an equality test and not a float-rounding guess. The stored order
+    // is B, G, R, A -- kRenderTargetFormat is B8G8R8A8_UNORM.
+    uint32_t touched = 0, coloured = 0, sample = 0;
+    for (uint32_t i = 0; i < kFrameW * kFrameH; ++i) {
+        const uint8_t b = pixels[i * 4 + 0], g = pixels[i * 4 + 1], r = pixels[i * 4 + 2];
+        if (b == kClearB8 && g == kClearG8 && r == kClearR8) continue;
+        ++touched;
+        if ((b | g | r) != 0) {
+            if (coloured == 0) {
+                sample = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
+            }
+            ++coloured;
+        }
+    }
+    g_readback->unmap();
+
+    REXLOG_WARN("plume: FRAME {} -- {} draws recorded ({} skipped), {} buffers; "
+                "{} of {} pixels touched, {} with colour, first {:08X}{}",
+                g_frame_index, g_frame_draws, g_frame_skipped, buffers,
+                touched, kFrameW * kFrameH, coloured, sample,
+                g_swapchain != nullptr ? ", presented" : "");
 }
 
 void BuildPipelines(const char* reason) {
@@ -1956,6 +2191,12 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
     // against plausible values before it becomes load-bearing.
 }
 
+void OnFrameEnd() {
+    if (!Enabled() || !g_init_ok) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    EndFrame();
+}
+
 void Dump(const char* reason) {
     if (!Enabled()) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -2016,12 +2257,46 @@ void Dump(const char* reason) {
 
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
+    // A frame left open holds a recording command list and the GPU may still be
+    // reading last frame's uploads. Drain before anything is destroyed.
+    if (g_queue != nullptr && g_fence != nullptr) {
+        if (g_frame_open) {
+            g_cmd->end();
+            g_frame_open = false;
+        }
+        g_queue->waitForCommandFence(g_fence.get());
+    }
+    g_frame_buffers.clear();
     g_shaders.clear();
     for (uint32_t i = 0; i < g_combo_count; ++i) g_combos[i].pipeline.reset();
     g_pipeline_layout.reset();
     g_quad_indices.reset();
     g_fan_indices.reset();
     g_index_state = IndexState::kNone;
+    g_textures.clear();
+    g_texture_index.clear();
+    g_texture_set.reset();
+    g_sampler_set.reset();
+    g_sampler.reset();
+    g_readback.reset();
+    g_framebuffer.reset();
+    g_color_target.reset();
+    g_depth_target.reset();
+    // The swapchain must go before the queue that created it, and the window
+    // before neither -- but after the swapchain that holds its HWND.
+    g_swapchain.reset();
+    g_cmd.reset();
+    g_upload_cmd.reset();
+    g_fence.reset();
+    g_upload_fence.reset();
+    g_queue.reset();
+#ifdef _WIN32
+    if (g_window != nullptr) {
+        DestroyWindow(g_window);
+        g_window = nullptr;
+    }
+#endif
+    g_offscreen = OffscreenState::kNone;
     g_device.reset();
     g_interface.reset();
     g_init_ok = false;

@@ -110,6 +110,16 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
 void OnGpuBeginShaderConstantF4(bool pixel_shader, uint32_t start_register, uint32_t count,
                                 uint32_t dest_ea, const uint8_t* base);
 
+// D3DDevice_Swap -- the game's frame boundary, and so ours.
+//
+// Every draw between two Swaps is recorded into ONE command list against ONE
+// colour+depth target, cleared once. This closes that list, copies the result
+// into a swapchain backbuffer, presents it, and frees the frame's uploads.
+//
+// A frame in which the game drew nothing never opened a list, so this is a
+// no-op rather than a present of a stale picture.
+void OnFrameEnd();
+
 // Log what resolved and what did not.
 void Dump(const char* reason);
 

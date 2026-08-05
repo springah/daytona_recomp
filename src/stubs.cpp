@@ -259,6 +259,10 @@ REX_HOOK_RAW(sub_82233C80) {
     // XDK 20500 d3d9.lib), so it is the frame tick. Drives the trace dump cadence
     // and doubles as the "did we render at all" control.
     dt_d3d9_trace::OnFrame();
+    // Same boundary, for the same reason: every draw since the last Swap has
+    // been recorded into one command list, and this is where it is submitted,
+    // presented and freed. A no-op unless DT_PLUME is set.
+    dt_plume::OnFrameEnd();
     // Fold the domain-hook census (input, signin, session, storage) into the
     // same WARN cadence, so an unattended run records WHY it is parked.
     {
