@@ -1909,6 +1909,36 @@ void EndFrame() {
                 g_frame_index, g_frame_draws, g_frame_skipped, buffers,
                 touched, kFrameW * kFrameH, coloured, sample,
                 g_swapchain != nullptr ? ", presented" : "");
+
+    // What is actually IN the constant buffers we bind. A register file that is
+    // mostly zero is not a neutral starting state: the translated shaders
+    // multiply by their constants, so an uncaptured register is a black pixel,
+    // and it looks exactly like a broken sampler from the readback alone.
+    {
+        auto census = [](const float (*regs)[4], const char* what) {
+            uint32_t nonzero = 0;
+            std::string first;
+            for (uint32_t r = 0; r < kConstRegisters; ++r) {
+                if (regs[r][0] == 0.0f && regs[r][1] == 0.0f &&
+                    regs[r][2] == 0.0f && regs[r][3] == 0.0f) {
+                    continue;
+                }
+                ++nonzero;
+                if (nonzero <= 6) {
+                    first += fmt::format("c{}=({:.3f},{:.3f},{:.3f},{:.3f}) ", r,
+                                         regs[r][0], regs[r][1], regs[r][2], regs[r][3]);
+                }
+            }
+            REXLOG_WARN("plume:   {} constants -- {} of {} registers non-zero; {}", what, nonzero,
+                        kConstRegisters, nonzero != 0 ? first : std::string("ALL ZERO"));
+        };
+        census(g_vs_constants, "vertex");
+        census(g_ps_constants, "pixel");
+        if (g_pending_const_dropped != 0) {
+            REXLOG_WARN("plume:   {} constant regions were dropped -- the pending list overflowed",
+                        g_pending_const_dropped);
+        }
+    }
 }
 
 void BuildPipelines(const char* reason) {
