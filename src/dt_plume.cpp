@@ -973,10 +973,31 @@ bool ReadTexturePixels(const DecodedTexture& t, const uint8_t* base,
     const uint32_t src_pitch = std::max(pitch_texels, t.width);
     const uint32_t needed = t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * 4u)
                                     : (src_pitch * t.height * 4u);
-    const uint32_t va = dt_guest_mem::PhysicalToVirtual(t.base_address, needed);
-    if (va == 0) return false;
-    const uint8_t* src = dt_guest_mem::Resolve(base, va, needed);
+    // PhysicalToVirtual returns the FIRST readable alias, which was right for
+    // vertex data but proves nothing for a render target: the 360 maps the same
+    // physical memory into several windows, and a mapped-but-stale one reads as
+    // zeros. Pick the alias that actually HAS content, and say which.
+    static constexpr uint32_t kAliases[] = {0xA0000000u, 0xC0000000u, 0xE0000000u, 0x80000000u};
+    const uint8_t* src = nullptr;
+    uint32_t chosen = 0;
+    for (uint32_t alias : kAliases) {
+        const uint8_t* p = dt_guest_mem::Resolve(base, alias | t.base_address, needed);
+        if (p == nullptr) continue;
+        size_t nonzero = 0;
+        for (uint32_t i = 0; i < needed && i < 0x40000u; ++i) nonzero += (p[i] != 0);
+        static std::set<uint32_t> reported;
+        if (reported.insert(alias | t.base_address).second) {
+            REXLOG_WARN("plume: texture {:08X} via {:08X} alias -- {} non-zero bytes in the first "
+                        "256 KB", t.base_address, alias, nonzero);
+        }
+        if (src == nullptr || nonzero != 0) {
+            src = p;
+            chosen = alias;
+            if (nonzero != 0) break;
+        }
+    }
     if (src == nullptr) return false;
+    (void)chosen;
 
     out.resize(size_t(t.width) * t.height * 4);
     for (uint32_t y = 0; y < t.height; ++y) {
