@@ -5,6 +5,8 @@
 
 #include <rex/logging.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -14,6 +16,7 @@
 #include <vector>
 
 #include "plume_render_interface.h"
+#include "plume_render_interface_builders.h"
 
 namespace plume {
 // Defined in plume_d3d12.cpp / plume_vulkan.cpp; plume declares neither in a
@@ -125,6 +128,14 @@ struct Combo {
     uint64_t decl_mismatch = 0;
     PipelineState pipeline_state = PipelineState::kPending;
     std::unique_ptr<plume::RenderPipeline> pipeline;
+    // The input layout this combination's pipeline was built with. Kept because
+    // a draw has to bind vertex buffers with exactly the slots and strides the
+    // pipeline expects, and the stride is a property of the COMBINATION (the
+    // same shader is bound at 12/4/8 in one and 24/24/24 in another), so it
+    // cannot be recomputed from the shader alone.
+    std::vector<plume::RenderInputSlot> slots;
+    std::vector<uint32_t> slot_consts;   // slot -> fetch constant (i.e. stream)
+    uint32_t offscreen_draws = 0;
 };
 
 std::unordered_map<uint32_t, uint64_t> g_shader_objects;   // guest object ea -> container hash
@@ -139,11 +150,13 @@ uint32_t g_device_ea = 0;   // guest CDevice*, r3 on every D3D9 entry point
 uint64_t g_draw_vs = 0;
 uint32_t g_draw_start = 0;
 uint32_t g_draw_count = 0;
+uint32_t g_draw_combo = 0xFFFFFFFFu;   // index into g_combos, latched the same way
 Combo g_combos[kMaxCombos];
 uint32_t g_combo_count = 0;
 uint64_t g_draws = 0;
 uint64_t g_draws_unresolved = 0;     // a draw whose VS or PS we have no blob for
 uint32_t g_combo_overflow = 0;
+bool g_bisected = false;   // the pipeline-failure bisect runs once, not per combo
 uint32_t g_decl_changes = 0;
 
 constexpr uint32_t kMaxDecls = 8;
@@ -326,6 +339,12 @@ uint32_t VulkanLocation(uint8_t usage, uint8_t index) {
 // Provisional until the swapchain is wired: the guest presents B8G8R8A8 and the
 // pixel shaders write SV_Depth, so a depth target must exist for them to compile
 // against. Revisit when the render targets are real.
+// Sizes of the unbounded descriptor arrays the translated shaders declare. The
+// game binds 8 samplers and, per the trace, has ~536 distinct textures; these
+// are ceilings for the heap, not a measured requirement.
+constexpr uint32_t kTextureDescriptorSize = 1024;
+constexpr uint32_t kSamplerDescriptorSize = 64;
+
 constexpr plume::RenderFormat kRenderTargetFormat = plume::RenderFormat::B8G8R8A8_UNORM;
 constexpr plume::RenderFormat kDepthTargetFormat = plume::RenderFormat::D32_FLOAT;
 
@@ -643,6 +662,10 @@ bool BuildIndexBuffers() {
     return true;
 }
 
+// Defined below, next to the offscreen target it renders into.
+void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
+                   const uint8_t* base);
+
 void SnapshotDrawVertices(const uint8_t* base) {
     const uint32_t start_vertex = g_draw_start;
     const uint32_t vertex_count = g_draw_count;
@@ -661,6 +684,14 @@ void SnapshotDrawVertices(const uint8_t* base) {
     auto sit = g_shaders.find(g_draw_vs);
     if (sit == g_shaders.end() || !sit->second.layout_done) return;
     Created& s = sit->second;
+
+    // The real work: upload this draw's vertex data and render it offscreen.
+    // Kept ahead of the logging below because it is now the point, and it is
+    // separately bounded (per combination, not per shader).
+    if (g_draw_combo < g_combo_count) {
+        DrawOffscreen(g_combos[g_draw_combo], s, start_vertex, vertex_count, base);
+    }
+
     if (s.snapshots >= kSnapshotsPerShader) return;
 
     if (vertex_count > kMaxExpandVerts) {
@@ -754,18 +785,330 @@ void SnapshotDrawVertices(const uint8_t* base) {
     }
 }
 
+// ── Offscreen proof draw ─────────────────────────────────────────────────────
+// The point of this stage is to prove the whole path end to end -- guest vertex
+// data -> endian swap -> plume buffer -> the pipeline built from the derived
+// layout -> expansion index buffer -> pixels -- WITHOUT taking the window from
+// rexglue, which is a separate and much larger problem (the swapchain stage).
+//
+// So it renders into an offscreen target and reads it back. "It drew" then
+// means a measured count of pixels that differ from the clear colour, not a
+// clean return code. A draw that binds nothing and covers nothing also returns
+// success from every call below; only the readback can tell the difference.
+
+constexpr uint32_t kOffscreenW = 256;
+constexpr uint32_t kOffscreenH = 256;
+constexpr uint32_t kOffscreenDrawsPerCombo = 1;
+
+std::unique_ptr<plume::RenderCommandQueue> g_queue;
+std::unique_ptr<plume::RenderCommandList> g_cmd;
+std::unique_ptr<plume::RenderCommandFence> g_fence;
+std::unique_ptr<plume::RenderTexture> g_color_target;
+std::unique_ptr<plume::RenderTexture> g_depth_target;
+std::unique_ptr<plume::RenderFramebuffer> g_framebuffer;
+std::unique_ptr<plume::RenderBuffer> g_readback;
+enum class OffscreenState { kNone, kReady, kFailed };
+OffscreenState g_offscreen = OffscreenState::kNone;
+
+bool EnsureOffscreen() {
+    if (g_offscreen != OffscreenState::kNone) return g_offscreen == OffscreenState::kReady;
+    g_offscreen = OffscreenState::kFailed;   // set to ready only on the way out
+
+    g_queue = g_device->createCommandQueue(plume::RenderCommandListType::DIRECT);
+    // Command lists come from the queue they will run on, not the device.
+    g_cmd = g_queue != nullptr ? g_queue->createCommandList() : nullptr;
+    g_fence = g_device->createCommandFence();
+    if (g_queue == nullptr || g_cmd == nullptr || g_fence == nullptr) {
+        REXLOG_WARN("plume: offscreen setup failed -- queue={} list={} fence={}",
+                    g_queue != nullptr, g_cmd != nullptr, g_fence != nullptr);
+        return false;
+    }
+
+    g_color_target = g_device->createTexture(
+        plume::RenderTextureDesc::ColorTarget(kOffscreenW, kOffscreenH, kRenderTargetFormat));
+    // The pixel shaders write SV_Depth, so the pipelines were compiled against a
+    // depth target; the framebuffer must supply one or the draw is invalid.
+    g_depth_target = g_device->createTexture(
+        plume::RenderTextureDesc::DepthTarget(kOffscreenW, kOffscreenH, kDepthTargetFormat));
+    if (g_color_target == nullptr || g_depth_target == nullptr) {
+        REXLOG_WARN("plume: offscreen targets failed -- color={} depth={}",
+                    g_color_target != nullptr, g_depth_target != nullptr);
+        return false;
+    }
+
+    const plume::RenderTexture* color = g_color_target.get();
+    plume::RenderFramebufferDesc fb_desc(&color, 1, g_depth_target.get());
+    g_framebuffer = g_device->createFramebuffer(fb_desc);
+    if (g_framebuffer == nullptr) {
+        REXLOG_WARN("plume: createFramebuffer failed");
+        return false;
+    }
+
+    g_readback = g_device->createBuffer(
+        plume::RenderBufferDesc::ReadbackBuffer(uint64_t(kOffscreenW) * kOffscreenH * 4));
+    if (g_readback == nullptr) {
+        REXLOG_WARN("plume: readback buffer failed");
+        return false;
+    }
+
+    g_offscreen = OffscreenState::kReady;
+    REXLOG_WARN("plume: offscreen target ready -- {}x{} {} + depth, with readback",
+                kOffscreenW, kOffscreenH, static_cast<uint32_t>(kRenderTargetFormat));
+    return true;
+}
+
+// Copy one slot's vertex range out of guest memory, byte-swapping per COMPONENT
+// for each attribute that lives in that slot.
+//
+// The swap width is per component, not per vertex and not a blanket dword swap:
+// dword-swapping an 8_8_8_8 colour reverses its channels and no DXGI format
+// undoes that. Bytes not covered by any attribute are copied through untouched
+// rather than zeroed -- padding we have not identified is not the same thing as
+// padding we know to be unused.
+bool BuildSlotBytes(const Created& s, uint32_t fetch_const, uint32_t stride,
+                    uint32_t start_vertex, uint32_t vertex_count, const uint8_t* base,
+                    std::vector<uint8_t>& out, uint32_t& out_src_ea) {
+    out_src_ea = 0;
+    if (stride == 0 || vertex_count == 0) return false;
+
+    const uint32_t fc_ea = g_device_ea + 1152u + fetch_const * 8u;
+    const uint8_t* fc = dt_guest_mem::Resolve(base, fc_ea, 8u);
+    if (fc == nullptr) return false;
+    const uint32_t phys = LoadBE32(fc) & ~uint32_t(3);
+    if (phys == 0) return false;
+
+    const uint32_t span = (start_vertex + vertex_count) * stride;
+    const uint32_t va = dt_guest_mem::PhysicalToVirtual(phys, span);
+    if (va == 0) return false;
+    const uint32_t src_ea = va + start_vertex * stride;
+    const uint32_t bytes = vertex_count * stride;
+    const uint8_t* src = dt_guest_mem::Resolve(base, src_ea, bytes);
+    if (src == nullptr) return false;
+
+    out.assign(src, src + bytes);
+    out_src_ea = src_ea;
+
+    for (const auto& a : s.attributes) {
+        if (a.fetch_const != fetch_const) continue;
+        const uint32_t comp = ComponentBytes(a.format);
+        const uint32_t width = AttributeBytes(a.format);
+        if (comp <= 1 || width == 0) continue;   // single-byte components need no swap
+        for (uint32_t v = 0; v < vertex_count; ++v) {
+            const uint32_t at = v * stride + a.offset;
+            if (at + width > bytes) break;       // attribute runs past the range
+            for (uint32_t g = 0; g + comp <= width; g += comp) {
+                std::reverse(out.begin() + at + g, out.begin() + at + g + comp);
+            }
+        }
+    }
+    return true;
+}
+
+// Render one captured draw offscreen and report how many pixels it changed.
+// The first offscreen draw runs a long sequence of plume calls, any of which
+// can fault on a wrong assumption. A crash is not an early return, so it cannot
+// log a reason on the way out -- instead each step announces itself BEFORE it
+// runs, and the last line in the log names the one that died.
+bool g_offscreen_verbose = true;
+void Step(const char* what) {
+    if (!g_offscreen_verbose) return;
+    REXLOG_WARN("plume: offscreen step -- {}", what);
+    // Unbuffered too: a crash can eat the last buffered log line, which would
+    // point at the step BEFORE the one that actually died. plume writes its own
+    // errors to stderr as well, so they interleave in the right order.
+    std::fprintf(stderr, "[plume step] %s\n", what);
+    std::fflush(stderr);
+}
+
+void DrawOffscreen(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
+                   const uint8_t* base) {
+    if (c.pipeline_state != PipelineState::kBuilt || c.pipeline == nullptr) return;
+    if (g_index_state != IndexState::kReady) return;
+    if (c.offscreen_draws >= kOffscreenDrawsPerCombo) return;
+    if (!EnsureOffscreen()) return;
+
+    // QUADLIST expands 4 verts -> 6 indices; TRIANGLEFAN expands n -> (n-2)*3.
+    const bool is_quad = (c.topology == 0x0D);
+    uint32_t index_count = 0;
+    if (is_quad) {
+        if (vertex_count < 4) return;
+        index_count = (vertex_count / 4) * 6;
+    } else {
+        if (vertex_count < 3) return;
+        index_count = (vertex_count - 2) * 3;
+    }
+    const plume::RenderBuffer* ib = is_quad ? g_quad_indices.get() : g_fan_indices.get();
+    if (ib == nullptr || index_count == 0) return;
+
+    // One vertex buffer per input slot, each with that slot's own stride.
+    std::vector<std::unique_ptr<plume::RenderBuffer>> vbs;
+    std::vector<plume::RenderVertexBufferView> views;
+    uint32_t first_src_ea = 0;
+    for (uint32_t sl = 0; sl < c.slots.size(); ++sl) {
+        std::vector<uint8_t> bytes;
+        uint32_t src_ea = 0;
+        if (!BuildSlotBytes(s, c.slot_consts[sl], c.slots[sl].stride, start_vertex, vertex_count,
+                            base, bytes, src_ea)) {
+            REXLOG_WARN("plume: offscreen draw skipped -- slot {} (fetch const {}, stride {}) "
+                        "has no readable vertex data", sl, c.slot_consts[sl], c.slots[sl].stride);
+            return;
+        }
+        if (sl == 0) first_src_ea = src_ea;
+        Step("createBuffer(vertex)");
+        auto vb = g_device->createBuffer(
+            plume::RenderBufferDesc::VertexBuffer(bytes.size(), plume::RenderHeapType::UPLOAD));
+        if (vb == nullptr) return;
+        void* p = vb->map();
+        if (p == nullptr) return;
+        std::memcpy(p, bytes.data(), bytes.size());
+        vb->unmap();
+        views.emplace_back(vb->at(0), uint32_t(bytes.size()));
+        vbs.push_back(std::move(vb));
+    }
+    if (views.empty()) return;
+
+    ++c.offscreen_draws;
+
+    const plume::RenderViewport viewport(0.0f, 0.0f, float(kOffscreenW), float(kOffscreenH));
+    const plume::RenderRect scissor(0, 0, int32_t(kOffscreenW), int32_t(kOffscreenH));
+    const plume::RenderIndexBufferView ibv(ib->at(0), index_count * uint32_t(sizeof(uint16_t)),
+                                           plume::RenderFormat::R16_UINT);
+
+    Step("cmd begin");
+    g_cmd->begin();
+    const plume::RenderTextureBarrier to_write[] = {
+        plume::RenderTextureBarrier(g_color_target.get(), plume::RenderTextureLayout::COLOR_WRITE),
+        plume::RenderTextureBarrier(g_depth_target.get(), plume::RenderTextureLayout::DEPTH_WRITE),
+    };
+    Step("barriers -> COLOR_WRITE/DEPTH_WRITE");
+    g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, to_write, 2);
+    Step("setFramebuffer");
+    g_cmd->setFramebuffer(g_framebuffer.get());
+    // Clear to opaque black so "a pixel changed" is unambiguous on readback.
+    Step("clearColor");
+    g_cmd->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+    Step("clearDepthStencil");
+    g_cmd->clearDepthStencil();
+    Step("setPipeline");
+    g_cmd->setPipeline(c.pipeline.get());
+    Step("setGraphicsPipelineLayout");
+    g_cmd->setGraphicsPipelineLayout(g_pipeline_layout.get());
+    Step("setViewports/setScissors");
+    g_cmd->setViewports(&viewport, 1);
+    g_cmd->setScissors(&scissor, 1);
+    Step("setVertexBuffers");
+    g_cmd->setVertexBuffers(0, views.data(), uint32_t(views.size()), c.slots.data());
+    Step("setIndexBuffer");
+    g_cmd->setIndexBuffer(&ibv);
+    Step("drawIndexedInstanced");
+    g_cmd->drawIndexedInstanced(index_count, 1, 0, 0, 0);
+
+    const plume::RenderTextureBarrier to_copy(g_color_target.get(),
+                                              plume::RenderTextureLayout::COPY_SOURCE);
+    g_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_copy, 1);
+    Step("copyTextureRegion");
+    g_cmd->copyTextureRegion(
+        plume::RenderTextureCopyLocation::PlacedFootprint(g_readback.get(), kRenderTargetFormat,
+                                                          kOffscreenW, kOffscreenH, 1, kOffscreenW),
+        plume::RenderTextureCopyLocation::Subresource(g_color_target.get()));
+    Step("cmd end");
+    g_cmd->end();
+
+    const plume::RenderCommandList* lists[] = {g_cmd.get()};
+    Step("executeCommandLists");
+    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
+    Step("waitForCommandFence");
+    g_queue->waitForCommandFence(g_fence.get());
+
+    Step("readback map");
+    const uint8_t* pixels = static_cast<const uint8_t*>(g_readback->map());
+    if (pixels == nullptr) {
+        REXLOG_WARN("plume: offscreen readback map failed");
+        return;
+    }
+    uint32_t touched = 0;
+    uint32_t sample = 0;
+    for (uint32_t i = 0; i < kOffscreenW * kOffscreenH; ++i) {
+        const uint32_t px = (uint32_t(pixels[i * 4 + 0]) << 0) | (uint32_t(pixels[i * 4 + 1]) << 8) |
+                            (uint32_t(pixels[i * 4 + 2]) << 16) | (uint32_t(pixels[i * 4 + 3]) << 24);
+        if ((px & 0x00FFFFFFu) != 0) {
+            if (touched == 0) sample = px;
+            ++touched;
+        }
+    }
+    g_readback->unmap();
+    // The sequence survived once; do not narrate it for every later combination.
+    g_offscreen_verbose = false;
+
+    if (touched != 0) {
+        REXLOG_WARN("plume: OFFSCREEN DRAW {} + {} -- {} verts -> {} indices, {} slots; "
+                    "{} of {} pixels written, first {:08X}",
+                    s.entry->name, TopologyName(c.topology), vertex_count, index_count,
+                    views.size(), touched, kOffscreenW * kOffscreenH, sample);
+    } else {
+        // Every call above succeeds for a draw that covers nothing, so this is
+        // the only thing that distinguishes "drew" from "ran".
+        REXLOG_WARN("plume: OFFSCREEN DRAW {} + {} -- {} verts -> {} indices, {} slots; "
+                    "NOTHING DREW, the clear survived (vertex data @{:08X})",
+                    s.entry->name, TopologyName(c.topology), vertex_count, index_count,
+                    views.size(), first_src_ea);
+    }
+}
+
 void BuildPipelines(const char* reason) {
     if (!Enabled() || !g_init_ok) return;
     std::lock_guard<std::mutex> lock(g_mutex);
 
     if (g_pipeline_layout == nullptr) {
-        plume::RenderPipelineLayoutDesc desc;
-        desc.allowInputLayout = true;
-        g_pipeline_layout = g_device->createPipelineLayout(desc);
+        // ⚠ An "allowInputLayout only" layout produces a root signature with
+        // ZERO parameters, and D3D12 validates root-signature/shader binding
+        // compatibility inside CreateGraphicsPipelineState. Every pipeline
+        // failed E_INVALIDARG against it -- silently, because plume's
+        // D3D12GraphicsPipeline constructor discarded the HRESULT (patched).
+        //
+        // The bindings are not a guess. XenosRecomp emits them:
+        //   shader_recompiler.cpp:1237  cbuffer VertexShaderConstants : b0, space4
+        //                               cbuffer PixelShaderConstants  : b1, space4
+        //   shader_recompiler.cpp:1266  cbuffer SharedConstants       : b2, space4
+        //   shader_common.h:50-53       Texture2D[]   t0, space0
+        //                               Texture3D[]   t0, space1
+        //                               TextureCube[] t0, space2
+        //                               SamplerState[] s0, space3
+        // Daytona's blobs come from that same translator, so this mirrors
+        // UnleashedRecomp's layout (gpu/video.cpp:1888-1976), which is the
+        // reference implementation for these shaders.
+        //
+        // The heaps are declared here so the shaders link; they are not
+        // populated yet. Nothing this stage draws samples a texture.
+        plume::RenderPipelineLayoutBuilder builder;
+        builder.begin(false, true);   // allowInputLayout
+
+        plume::RenderDescriptorSetBuilder set;
+        set.begin();
+        set.addTexture(0, kTextureDescriptorSize);
+        set.end(true, kTextureDescriptorSize);
+        builder.addDescriptorSet(set);   // space0 Texture2D
+        builder.addDescriptorSet(set);   // space1 Texture3D
+        builder.addDescriptorSet(set);   // space2 TextureCube
+
+        plume::RenderDescriptorSetBuilder samplers;
+        samplers.begin();
+        samplers.addSampler(0, kSamplerDescriptorSize);
+        samplers.end(true, kSamplerDescriptorSize);
+        builder.addDescriptorSet(samplers);   // space3 SamplerState
+
+        builder.addRootDescriptor(0, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
+        builder.addRootDescriptor(1, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
+        builder.addRootDescriptor(2, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
+        builder.end();
+
+        g_pipeline_layout = builder.create(g_device.get());
         if (g_pipeline_layout == nullptr) {
             REXLOG_WARN("plume: createPipelineLayout failed; no pipelines can be built");
             return;
         }
+        REXLOG_WARN("plume: pipeline layout built -- 4 descriptor sets (t/space0-2, s/space3) "
+                    "+ 3 root CBVs (b0/b1/b2 space4), matching XenosRecomp's binding model");
     }
 
     uint32_t built = 0, waiting = 0, failed = 0;
@@ -843,6 +1186,8 @@ void BuildPipelines(const char* reason) {
                                   VulkanLocation(a.usage, a.usage_index), fmt, slot, a.offset);
         }
         if (!usable) { c.pipeline_state = PipelineState::kFailed; ++failed; continue; }
+        c.slots = slots;
+        c.slot_consts = slot_consts;
 
         plume::RenderGraphicsPipelineDesc desc;
         desc.pipelineLayout = g_pipeline_layout.get();
@@ -867,6 +1212,51 @@ void BuildPipelines(const char* reason) {
             ++failed;
             REXLOG_WARN("plume: pipeline {} FAILED ({} + {}, {})", i,
                         vs->second.entry->name, ps->second.entry->name, TopologyName(c.topology));
+            // CreateGraphicsPipelineState returns a bare E_INVALIDARG, and the
+            // D3D12 debug layer is an optional Windows feature that is not
+            // installed here -- so there is no message to read. Instead, rebuild
+            // the pipeline with one piece removed at a time: the first variant
+            // that succeeds names the piece that is wrong. Runs once per failed
+            // combination.
+            if (!g_bisected) {
+                g_bisected = true;
+                auto try_variant = [&](const char* what, auto&& mutate) {
+                    plume::RenderGraphicsPipelineDesc v = desc;
+                    mutate(v);
+                    auto p = g_device->createGraphicsPipeline(v);
+                    REXLOG_WARN("plume:   bisect -- without {}: {}", what,
+                                p != nullptr ? "BUILDS" : "still fails");
+                    return p != nullptr;
+                };
+                try_variant("the input layout", [](plume::RenderGraphicsPipelineDesc& v) {
+                    v.inputElements = nullptr; v.inputElementsCount = 0;
+                    v.inputSlots = nullptr;    v.inputSlotsCount = 0;
+                });
+                try_variant("the pixel shader", [](plume::RenderGraphicsPipelineDesc& v) {
+                    v.pixelShader = nullptr;
+                });
+                try_variant("the depth target", [](plume::RenderGraphicsPipelineDesc& v) {
+                    v.depthTargetFormat = plume::RenderFormat::UNKNOWN;
+                });
+                try_variant("the colour target", [](plume::RenderGraphicsPipelineDesc& v) {
+                    v.renderTargetCount = 0;
+                    v.renderTargetFormat[0] = plume::RenderFormat::UNKNOWN;
+                });
+                // The pixel shader is the piece that fails. Is the root
+                // signature missing something it needs, or does it conflict
+                // with something it does not? An EMPTY layout answers that:
+                // if the pipeline builds against nothing, the bindings we
+                // declared are wrong rather than absent.
+                plume::RenderPipelineLayoutDesc empty_desc;
+                empty_desc.allowInputLayout = true;
+                auto empty_layout = g_device->createPipelineLayout(empty_desc);
+                if (empty_layout != nullptr) {
+                    try_variant("our root signature (empty layout instead)",
+                                [&](plume::RenderGraphicsPipelineDesc& v) {
+                                    v.pipelineLayout = empty_layout.get();
+                                });
+                }
+            }
             continue;
         }
         c.pipeline_state = PipelineState::kBuilt;
@@ -1102,6 +1492,7 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
     if (g_cur_decl_ea != found->decl_ea) ++found->decl_mismatch;
     if (vertex_count < found->min_count) found->min_count = vertex_count;
     if (vertex_count > found->max_count) found->max_count = vertex_count;
+    g_draw_combo = uint32_t(found - g_combos);
 
     // Fold in whatever is actually bound right now.
     for (uint32_t s = 0; s < kMaxStreams; ++s) {

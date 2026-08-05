@@ -82,6 +82,21 @@ target_compile_definitions(daytona PRIVATE DAYTONA_VERSION=${PROJECT_VERSION})
 # plume. Linked but inert unless DT_PLUME is set in the environment -- see
 # src/dt_plume.cpp.
 target_link_libraries(daytona PRIVATE plume)
+
+# The renderer spike drives plume by hand from intercepted guest calls, so a
+# wrong descriptor or a mismatched pipeline shows up as a crash with no message.
+# -DDT_PLUME_D3D12_DEBUG=ON turns on the D3D12 validation layer, which names the
+# offending call instead. Off by default: it is slow, and it is a diagnostic.
+option(DT_PLUME_D3D12_DEBUG "Enable the D3D12 debug layer inside plume" OFF)
+if(DT_PLUME_D3D12_DEBUG)
+    # plume's debug path also expects the two break-on-severity knobs to be
+    # defined; it never provides defaults. Both false: we want the validation
+    # MESSAGES, not a debugger break in an unattended run.
+    target_compile_definitions(plume PRIVATE
+        D3D12_DEBUG_LAYER_ENABLED
+        D3D12_DEBUG_LAYER_BREAK_ON_ERROR=false
+        D3D12_DEBUG_LAYER_BREAK_ON_WARNING=false)
+endif()
 if(WIN32)
     target_link_libraries(daytona PRIVATE d3d12 dxgi)
 endif()
