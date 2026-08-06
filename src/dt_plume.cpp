@@ -400,9 +400,15 @@ uint32_t AttributeBytes(uint32_t gpu_format) {
 
 uint32_t ComponentBytes(uint32_t gpu_format) {
     switch (gpu_format) {
-        case 57: case 37: case 38: return 4;
-        case 6:                    return 1;
-        default:                   return 0;   // unknown: refuse to swap
+        // ⚠ 36 (32_FLOAT) was in AttributeBytes and in ToRenderFormat but not
+        // here, so the one attribute that uses it -- DEPTH0, which only
+        // vs_0f1a63ff9e54ebc8 declares, which is only the 3D scene -- fell
+        // through to 0 and was skipped by every swap. It reached the shader
+        // still big-endian, and a float whose bytes are reversed is not a
+        // slightly wrong number: 145.0014f reads as 1.1e-12.
+        case 57: case 37: case 38: case 36: return 4;
+        case 6:                             return 1;
+        default:                            return 0;   // unknown: refuse to swap
     }
 }
 
