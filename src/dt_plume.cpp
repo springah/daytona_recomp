@@ -345,6 +345,30 @@ bool g_pipelines_dirty = false;
 bool g_bisected = false;   // the pipeline-failure bisect runs once, not per combo
 uint32_t g_decl_changes = 0;
 
+// ── Mesh dump (opt-in: DT_PLUME_MESHDUMP=<dir>) ──────────────────────────────
+// A readback says WHETHER pixels appeared; it cannot say what SHAPE the guest
+// asked for. Two attract-cycle defects (a floodlight's lamps squashed to
+// slivers, a guideway's columns truncated to stubs) are shape defects, and the
+// only way to tell "we decoded the vertices wrong" from "the guest sent those
+// vertices" is to read the decoded stream against the picture of the same
+// frame. So: every DT_PLUME_MESHEVERY frames, write one text file of every
+// draw's decoded POSITION/DEPTH plus a BMP of that same frame.
+//
+// The vertex bytes dumped are the HOST-ORDER ones -- exactly what the input
+// assembler will hand the shader -- because decoding the guest copy a second
+// time would only re-test the decoder against itself.
+const char* g_meshdump_dir = nullptr;
+uint32_t g_meshdump_every = 300;      // DT_PLUME_MESHEVERY
+uint32_t g_meshdump_from = 0;         // DT_PLUME_MESHFROM: skip the boot frames
+uint32_t g_meshdump_frames = 0;       // DT_PLUME_MESHFRAMES: 0 = no limit
+uint32_t g_meshdump_maxverts = 32;    // DT_PLUME_MESHVERTS: per-draw vertex cap
+uint32_t g_meshdump_maxn = 0;         // DT_PLUME_MESHMAXN: only detail draws <= n verts
+float g_meshdump_rect[4] = {0, 0, 0, 0};   // DT_PLUME_MESHRECT="x0,y0,x1,y1"
+bool g_meshdump_has_rect = false;
+FILE* g_meshdump_file = nullptr;
+uint32_t g_meshdump_written = 0;
+bool g_meshdump_want_bmp = false;
+
 constexpr uint32_t kMaxDecls = 8;
 struct DeclBind {
     uint32_t ea = 0;
@@ -697,6 +721,24 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_SWAPPRESENT")) g_swap_present = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_STATECENSUS")) g_statecensus = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_DEPTHSTATE")) g_depthstate = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_MESHDUMP")) {
+        g_meshdump_dir = p;
+        if (const char* v = std::getenv("DT_PLUME_MESHEVERY")) g_meshdump_every = std::atoi(v);
+        if (const char* v = std::getenv("DT_PLUME_MESHFROM")) g_meshdump_from = std::atoi(v);
+        if (const char* v = std::getenv("DT_PLUME_MESHFRAMES")) g_meshdump_frames = std::atoi(v);
+        if (const char* v = std::getenv("DT_PLUME_MESHVERTS")) g_meshdump_maxverts = std::atoi(v);
+        if (const char* v = std::getenv("DT_PLUME_MESHMAXN")) g_meshdump_maxn = std::atoi(v);
+        if (const char* v = std::getenv("DT_PLUME_MESHRECT")) {
+            g_meshdump_has_rect = std::sscanf(v, "%f,%f,%f,%f", &g_meshdump_rect[0],
+                                              &g_meshdump_rect[1], &g_meshdump_rect[2],
+                                              &g_meshdump_rect[3]) == 4;
+        }
+        if (g_meshdump_every == 0) g_meshdump_every = 1;
+        REXLOG_WARN("plume: MESHDUMP to {} -- every {} frames, {} frames max, {} verts/draw, "
+                    "detail cap {} verts, rect {}",
+                    g_meshdump_dir, g_meshdump_every, g_meshdump_frames, g_meshdump_maxverts,
+                    g_meshdump_maxn, g_meshdump_has_rect ? "on" : "off");
+    }
     REXLOG_WARN("plume: per-draw depth state is {} (DT_PLUME_DEPTHSTATE={})",
                 g_depthstate ? "ON -- RB_DEPTHCONTROL keys the pipeline"
                              : "OFF -- every pipeline draws with the depth test disabled",
@@ -2957,6 +2999,137 @@ struct ScopedMs {
     }
 };
 
+// Is the frame currently being recorded one of the dumped ones? Draws run
+// BEFORE EndFrame's ++, so the frame they belong to is g_frame_index + 1.
+bool MeshDumpActive() {
+    if (g_meshdump_dir == nullptr) return false;
+    if (g_meshdump_frames != 0 && g_meshdump_written >= g_meshdump_frames) return false;
+    if (g_frame_index + 1u < g_meshdump_from) return false;
+    return ((g_frame_index + 1u) % g_meshdump_every) == 0;
+}
+
+// One line per draw with the decoded position bounding box, then one line per
+// vertex for the draws that pass the filters. The bbox is on EVERY draw because
+// a draw that is missing from the picture but present in the dump is the whole
+// question, and a filter that hid it would answer it wrong.
+void MeshDumpDraw(const Combo& c, const Created& s, uint32_t start_vertex,
+                  uint32_t vertex_count, uint32_t stride, const std::vector<uint8_t>& bytes,
+                  const uint8_t* base) {
+    if (g_meshdump_file == nullptr) {
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/mesh_%06u.txt", g_meshdump_dir, g_frame_index + 1u);
+        g_meshdump_file = std::fopen(path, "wb");
+        if (g_meshdump_file == nullptr) {
+            g_meshdump_dir = nullptr;   // one failure is enough; do not retry per draw
+            return;
+        }
+        g_meshdump_want_bmp = true;
+        std::fprintf(g_meshdump_file, "frame %u\n", g_frame_index + 1u);
+    }
+
+    // The transform this draw will actually run, straight out of the vertex
+    // constant file. Without it the dump is a pile of numbers in an unknown
+    // space; with it every vertex can be carried all the way to SV_Position and
+    // SV_Depth on the CPU and laid over the picture of the same frame.
+    //
+    // Read off the DISASSEMBLED shader (dxc -dumpbin of the vs_0f1a63ff9e54ebc8
+    // blob), not guessed:
+    //   clip = P.x*c72 + P.y*c73 + P.z*c74 + c75        (P.w is the patched 1.0)
+    //   SV_Position = (clip.x + off.z*clip.w, clip.y + off.w*clip.w, clip.z,
+    //                  clip.w)
+    //   SV_Depth    = saturate((c0.z*(clip.z - DEPTH0) + DEPTH0)*c0.x + c0.y)
+    // so c0 and c72..c75 are the whole story and are dumped whenever they move.
+    {
+        static float last[5][4] = {};
+        static bool have_last = false;
+        const uint32_t regs[5] = {0, 72, 73, 74, 75};
+        bool same = have_last;
+        for (uint32_t i = 0; i < 5 && same; ++i) {
+            for (uint32_t k = 0; k < 4; ++k) {
+                if (last[i][k] != g_vs_constants[regs[i]][k]) { same = false; break; }
+            }
+        }
+        if (!same) {
+            std::fprintf(g_meshdump_file, "C");
+            for (uint32_t i = 0; i < 5; ++i) {
+                for (uint32_t k = 0; k < 4; ++k) {
+                    last[i][k] = g_vs_constants[regs[i]][k];
+                }
+                std::fprintf(g_meshdump_file, " c%u=(%.6f,%.6f,%.6f,%.6f)", regs[i],
+                             last[i][0], last[i][1], last[i][2], last[i][3]);
+            }
+            std::fprintf(g_meshdump_file, "\n");
+            have_last = true;
+        }
+    }
+
+    // Where POSITION, DEPTH and the two texcoords sit inside this slot's stride.
+    int pos_off = -1, depth_off = -1, uv0_off = -1, uv1_off = -1;
+    for (const auto& a : c.attributes) {
+        if (a.usage == 0 && a.usage_index == 0 && a.format == 57) pos_off = int(a.offset);
+        if (a.usage == 12 && a.format == 36) depth_off = int(a.offset);
+        if (a.usage == 5 && a.format == 37) {
+            if (a.usage_index == 0) uv0_off = int(a.offset);
+            else uv1_off = int(a.offset);
+        }
+    }
+
+    float bb[6] = {1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f};
+    float dlo = 1e30f, dhi = -1e30f;
+    const auto read = [&](uint32_t v, int off, float* out, uint32_t n) -> bool {
+        if (off < 0) return false;
+        const size_t at = size_t(v) * stride + size_t(off);
+        if (at + n * 4 > bytes.size()) return false;
+        std::memcpy(out, bytes.data() + at, n * 4);
+        return true;
+    };
+    for (uint32_t v = 0; v < vertex_count; ++v) {
+        float p[3];
+        if (read(v, pos_off, p, 3)) {
+            for (uint32_t k = 0; k < 3; ++k) {
+                bb[k] = std::min(bb[k], p[k]);
+                bb[3 + k] = std::max(bb[3 + k], p[k]);
+            }
+        }
+        float d;
+        if (read(v, depth_off, &d, 1)) { dlo = std::min(dlo, d); dhi = std::max(dhi, d); }
+    }
+
+    // Which art this draw samples, named the way DT_PLUME_TEXDUMP names its
+    // files, so a draw in the dump and a texture on disk go side by side
+    // without a second lookup table. The pixel shader ALPHA-TESTS against
+    // sampler 0's alpha, so this binding is not decoration: it is the suspect.
+    char tex[160] = "tex0=none";
+    const DecodedTexture t0 = ReadTextureFetchConstant(0, base);
+    if (t0.valid) {
+        std::snprintf(tex, sizeof(tex), "tex0=%08X_%ux%u_f%u_s%03X", t0.base_address, t0.width,
+                      t0.height, t0.format, t0.swizzle);
+    }
+    std::fprintf(g_meshdump_file,
+                 "D %u combo=%u topo=%s vs=%s n=%u start=%u stride=%u bb=(%.2f,%.2f,%.2f)-"
+                 "(%.2f,%.2f,%.2f) depth=(%.4f,%.4f) %s\n",
+                 g_frame_draws, uint32_t(&c - g_combos), TopologyName(c.topology),
+                 s.entry != nullptr ? s.entry->name : "?", vertex_count, start_vertex, stride,
+                 bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], dlo, dhi, tex);
+
+    if (g_meshdump_maxn != 0 && vertex_count > g_meshdump_maxn) return;
+    if (g_meshdump_has_rect &&
+        (bb[3] < g_meshdump_rect[0] || bb[0] > g_meshdump_rect[2] ||
+         bb[4] < g_meshdump_rect[1] || bb[1] > g_meshdump_rect[3])) {
+        return;
+    }
+    const uint32_t n = std::min(vertex_count, g_meshdump_maxverts);
+    for (uint32_t v = 0; v < n; ++v) {
+        float p[3] = {}, d = 0.0f, uv0[2] = {}, uv1[2] = {};
+        read(v, pos_off, p, 3);
+        read(v, depth_off, &d, 1);
+        read(v, uv0_off, uv0, 2);
+        read(v, uv1_off, uv1, 2);
+        std::fprintf(g_meshdump_file, "  v%u %.3f %.3f %.3f d=%.4f uv0=%.4f,%.4f uv1=%.4f,%.4f\n",
+                     v, p[0], p[1], p[2], d, uv0[0], uv0[1], uv1[0], uv1[1]);
+    }
+}
+
 void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
                    const uint8_t* base) {
     ScopedMs timer(g_ms_record);
@@ -3032,6 +3205,10 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         }
         if (sl == 0) {
             first_src_ea = src_ea;
+            if (MeshDumpActive()) {
+                MeshDumpDraw(c, s, start_vertex, vertex_count, c.slots[sl].stride, bytes,
+                             base);
+            }
             // What geometry is this actually? A degenerate quad draws nothing
             // and looks identical to a broken pipeline from the readback alone.
             if (c.recorded_draws <= 2) {
@@ -3303,6 +3480,14 @@ void EndFrame(bool present) {
     ScopedMs timer(g_ms_endframe);
     g_frame_open = false;
     ++g_frame_index;
+    // The mesh dump's file covers exactly the draws of the frame that just
+    // closed, so it closes with the frame -- and the BMP it asked for is
+    // written from this same EndFrame's readback, below.
+    if (g_meshdump_file != nullptr) {
+        std::fclose(g_meshdump_file);
+        g_meshdump_file = nullptr;
+        ++g_meshdump_written;
+    }
     if ((g_frame_index % 300) == 0) {
         const auto now = std::chrono::steady_clock::now();
         const double wall = g_last_endframe.time_since_epoch().count() != 0
@@ -3334,7 +3519,7 @@ void EndFrame(bool present) {
         g_presents = g_presents_closed = g_swaps = 0;
     }
 
-    const bool report = g_capture_resolve ||
+    const bool report = g_capture_resolve || g_meshdump_want_bmp ||
         g_frame_index <= kReportedFrames || (g_frame_index % kReportInterval) == 0;
 
     // DT_PLUME_SWAPPRESENT=0 restores the old present-at-every-EndFrame, which
@@ -3441,8 +3626,16 @@ void EndFrame(bool present) {
     // have, which is exactly what the 32-bit format stores.
     {
         static const char* want = std::getenv("DT_PLUME_DUMP");
+        char mesh_bmp[512] = {};
+        const char* path = nullptr;
         if (want != nullptr && g_frame_index == uint32_t(std::atoi(want))) {
-            const char* path = "plume_frame.bmp";
+            path = "plume_frame.bmp";
+        } else if (g_meshdump_want_bmp) {
+            std::snprintf(mesh_bmp, sizeof(mesh_bmp), "%s/mesh_%06u.bmp", g_meshdump_dir,
+                          g_frame_index);
+            path = mesh_bmp;
+        }
+        if (path != nullptr) {
             if (FILE* f = std::fopen(path, "wb")) {
                 const uint32_t image = kFrameW * kFrameH * 4;
                 const uint32_t offset = 14 + 40;
@@ -3465,6 +3658,7 @@ void EndFrame(bool present) {
                 REXLOG_WARN("plume: wrote frame {} to {}", g_frame_index, path);
             }
         }
+        g_meshdump_want_bmp = false;
     }
     // The pixel census and the FRAME log below are diagnostics: skip them on
     // frames that only reached this path because the resolve wanted the pixels
