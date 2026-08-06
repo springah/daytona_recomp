@@ -243,9 +243,13 @@ const char* TopologyName(uint32_t t) {
         case 1:  return "POINTLIST";
         case 2:  return "LINELIST";
         case 3:  return "LINESTRIP";
+        // ⚠ XENOS encoding (xenos.h:49-51), NOT the PC D3D9 one -- fan and
+        // strip are REVERSED between them. Decoding 6 as FAN drew the title's
+        // fullscreen strip-ordered quad with fan indices, which covers all of
+        // the screen except a bottom-centre triangle: the black wedge.
         case 4:  return "TRIANGLELIST";
-        case 5:  return "TRIANGLESTRIP";
-        case 6:  return "TRIANGLEFAN";
+        case 5:  return "TRIANGLEFAN";
+        case 6:  return "TRIANGLESTRIP";
         case 13: return "QUADLIST";
         default: return "?";
     }
@@ -1675,18 +1679,42 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     if (!BeginFrame()) return;
     if (g_frame_draws >= kMaxDrawsPerFrame) { ++g_frame_skipped; return; }
 
-    // QUADLIST expands 4 verts -> 6 indices; TRIANGLEFAN expands n -> (n-2)*3.
+    // Topology decides the draw shape. QUADLIST expands 4 verts -> 6 indices
+    // and TRIANGLEFAN n -> (n-2)*3, both through static index buffers, because
+    // neither exists in D3D12/Vulkan. TRIANGLELIST and TRIANGLESTRIP need no
+    // index expansion at all -- they draw non-indexed, with the strip's
+    // pipeline built with STRIP topology.
+    //
+    // ⚠ The first version fanned EVERYTHING non-quad. A TRIANGLELIST expanded
+    // with fan indices re-anchors every triangle at vertex 0 -- measured as a
+    // giant black wedge across the title screen that the xenos referee does
+    // not have.
     const bool is_quad = (c.topology == 0x0D);
+    const bool is_fan = (c.topology == 5);                         // XENOS: 5 = fan
+    const bool is_direct = (c.topology == 4 || c.topology == 6);   // list, strip
+    if (!is_quad && !is_fan && !is_direct) {
+        if (!c.warned_unreadable) {
+            c.warned_unreadable = true;
+            REXLOG_WARN("plume: topology {} ({}) not drawable yet -- draws skipped",
+                        c.topology, TopologyName(c.topology));
+        }
+        ++g_frame_skipped;
+        return;
+    }
     uint32_t index_count = 0;
+    const plume::RenderBuffer* ib = nullptr;
     if (is_quad) {
         if (vertex_count < 4) return;
         index_count = (vertex_count / 4) * 6;
-    } else {
+        ib = g_quad_indices.get();
+    } else if (is_fan) {
         if (vertex_count < 3) return;
         index_count = (vertex_count - 2) * 3;
+        ib = g_fan_indices.get();
+    } else {
+        if (vertex_count < 3) return;
     }
-    const plume::RenderBuffer* ib = is_quad ? g_quad_indices.get() : g_fan_indices.get();
-    if (ib == nullptr || index_count == 0) return;
+    if (!is_direct && (ib == nullptr || index_count == 0)) return;
 
     // One vertex buffer per input slot, each with that slot's own stride.
     std::vector<std::unique_ptr<plume::RenderBuffer>> vbs;
@@ -1825,8 +1853,6 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
 
     const plume::RenderViewport viewport(0.0f, 0.0f, float(kFrameW), float(kFrameH));
     const plume::RenderRect scissor(0, 0, int32_t(kFrameW), int32_t(kFrameH));
-    const plume::RenderIndexBufferView ibv(ib->at(0), index_count * uint32_t(sizeof(uint16_t)),
-                                           plume::RenderFormat::R16_UINT);
 
     // From here it is pure recording into the frame's already-open list. No
     // clear: the frame was cleared once in BeginFrame, and clearing per draw is
@@ -1849,10 +1875,17 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     g_cmd->setScissors(&scissor, 1);
     Step("setVertexBuffers");
     g_cmd->setVertexBuffers(0, views.data(), uint32_t(views.size()), c.slots.data());
-    Step("setIndexBuffer");
-    g_cmd->setIndexBuffer(&ibv);
-    Step("drawIndexedInstanced");
-    g_cmd->drawIndexedInstanced(index_count, 1, 0, 0, 0);
+    if (is_direct) {
+        Step("drawInstanced");
+        g_cmd->drawInstanced(vertex_count, 1, 0, 0);
+    } else {
+        const plume::RenderIndexBufferView ibv(
+            ib->at(0), index_count * uint32_t(sizeof(uint16_t)), plume::RenderFormat::R16_UINT);
+        Step("setIndexBuffer");
+        g_cmd->setIndexBuffer(&ibv);
+        Step("drawIndexedInstanced");
+        g_cmd->drawIndexedInstanced(index_count, 1, 0, 0, 0);
+    }
 
     // The constant buffers are read at submit time like the vertex data, so
     // they belong to the frame too.
@@ -2259,8 +2292,12 @@ void BuildPipelines(const char* reason) {
         desc.depthTargetFormat = kDepthTargetFormat;
         // QUADLIST and TRIANGLEFAN both become an indexed TRIANGLE_LIST: neither
         // exists in D3D12/Vulkan, and both expand with a static index pattern
-        // (0,1,2, 0,2,3 per quad; 0,i,i+1 for a fan). See RENDERER_INPUT_SPEC.md.
-        desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+        // (0,1,2, 0,2,3 per quad; 0,i,i+1 for a fan). TRIANGLELIST draws as
+        // itself, non-indexed; TRIANGLESTRIP keeps STRIP topology (it exists
+        // natively). See RENDERER_INPUT_SPEC.md.
+        desc.primitiveTopology = c.topology == 6   // XENOS: 6 = strip
+            ? plume::RenderPrimitiveTopology::TRIANGLE_STRIP
+            : plume::RenderPrimitiveTopology::TRIANGLE_LIST;
 
         c.pipeline = g_device->createGraphicsPipeline(desc);
         if (c.pipeline == nullptr) {
