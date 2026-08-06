@@ -61,6 +61,9 @@ bool g_resolveclear = true;
 // Likewise: whether the per-draw uploads are suballocated out of one per-frame
 // buffer or each get a buffer of their own. See the upload arena.
 bool g_arena = true;
+// Likewise: whether the swapchain is presented ONLY at the guest's Swap, or at
+// every EndFrame the way it used to be. See EndFrame for what that cost.
+bool g_swap_present = true;
 
 // ── Sub-buckets inside `record` ──────────────────────────────────────────────
 // The 300-frame timing line names three buckets; `record` is the biggest of
@@ -648,6 +651,12 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_RESOLVECLEAR")) g_resolveclear = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_PROF")) g_prof = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_ARENA")) g_arena = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_SWAPPRESENT")) g_swap_present = std::atoi(p) != 0;
+    REXLOG_WARN("plume: the swapchain is presented {} (DT_PLUME_SWAPPRESENT={})",
+                g_swap_present ? "at the guest's Swap ONLY -- a mid-frame resolve closes and "
+                                 "captures the frame but does not put it on the screen"
+                               : "at every EndFrame, mid-frame resolves included",
+                g_swap_present ? 1 : 0);
     REXLOG_WARN("plume: per-draw uploads come from {} (DT_PLUME_ARENA={})",
                 g_arena ? "ONE per-frame arena, bump-allocated"
                         : "a buffer of their own, one createBuffer each",
@@ -1090,7 +1099,7 @@ bool BuildIndexBuffers() {
 // Defined below, next to the frame target they render into.
 void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
                    const uint8_t* base);
-void EndFrame();
+void EndFrame(bool present);
 void FlushConstants(const uint8_t* base);
 
 void SnapshotDrawVertices(const uint8_t* base) {
@@ -2873,6 +2882,11 @@ double g_ms_endframe = 0.0;
 double g_ms_scatter = 0.0;
 double g_ms_record = 0.0;
 uint32_t g_scatter_count = 0;
+// Presents and guest Swaps over the same 300-EndFrame window. These two numbers
+// are the standing check on the fix below: one present per Swap is the whole
+// point, and 2 presents per Swap is the flicker coming back.
+uint32_t g_presents = 0;
+uint32_t g_swaps = 0;
 std::chrono::steady_clock::time_point g_last_endframe{};
 
 struct ScopedMs {
@@ -3198,14 +3212,35 @@ void PumpWindow() {
 }
 #endif
 
-// Close the frame: copy into the backbuffer, submit, present, and (for the
-// first few frames) measure what actually landed.
+// Close the frame: submit it, optionally copy it into the backbuffer and
+// present, and (for the first few frames) measure what actually landed.
 //
 // The measurement is not redundant with the window. A window shows a person
 // what happened; the readback is what an unattended run, or a run on a machine
 // with no display, can still report -- and it is the thing that caught a
 // renderer reporting success while drawing nothing.
-void EndFrame() {
+//
+// ── Why `present` is a parameter ─────────────────────────────────────────────
+// Closing a frame and PUTTING IT ON THE SCREEN are two different events, and
+// conflating them is what made the HUD flicker.
+//
+// EndFrame runs twice per guest frame: once at the guest's Swap, and once at
+// the mid-frame D3DDevice_Resolve that copies the finished 3D scene out of
+// EDRAM (OnResolve has to close the frame there, because the pixels the guest
+// asked for only exist once the recording is submitted). The guest then draws
+// its HUD/overlay pass and Swaps. So a frame that presented at BOTH points put
+// two different pictures on the screen: the bare 3D scene at the resolve, and
+// the composited scene+HUD at the Swap.
+//
+// MEASURED: 300 EndFrames took a metronomic 2500ms -- 120.0/s against a 60Hz
+// guest, i.e. exactly 2 presents per guest frame -- and a 20-shot in-race burst
+// classified 13 composited / 7 bare. The bare seven were not corrupt frames.
+// They were legitimate mid-frame states that had no business being presented.
+//
+// Everything else a resolve-EndFrame does it still does: the readback that
+// captures g_resolve_pixels for the guest, the mirror refresh, the fence wait,
+// the buffer and arena lifecycle. Only the acquire/copy/present is skipped.
+void EndFrame(bool present) {
     if (!g_frame_open) return;
     ScopedMs timer(g_ms_endframe);
     g_frame_open = false;
@@ -3216,11 +3251,12 @@ void EndFrame() {
             ? std::chrono::duration<double, std::milli>(now - g_last_endframe).count() : 0.0;
         REXLOG_WARN("plume: timing over 300 frames -- wall {:.0f}ms ({:.1f}fps), endframe "
                     "{:.0f}ms, scatter {:.0f}ms ({} scatters), record {:.0f}ms, guest+rest "
-                    "{:.0f}ms; {} binds served from the mirror ({} a generation late)",
+                    "{:.0f}ms; {} binds served from the mirror ({} a generation late); "
+                    "{} presents for {} guest Swaps",
                     wall, wall > 0 ? 300000.0 / wall : 0.0, g_ms_endframe, g_ms_scatter,
                     g_scatter_count, g_ms_record,
                     wall - g_ms_endframe - g_ms_scatter - g_ms_record,
-                    g_mirror_hits, g_mirror_stale);
+                    g_mirror_hits, g_mirror_stale, g_presents, g_swaps);
         if (g_prof) {
             REXLOG_WARN("plume: record breakdown over 300 frames -- vtx {:.0f}ms, vbuf {:.0f}ms, "
                         "tex {:.0f}ms (probe {:.0f}ms in {} calls), cb {:.0f}ms, cmd {:.0f}ms, "
@@ -3237,14 +3273,18 @@ void EndFrame() {
         g_probe_calls = 0;
         g_scatter_count = 0;
         g_mirror_hits = g_mirror_stale = 0;
+        g_presents = g_swaps = 0;
     }
 
     const bool report = g_capture_resolve ||
         g_frame_index <= kReportedFrames || (g_frame_index % kReportInterval) == 0;
 
+    // DT_PLUME_SWAPPRESENT=0 restores the old present-at-every-EndFrame, which
+    // is the A/B for the flicker.
+    const bool do_present = g_swap_present ? present : true;
     uint32_t swap_index = 0;
     plume::RenderTexture* backbuffer = nullptr;
-    if (g_swapchain != nullptr && !g_swapchain->needsResize() &&
+    if (do_present && g_swapchain != nullptr && !g_swapchain->needsResize() &&
         g_swapchain->acquireTexture(nullptr, &swap_index)) {
         backbuffer = g_swapchain->getTexture(swap_index);
     }
@@ -3300,8 +3340,11 @@ void EndFrame() {
 
     if (backbuffer != nullptr) {
         g_swapchain->present(swap_index, nullptr, 0);
+        ++g_presents;
     }
 #ifdef _WIN32
+    // Unconditional: a frame that does not present still has to keep the
+    // window's message queue drained or it is marked unresponsive.
     PumpWindow();
 #endif
 
@@ -3482,6 +3525,50 @@ plume::RenderBlendDesc BlendDescFromControl(uint32_t bc, uint8_t write_mask) {
     d.blendEnabled = !(csrc == 1 && cop == 0 && cdst == 0 && asrc == 1 && aop == 0 && adst == 0);
     d.renderTargetWriteMask = write_mask;
     return d;
+}
+
+// Put the frame target on the screen without touching the recording.
+//
+// A guest Swap is the only moment a picture is finished, but by the time it
+// arrives the frame may already have been CLOSED -- OnResolve closes it, and
+// the guest's last resolve of a frame can come after its last draw, leaving
+// nothing for the Swap's EndFrame to do but return. Presenting the target as it
+// stands is exactly right then: it holds the composited frame, byte for byte
+// what the resolve-EndFrame submitted. The alternative, skipping the present,
+// leaves the PREVIOUS guest frame on the screen, which is a stutter traded for
+// a flicker.
+//
+// It borrows g_upload_cmd rather than g_cmd: g_cmd is between begin() and end()
+// for most of a frame and calling begin() on an open list is invalid, whereas
+// nothing is uploading at a Swap with no frame open.
+void PresentTarget() {
+    if (g_offscreen != OffscreenState::kReady || !g_target_primed) return;
+    if (g_swapchain == nullptr || g_swapchain->needsResize()) return;
+    uint32_t swap_index = 0;
+    if (!g_swapchain->acquireTexture(nullptr, &swap_index)) return;
+    plume::RenderTexture* backbuffer = g_swapchain->getTexture(swap_index);
+    if (backbuffer == nullptr) return;
+
+    // The frame target has been in COPY_SOURCE since the EndFrame that closed
+    // the frame and it is not transitioned back until the next BeginFrame, so
+    // only the backbuffer needs a barrier here.
+    g_upload_cmd->begin();
+    const plume::RenderTextureBarrier to_dst(backbuffer, plume::RenderTextureLayout::COPY_DEST);
+    g_upload_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_dst, 1);
+    g_upload_cmd->copyTexture(backbuffer, g_color_target.get());
+    const plume::RenderTextureBarrier to_present(backbuffer,
+                                                 plume::RenderTextureLayout::PRESENT);
+    g_upload_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_present, 1);
+    g_upload_cmd->end();
+
+    const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
+    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_upload_fence.get());
+    g_queue->waitForCommandFence(g_upload_fence.get());
+    g_swapchain->present(swap_index, nullptr, 0);
+    ++g_presents;
+#ifdef _WIN32
+    PumpWindow();
+#endif
 }
 
 void BuildPipelines(const char* reason) {
@@ -4047,7 +4134,11 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
     // asking for output, and stale output unblocks it where none never will.
     if (g_frame_open) {
         g_capture_resolve = true;
-        EndFrame();
+        // present=false: this is a MID-FRAME close. The guest has finished its
+        // 3D scene and wants the pixels, but it has not drawn its HUD/overlay
+        // pass yet, so what is in the target is not what the frame will look
+        // like. Presenting it here is what put bare-3D frames on the screen.
+        EndFrame(false);
         g_capture_resolve = false;
     }
     if (g_resolve_pixels.empty()) {
@@ -4443,10 +4534,19 @@ void OnGpuCacheInvalidate(uint32_t base_addr, uint32_t size) {
     }
 }
 
+// D3DDevice_Swap: the guest says the picture is finished. This is the ONE
+// place a frame goes on the screen.
 void OnFrameEnd() {
     if (!Enabled() || !g_init_ok) return;
     std::lock_guard<std::mutex> lock(g_mutex);
-    EndFrame();
+    ++g_swaps;
+    if (g_frame_open) {
+        EndFrame(true);
+    } else if (g_swap_present) {
+        // Already closed by a resolve. The recording is gone but the picture is
+        // not: present the target as it stands.
+        PresentTarget();
+    }
 }
 
 void Dump(const char* reason) {
