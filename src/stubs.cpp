@@ -63,6 +63,33 @@ bool ShouldLog(uint32_t count) {
     return count <= 16 || (count % 1000) == 0;
 }
 
+// DT_TRACE_BOOT gates the boot-wedge instruments: the XPS command-buffer
+// player/end dumps, the ring-space wait loggers, the present-wait logger, the
+// ring-cursor/fence dump, the ISR source-1 dump and the KickOff dump.
+//
+// Those exist to diagnose ONE question -- why the boot present never retired --
+// and that question is answered. They are dead weight now, and two of them are
+// actively harmful by default:
+//
+//   * they read guest memory at HARDCODED boot-allocation addresses
+//     (0xA5701980 device, 0xA5707920 fence slots). Those are this boot's
+//     allocations under this configuration; in any other one they are garbage
+//     or unmapped.
+//   * sub_82228FB0 is a spin-loop poll measured at 3.0e9 calls in two minutes.
+//     Its "every millionth" throttle still emits ~45 lines/second, which
+//     rotated the 1 MB log ~9 times per run and destroyed every line the log
+//     existed to carry. (This is the same failure the sub_822337C0 comment
+//     already warns about, one instrument over.)
+//
+// Read once: a getenv per call on a 25M-calls/second path is itself a defect.
+bool TraceBoot() {
+    static const bool on = [] {
+        const char* v = std::getenv("DT_TRACE_BOOT");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
 void LogGuestCall(const char* name, uint32_t count, const PPCContext& ctx) {
     REXLOG_INFO("Daytona hook {} call #{} lr={:08X} r3={:08X} r4={:08X} r5={:08X}",
                 name,
@@ -225,7 +252,7 @@ const uint8_t* PatchTestResolve(uint32_t ea, void* ctx) {
 // only -- the 60/s source-0 vblanks would drown everything.
 REX_HOOK_RAW(sub_822346A0) {
     daytona_debug::RecordHook(daytona_debug::HookId::kD3DInterruptCallback, ctx);
-    if (ctx.r3.u32 == 1) {
+    if (TraceBoot() && ctx.r3.u32 == 1) {
         static uint32_t calls = 0;
         ++calls;
         // The pending word at [block+0] is the delivery-race probe. The ISR
@@ -306,6 +333,10 @@ DT_TRACE_HOOK(sub_8223CF68, daytona_debug::HookId::kD3DWorkerThread)  // D3D_Wor
 // replays at 65kHz forever. These dumps exist to DIFF those two runs: the
 // word that differs by round 6 is the completion the guest is waiting for.
 REX_HOOK_RAW(sub_8223CCA8) {
+    if (!TraceBoot()) {
+        __imp__sub_8223CCA8(ctx, base);
+        return;
+    }
     static uint64_t calls = 0;
     ++calls;
     const bool log = calls <= 24 || (calls % 100000) == 0;
@@ -331,6 +362,10 @@ REX_HOOK_RAW(sub_8223CCA8) {
 // continue at (a continuation was appended while we played). r5 points at the
 // end word itself; its value AFTER the call says whether the chain grew.
 REX_HOOK_RAW(sub_8223BFE0) {
+    if (!TraceBoot()) {
+        __imp__sub_8223BFE0(ctx, base);
+        return;
+    }
     static uint64_t calls = 0;
     ++calls;
     const bool log = calls <= 24 || (calls % 100000) == 0;
@@ -363,6 +398,10 @@ DT_TRACE_HOOK(sub_82233C78, daytona_debug::HookId::kD3DSyncToPresentation)      
 // here: a difference that never moves says the GPU never reported completion;
 // one that moves and stops says it reported the wrong thing.
 REX_HOOK_RAW(sub_822337C0) {
+    if (!TraceBoot()) {
+        __imp__sub_822337C0(ctx, base);
+        return;
+    }
     const uint32_t device = ctx.r3.u32;
     const uint32_t out = ctx.r4.u32;
     __imp__sub_822337C0(ctx, base);
@@ -423,7 +462,13 @@ REX_HOOK_RAW(sub_82233568) {
 //   [dev+11036] monotonic write cursor, [dev+11040] (whatever sits next).
 // The spin is: space_needed = cursor - r30; in_flight = cursor - *writeback;
 // wait while space_needed < in_flight.
+//
+// ⚠ HARDCODED ADDRESSES. `dev` and the fence-slot array below are THIS boot's
+// allocations under THIS configuration; nothing guarantees them in another.
+// That was acceptable for a one-question instrument, so the whole thing is
+// DT_TRACE_BOOT-gated and reads nothing by default.
 void DumpRingCursors(const uint8_t* base, const char* tag) {
+    if (!TraceBoot()) return;
     const uint32_t dev = 0xA5701980u;
     const uint32_t wb_ptr = REX_LOAD_U32(dev + 11024);
     const uint32_t wb = wb_ptr != 0 ? REX_LOAD_U32(wb_ptr) : 0xDEADDEAD;
@@ -446,6 +491,12 @@ void DumpRingCursors(const uint8_t* base, const char* tag) {
 // caller's stack. Dumping that struct IS the parked comparison -- no more
 // guessing at which field means what from the disassembly.
 REX_HOOK_RAW(sub_82228FB0) {
+    // Measured 3.0e9 calls in the first two minutes of a run. Anything but an
+    // immediate tail call here is a measurable tax on the whole port.
+    if (!TraceBoot()) {
+        __imp__sub_82228FB0(ctx, base);
+        return;
+    }
     static uint64_t calls = 0;
     ++calls;
     if (calls <= 4 || (calls % 1000000) == 0) {
@@ -467,6 +518,10 @@ REX_HOOK_RAW(sub_82228FB0) {
 // park forever is a range that CONTAINS that position -- a stale caller-side
 // cursor, or a wrapping request. r4/r5 name which.
 REX_HOOK_RAW(sub_82234418) {
+    if (!TraceBoot()) {
+        __imp__sub_82234418(ctx, base);
+        return;
+    }
     // Log only calls that will actually WAIT (the guest's own condition,
     // computed here): satisfied calls are routine and drowned the parked one.
     const uint32_t dev = ctx.r3.u32;
@@ -510,7 +565,8 @@ REX_HOOK_RAW(sub_82234418) {
 REX_HOOK_RAW(sub_82235B20) {
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DKickOff, ctx);
     if (ShouldLog(n)) LogGuestCall("sub_82235B20", n, ctx);
-    const bool log_exit = n < 40;
+    // ⚠ HARDCODED 0xA5707920 below -- this boot's fence allocation. Gated.
+    const bool log_exit = TraceBoot() && n < 40;
     // ⚠ Latched BEFORE __imp__: argument registers are volatile, and reading
     // r3 after the call dumps whatever the callee left there (measured:
     // CDCDCDCD -- uninitialised stack, not a device).
