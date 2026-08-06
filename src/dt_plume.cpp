@@ -218,6 +218,7 @@ struct Combo {
     // every draw is recorded rather than sampled.
     uint32_t recorded_draws = 0;
     bool warned_unreadable = false;
+    bool logged_samplers = false;
 };
 
 std::unordered_map<uint32_t, uint64_t> g_shader_objects;   // guest object ea -> container hash
@@ -2174,11 +2175,35 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     // ⚠ Every sampler, not just 0. ps_e785a247caf76ef9 declares SrcImage1 at
     // c0.y/c12.y; filling only s0 left it reading heap slot 0.
     uint32_t shared[64][4] = {};
+    uint32_t unresolved = 0;
     for (uint32_t s_i = 0; s_i < 8; ++s_i) {
         const uint32_t slot = EnsureTexture(s_i, base);
-        if (slot == UINT32_MAX) continue;
+        if (slot == UINT32_MAX) {
+            // ⚠ Leaving the index at 0 is not "no texture" -- 0 is the control
+            // CHECKER, and a shader that adds its sampler instead of modulating
+            // by it paints the checker over the picture. ps_4a5273cf8fbd0839,
+            // which every 3D surface uses, does exactly that:
+            //     r1.xyz = tex2D(texture_color_ram, ...)      // sampler 1
+            //     r0.xyz = saturate(r1.xyz * 2 + r0.xyz * 2)
+            // so an unresolved sampler 1 saturates to magenta or green over
+            // the whole scene. Counted here so it is a number, not a theory.
+            unresolved |= 1u << s_i;
+            continue;
+        }
         shared[s_i / 4][s_i % 4] = slot;
         shared[12 + s_i / 4][s_i % 4] = 0;   // the one sampler serves them all
+    }
+    // Once per combination: this runs on every draw and the answer is a
+    // property of the combination, not of the draw.
+    if (!c.logged_samplers) {
+        c.logged_samplers = true;
+        REXLOG_WARN("plume: combo {} ({}) textures s0={} s1={} s2={} s3={}{}",
+                    uint32_t(&c - g_combos), s.entry->name,
+                    shared[0][0], shared[0][1], shared[0][2], shared[0][3],
+                    unresolved != 0
+                        ? fmt::format(" -- UNRESOLVED sampler mask {:02X}, those read heap slot 0, "
+                                      "the control checker", unresolved)
+                        : "");
     }
     if (!upload_constants(g_vs_constants, sizeof(g_vs_constants), vs_cb) ||
         !upload_constants(g_ps_constants, sizeof(g_ps_constants), ps_cb) ||
