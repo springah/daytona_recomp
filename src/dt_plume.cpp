@@ -1913,13 +1913,19 @@ uint64_t ProbeSource(const DecodedTexture& t, uint32_t alias, uint32_t source_by
     const uint8_t* p = dt_guest_mem::Resolve(base, alias | t.base_address, source_bytes);
     if (p == nullptr) return 0;
     constexpr uint32_t kWindows = 32, kWindowBytes = 16;
+    // A surface smaller than one window is hashed whole and once. Spelled out
+    // because the arithmetic below is unsigned: source_bytes - kWindowBytes
+    // would wrap, and the read would run off the end of the range Resolve
+    // validated.
+    const uint32_t window = std::min<uint32_t>(kWindowBytes, source_bytes);
+    const uint32_t span = source_bytes - window;
     uint64_t h = 1469598103934665603ull;                 // FNV-1a
     for (uint32_t w = 0; w < kWindows; ++w) {
-        uint64_t at = uint64_t(source_bytes - kWindowBytes) * w / (kWindows - 1);
-        for (uint32_t i = 0; i < kWindowBytes; ++i) {
+        const uint64_t at = uint64_t(span) * w / (kWindows - 1);
+        for (uint32_t i = 0; i < window; ++i) {
             h = (h ^ p[at + i]) * 1099511628211ull;
         }
-        if (source_bytes <= kWindowBytes) break;
+        if (span == 0) break;
     }
     return h;
 }
