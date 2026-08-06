@@ -139,6 +139,13 @@ struct Combo {
     uint64_t vs = 0;
     uint64_t ps = 0;
     uint32_t topology = 0;
+    // Packed RB_BLENDCONTROL, read from the device shadow (+10552, written by
+    // D3DDevice_SetBlendState sub_8221F868 and the individual blend render
+    // states) at draw time, and the colour write mask (+10460 bits 0..3).
+    // Part of the combination KEY: one pipeline per distinct blend state.
+    // Default = src ONE, op ADD, dst ZERO both halves = blending off.
+    uint32_t blend = 0x00010001u;
+    uint8_t write_mask = 0xFu;
     uint64_t draws = 0;
     uint64_t vertices = 0;
     uint32_t min_count = 0xFFFFFFFFu;
@@ -2045,6 +2052,65 @@ void EndFrame() {
     }
 }
 
+// Xenos RB_BLENDCONTROL -> plume. Field layout is rexglue registers.h:779
+// (color src +0/5, op +5/3, dst +8/5; alpha src +16/5, op +21/3, dst +24/5),
+// factor and op encodings from xenos.h:700/719 -- the 360 D3DBLEND values ARE
+// the hardware encodings, which is why SetBlendState can store the packed
+// word untranslated.
+plume::RenderBlend ToRenderBlend(uint32_t f) {
+    using B = plume::RenderBlend;
+    switch (f) {
+        case 0:  return B::ZERO;
+        case 1:  return B::ONE;
+        case 4:  return B::SRC_COLOR;
+        case 5:  return B::INV_SRC_COLOR;
+        case 6:  return B::SRC_ALPHA;
+        case 7:  return B::INV_SRC_ALPHA;
+        case 8:  return B::DEST_COLOR;
+        case 9:  return B::INV_DEST_COLOR;
+        case 10: return B::DEST_ALPHA;
+        case 11: return B::INV_DEST_ALPHA;
+        // Constant colour and constant alpha both map to the blend factor;
+        // plume has no separate constant-alpha, so the alpha channel of the
+        // factor stands in. Daytona sets BlendFactor via sub_8221D620.
+        case 12: return B::BLEND_FACTOR;
+        case 13: return B::INV_BLEND_FACTOR;
+        case 14: return B::BLEND_FACTOR;
+        case 15: return B::INV_BLEND_FACTOR;
+        case 16: return B::SRC_ALPHA_SAT;
+        default: return B::ONE;
+    }
+}
+
+plume::RenderBlendOperation ToRenderBlendOp(uint32_t op) {
+    using O = plume::RenderBlendOperation;
+    switch (op) {
+        case 0:  return O::ADD;
+        case 1:  return O::SUBTRACT;
+        case 2:  return O::MIN;
+        case 3:  return O::MAX;
+        case 4:  return O::REV_SUBTRACT;
+        default: return O::ADD;
+    }
+}
+
+plume::RenderBlendDesc BlendDescFromControl(uint32_t bc, uint8_t write_mask) {
+    const uint32_t csrc = bc & 0x1F, cop = (bc >> 5) & 0x7, cdst = (bc >> 8) & 0x1F;
+    const uint32_t asrc = (bc >> 16) & 0x1F, aop = (bc >> 21) & 0x7, adst = (bc >> 24) & 0x1F;
+    plume::RenderBlendDesc d;
+    d.srcBlend = ToRenderBlend(csrc);
+    d.blendOp = ToRenderBlendOp(cop);
+    d.dstBlend = ToRenderBlend(cdst);
+    d.srcBlendAlpha = ToRenderBlend(asrc);
+    d.blendOpAlpha = ToRenderBlendOp(aop);
+    d.dstBlendAlpha = ToRenderBlend(adst);
+    // Xenos has no master blend-enable bit; ONE + ADD + ZERO IS "off". The
+    // same convention rexglue's pipeline caches use.
+    d.blendEnabled = !(csrc == 1 && cop == 0 && cdst == 0 && asrc == 1 && aop == 0 && adst == 0);
+    d.renderTargetWriteMask = write_mask;
+    return d;
+}
+
 void BuildPipelines(const char* reason) {
     if (!Enabled() || !g_init_ok) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -2188,7 +2254,7 @@ void BuildPipelines(const char* reason) {
         desc.inputElements = elements.data();
         desc.inputElementsCount = uint32_t(elements.size());
         desc.renderTargetFormat[0] = kRenderTargetFormat;
-        desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
+        desc.renderTargetBlend[0] = BlendDescFromControl(c.blend, c.write_mask);
         desc.renderTargetCount = 1;
         desc.depthTargetFormat = kDepthTargetFormat;
         // QUADLIST and TRIANGLEFAN both become an indexed TRIANGLE_LIST: neither
@@ -2456,10 +2522,28 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
     const uint64_t ps = HashOf(g_cur_ps_ea);
     if (vs == ~0ull || ps == ~0ull) ++g_draws_unresolved;
 
+    // The blend state at THIS draw, from the device's render-state shadow.
+    // Reading the shadow word rather than hooking every setter means the
+    // merged result is seen no matter which API wrote it (SetBlendState packs
+    // the whole word; SetRenderState_SrcBlend and friends splice bit fields).
+    // The host pointers are cached: the device object never moves, and this
+    // path runs per draw.
+    static uint32_t shadow_dev = 0;
+    static const uint8_t* blend_ptr = nullptr;
+    static const uint8_t* cwmask_ptr = nullptr;
+    if (shadow_dev != device_ea) {
+        shadow_dev = device_ea;
+        blend_ptr = dt_guest_mem::Resolve(base, device_ea + 10552, 4);
+        cwmask_ptr = dt_guest_mem::Resolve(base, device_ea + 10460, 4);
+    }
+    const uint32_t blend = blend_ptr != nullptr ? LoadBE32(blend_ptr) : 0x00010001u;
+    const uint8_t write_mask = cwmask_ptr != nullptr ? uint8_t(LoadBE32(cwmask_ptr) & 0xF) : 0xFu;
+
     Combo* found = nullptr;
     for (uint32_t i = 0; i < g_combo_count; ++i) {
         Combo& c = g_combos[i];
-        if (c.vs == vs && c.ps == ps && c.topology == primitive_type) {
+        if (c.vs == vs && c.ps == ps && c.topology == primitive_type && c.blend == blend &&
+            c.write_mask == write_mask) {
             found = &c;
             break;
         }
@@ -2473,7 +2557,11 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
         found->vs = vs;
         found->ps = ps;
         found->topology = primitive_type;
+        found->blend = blend;
+        found->write_mask = write_mask;
         found->decl_ea = g_cur_decl_ea;
+        REXLOG_WARN("plume: new combo {} -- blend {:08X} write-mask {:X}", g_combo_count - 1,
+                    blend, write_mask);
     }
     ++found->draws;
     found->vertices += vertex_count;
