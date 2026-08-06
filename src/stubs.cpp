@@ -657,7 +657,11 @@ DT_TRACE_HOOK_AFTER(sub_8221E940, daytona_debug::HookId::kD3DSetRSPresentInterva
 DT_TRACE_HOOK_AFTER(sub_8221E950, daytona_debug::HookId::kSetRenderStateB)    // SetRenderState (B)
 DT_TRACE_HOOK_AFTER(sub_8221E658, daytona_debug::HookId::kD3DSetRSHalfPixelOffset)    // SetRenderState (C)
 DT_TRACE_HOOK_AFTER(sub_822337E8, daytona_debug::HookId::kBackbufferSetup)    // BackbufferSetup
-DT_TRACE_HOOK_AFTER(sub_8222C4C8, daytona_debug::HookId::kSceneSetup)         // SceneSetup
+// D3DDevice_Clear(pDevice, Count, pRects, Flags, Color, Z, Stencil, EDRAMClear)
+// -- it unpacks the D3DCOLOR into a float4 and tail-calls D3DDevice_ClearF
+// (sub_8222C390), which is where dt_plume takes the clear. "SceneSetup" was a
+// guess from before the D3D9 sigscan; the name stays only because HookId does.
+DT_TRACE_HOOK_AFTER(sub_8222C4C8, daytona_debug::HookId::kSceneSetup)         // D3DDevice_Clear
 // D3DDevice_Resolve(device, Flags, pSourceRect, pDestTexture, pDestPoint,
 // DestLevel, ...) -- r6 is pDestTexture per the XDK 20500 prototype, LATCHED
 // before __imp__ (volatile). This is where the native renderer hands its
@@ -672,7 +676,10 @@ REX_HOOK_RAW(sub_8222EBC0) {
     dt_plume::OnResolve(dest_texture, base);
 }
 DT_TRACE_HOOK_AFTER(sub_8212F028, daytona_debug::HookId::kBeginSceneLike)     // BeginScene
-DT_TRACE_HOOK_AFTER(sub_82223F28, daytona_debug::HookId::kD3DSetShaderGPRAlloc)          // Clear
+// NOT the clear -- the sigscan against d3d9.lib names this
+// D3DDevice_SetShaderGPRAllocation, and the real clear is D3DDevice_ClearF
+// (sub_8222C390, hooked in dt_d3d9_hooks.cpp). The stale label here cost time.
+DT_TRACE_HOOK_AFTER(sub_82223F28, daytona_debug::HookId::kD3DSetShaderGPRAlloc)
 DT_TRACE_HOOK(sub_824DC8A8, daytona_debug::HookId::kMemcpyLikeDc8)            // Memcpy-like (DC8)
 DT_TRACE_HOOK(sub_824EB2B8, daytona_debug::HookId::kMemcpyLikeEb2)            // Memcpy-like (EB2)
 // ── Boot / Init sequence hooks ────────────────────────────────────────────────

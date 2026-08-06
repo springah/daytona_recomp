@@ -135,6 +135,16 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
 void OnGpuBeginShaderConstantF4(bool pixel_shader, uint32_t start_register, uint32_t count,
                                 uint32_t dest_ea, const uint8_t* base);
 
+// D3DDevice_ClearF (sub_8222C390) -- the only clear the guest ever issues, and
+// with the frame target now persisting across Swaps, the only thing that
+// clears ours. D3DDevice_Clear tail-calls it, so this one hook covers both.
+//
+//   Flags   D3DCLEAR_TARGET0..3 = 0x01..0x08, ZBUFFER = 0x10, STENCIL = 0x20
+//   rect_ea nullptr = whole target (all observed calls)
+//   color_ea  D3DVECTOR4 of big-endian floats in guest memory
+void OnClear(uint32_t flags, uint32_t rect_ea, uint32_t color_ea, float z, uint32_t stencil,
+             const uint8_t* base);
+
 // D3DDevice_Resolve -- the handshake that closes the architecture. The GPU
 // plugin discards draws, so EDRAM is empty, so the guest's resolve would write
 // nothing -- and the guest re-submits its rendering forever waiting for output

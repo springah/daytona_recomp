@@ -211,7 +211,27 @@ DT_D3D9_TRACE(sub_8222ADD8, 98)  // (unidentified)
 DT_D3D9_TRACE(sub_8222ADF8, 99)  // (unidentified)
 DT_D3D9_TRACE(sub_8222B070, 100)  // D3DDevice_SetTexture
 DT_D3D9_TRACE(sub_8222B200, 101)  // (unidentified)
-DT_D3D9_TRACE(sub_8222C390, 102)  // D3DDevice_ClearF
+// D3DDevice_ClearF(D3DDevice*, DWORD Flags, CONST D3DRECT* pRect,
+//                  CONST D3DVECTOR4* pColor, float Z, DWORD Stencil)
+// -- XDK 20209 d3d9.h:2176. Verified against the recompiled body: it tests bit
+// 0x10 (D3DCLEAR_ZBUFFER) of r4 and substitutes a default Z when it is clear,
+// builds a full-target D3DRECT on the stack when r5 is null, and forwards
+// r3/r4/r5/r6/f1/r8 to the ring builder. D3DDevice_Clear (sub_8222C4C8) unpacks
+// its D3DCOLOR into a float4 and tail-calls it, so this covers both entry
+// points; the census shows every call arriving with lr=8222C53C.
+//
+// float Z occupies the r7 GPR slot on this ABI, so Stencil is r8. Everything is
+// latched before __imp__: the arguments are volatile, and __imp__ rewrites r5.
+REX_HOOK_RAW(sub_8222C390) {
+    dt_d3d9_trace::Record(102, ctx);
+    const uint32_t flags = ctx.r4.u32;
+    const uint32_t rect_ea = ctx.r5.u32;
+    const uint32_t color_ea = ctx.r6.u32;
+    const float z = static_cast<float>(ctx.f1.f64);
+    const uint32_t stencil = ctx.r8.u32;
+    dt_plume::OnClear(flags, rect_ea, color_ea, z, stencil, base);
+    __imp__sub_8222C390(ctx, base);
+}
 DT_D3D9_TRACE(sub_8222C6A8, 103)  // D3DDevice_SetPredication
 DT_D3D9_TRACE(sub_8222C818, 104)  // D3DDevice_BeginTiling
 DT_D3D9_TRACE(sub_8222DA70, 105)  // D3DDevice_ResolveEx

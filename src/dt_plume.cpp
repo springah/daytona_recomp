@@ -45,6 +45,10 @@ namespace {
 std::mutex g_mutex;
 bool g_init_attempted = false;
 bool g_init_ok = false;
+// Declared here rather than beside the rest of the frame state below because
+// Init() reads DT_PLUME_PERSIST, and Init() comes first in the file. See the
+// frame-target block for what it means.
+bool g_persist = true;
 
 std::unique_ptr<plume::RenderInterface> g_interface;
 std::unique_ptr<plume::RenderDevice> g_device;
@@ -590,6 +594,14 @@ bool Init() {
     g_init_attempted = true;
 
     REXLOG_WARN("DT_PLUME set -- bringing up the native renderer (shader resolve only, no drawing)");
+
+    // The console's backbuffer persists across a present, so ours does too, and
+    // only the guest's clear clears it. DT_PLUME_PERSIST=0 goes back to
+    // clearing at the top of every frame, which is the A/B for this.
+    if (const char* p = std::getenv("DT_PLUME_PERSIST")) g_persist = std::atoi(p) != 0;
+    REXLOG_WARN("plume: frame target {} across Swaps (DT_PLUME_PERSIST={})",
+                g_persist ? "PERSISTS -- only the guest clear clears it" : "is cleared every frame",
+                g_persist ? 1 : 0);
 
 #ifdef _WIN32
     g_interface = plume::CreateD3D12Interface();
@@ -1721,6 +1733,32 @@ bool g_window_tried = false;
 // frame's fence signals -- a vertex buffer freed while the GPU is still reading
 // it is a use-after-free that usually does not crash, which is worse.
 bool g_frame_open = false;
+
+// ── The frame target persists; only the GUEST clears it ──────────────────────
+// A console backbuffer is not destroyed by presenting it. The guest exploits
+// that: on a frame where only the overlay changed it re-submits the overlay and
+// nothing else, and while paused it submits nothing but the pause panel. A
+// renderer that clears at the top of every frame throws away the picture those
+// frames are drawn ON TOP OF, and the result is a HUD floating on the clear
+// colour -- measured at 3-4 of 8 in-race captures, and a pause menu over black
+// where the referee freezes the race behind it.
+//
+// It is worse than one lost clear per Swap, too: EndFrame also runs at every
+// D3DDevice_Resolve, and the guest resolves several times per frame. Each of
+// those splits one guest frame into several of ours, so a scene pass and the
+// HUD pass that follows it landed in different targets even within one frame.
+//
+// So the target is never cleared on our own initiative (once primed), and the
+// guest's D3DDevice_ClearF is what clears it. DT_PLUME_PERSIST=0 restores the
+// old clear-every-frame behaviour for an A/B (g_persist, declared at the top of
+// this namespace because Init() reads its environment variable).
+bool g_target_primed = false;
+uint32_t g_clear_pending = 0;                 // D3DCLEAR_* not yet executed
+float g_clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+float g_clear_z = 1.0f;
+uint32_t g_clear_stencil = 0;
+uint32_t g_clears_seen = 0;
+
 // Set by OnResolve around its EndFrame call: forces the readback and captures
 // the frame's pixels into g_resolve_pixels for the write-back to guest memory.
 bool g_capture_resolve = false;
@@ -2219,9 +2257,28 @@ void Step(const char* what) {
     std::fflush(stderr);
 }
 
-// Open the frame's command list and clear it. Called lazily by the first draw
-// of a frame rather than at the previous Swap, so a frame in which the game
-// draws nothing costs nothing and does not present a stale picture.
+// Execute a clear the guest asked for, into the currently open command list.
+// The flag layout is the console's, not the PC one: TARGET is four bits, one
+// per MRT slot (d3d9types.h:192), so the colour test is a mask and not == 1.
+void ApplyGuestClear(uint32_t flags) {
+    if ((flags & 0x0Fu) != 0) {
+        g_cmd->clearColor(0, plume::RenderColor(g_clear_color[0], g_clear_color[1],
+                                                g_clear_color[2], g_clear_color[3]));
+    }
+    const bool depth = (flags & 0x10u) != 0;      // D3DCLEAR_ZBUFFER
+    const bool stencil = (flags & 0x20u) != 0;    // D3DCLEAR_STENCIL
+    if (depth || stencil) {
+        g_cmd->clearDepthStencil(depth, stencil, g_clear_z, g_clear_stencil);
+    }
+}
+
+// Open the frame's command list. Called lazily by the first draw of a frame
+// rather than at the previous Swap, so a frame in which the game draws nothing
+// costs nothing and does not present a stale picture.
+//
+// It no longer clears: see g_persist above. The one clear it still does is the
+// PRIMING clear, because a freshly created target holds whatever the allocator
+// left in it and the guest's first clear may not arrive before the first draw.
 bool BeginFrame() {
     if (g_frame_open) return true;
     if (!EnsureOffscreen()) return false;
@@ -2233,8 +2290,15 @@ bool BeginFrame() {
     };
     g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, to_write, 2);
     g_cmd->setFramebuffer(g_framebuffer.get());
-    g_cmd->clearColor(0, plume::RenderColor(kClearR, kClearG, kClearB, 1.0f));
-    g_cmd->clearDepthStencil();
+    if (!g_persist || !g_target_primed) {
+        g_cmd->clearColor(0, plume::RenderColor(kClearR, kClearG, kClearB, 1.0f));
+        g_cmd->clearDepthStencil();
+        g_target_primed = true;
+        g_clear_pending = 0;
+    } else if (g_clear_pending != 0) {
+        ApplyGuestClear(g_clear_pending);
+        g_clear_pending = 0;
+    }
     g_frame_open = true;
     g_frame_draws = 0;
     g_frame_skipped = 0;
@@ -3296,6 +3360,61 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
 
     // Bounded: a couple of draws per shader, purely to validate the endian swap
     // against plausible values before it becomes load-bearing.
+}
+
+// D3DDevice_ClearF (sub_8222C390) -- the ONE place the guest clears anything.
+// D3DDevice_Clear (sub_8222C4C8) unpacks its D3DCOLOR into a float4 and tail-
+// calls this, so hooking here catches both entry points (every observed call
+// arrives with lr=8222C53C, i.e. from inside D3DDevice_Clear).
+//
+//   D3DDevice_ClearF(D3DDevice*, DWORD Flags, CONST D3DRECT* pRect,
+//                    CONST D3DVECTOR4* pColor, float Z, DWORD Stencil)
+//   (XDK 20209 d3d9.h:2176)
+//
+// pRect == nullptr means the whole render target -- which is what the game
+// passes, so a sub-rect clear is a case this deliberately only LOGS.
+void OnClear(uint32_t flags, uint32_t rect_ea, uint32_t color_ea, float z, uint32_t stencil,
+             const uint8_t* base) {
+    if (!Enabled() || !g_init_ok) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if ((flags & 0x0Fu) != 0 && color_ea != 0) {
+        // A D3DVECTOR4 of big-endian floats, already in the 0..1 range the
+        // console clears with -- D3DDevice_Clear does the D3DCOLOR unpack.
+        if (const uint8_t* p = dt_guest_mem::Resolve(base, color_ea, 16)) {
+            for (uint32_t i = 0; i < 4; ++i) {
+                const uint32_t bits = LoadBE32(p + i * 4);
+                float f;
+                std::memcpy(&f, &bits, 4);
+                g_clear_color[i] = f;
+            }
+        }
+    }
+    g_clear_z = z;
+    g_clear_stencil = stencil;
+
+    ++g_clears_seen;
+    if (g_clears_seen <= 8 || (g_clears_seen % 600) == 0) {
+        REXLOG_WARN("plume: CLEAR #{} flags {:#x}{}{}{} colour ({:.3f},{:.3f},{:.3f},{:.3f}) "
+                    "z={:.3f} stencil={} rect={:08X} (frame {} {})",
+                    g_clears_seen, flags,
+                    (flags & 0x0Fu) ? " target" : "", (flags & 0x10u) ? " z" : "",
+                    (flags & 0x20u) ? " stencil" : "",
+                    g_clear_color[0], g_clear_color[1], g_clear_color[2], g_clear_color[3],
+                    z, stencil, rect_ea, g_frame_index,
+                    g_frame_open ? "open" : "closed");
+    }
+
+    if (!g_persist) return;                 // BeginFrame clears unconditionally
+    if (g_frame_open) {
+        // Mid-frame: execute it now, so draws recorded before it survive and
+        // draws after it start from the cleared target -- guest order.
+        ApplyGuestClear(flags);
+    } else {
+        // Between frames: the clear belongs to the frame the next draw opens.
+        // OR, not assign: two clears before one draw must both happen.
+        g_clear_pending |= flags;
+    }
 }
 
 void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
