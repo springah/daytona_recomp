@@ -2887,6 +2887,11 @@ uint32_t g_scatter_count = 0;
 // point, and 2 presents per Swap is the flicker coming back.
 uint32_t g_presents = 0;
 uint32_t g_swaps = 0;
+// ... of which came from PresentTarget, i.e. Swaps that arrived with the frame
+// already closed by a resolve. Counted because a fallback that never fires is
+// untested code, and one that fires constantly means the Swap is not where the
+// frame is being finished.
+uint32_t g_presents_closed = 0;
 std::chrono::steady_clock::time_point g_last_endframe{};
 
 struct ScopedMs {
@@ -3252,11 +3257,11 @@ void EndFrame(bool present) {
         REXLOG_WARN("plume: timing over 300 frames -- wall {:.0f}ms ({:.1f}fps), endframe "
                     "{:.0f}ms, scatter {:.0f}ms ({} scatters), record {:.0f}ms, guest+rest "
                     "{:.0f}ms; {} binds served from the mirror ({} a generation late); "
-                    "{} presents for {} guest Swaps",
+                    "{} presents ({} of them from an already-closed frame) for {} guest Swaps",
                     wall, wall > 0 ? 300000.0 / wall : 0.0, g_ms_endframe, g_ms_scatter,
                     g_scatter_count, g_ms_record,
                     wall - g_ms_endframe - g_ms_scatter - g_ms_record,
-                    g_mirror_hits, g_mirror_stale, g_presents, g_swaps);
+                    g_mirror_hits, g_mirror_stale, g_presents, g_presents_closed, g_swaps);
         if (g_prof) {
             REXLOG_WARN("plume: record breakdown over 300 frames -- vtx {:.0f}ms, vbuf {:.0f}ms, "
                         "tex {:.0f}ms (probe {:.0f}ms in {} calls), cb {:.0f}ms, cmd {:.0f}ms, "
@@ -3273,7 +3278,7 @@ void EndFrame(bool present) {
         g_probe_calls = 0;
         g_scatter_count = 0;
         g_mirror_hits = g_mirror_stale = 0;
-        g_presents = g_swaps = 0;
+        g_presents = g_presents_closed = g_swaps = 0;
     }
 
     const bool report = g_capture_resolve ||
@@ -3435,7 +3440,14 @@ void EndFrame(bool present) {
                 "{} of {} pixels touched, {} with colour, first {:08X}{}",
                 g_frame_index, g_frame_draws, g_frame_skipped, g_draws_nopipe, buffers,
                 touched, kFrameW * kFrameH, coloured, sample,
-                g_swapchain != nullptr ? ", presented" : "");
+                // What THIS EndFrame did, not what the swapchain is capable of.
+                // Half of them close a frame mid-guest-frame and do not present,
+                // and a label that said "presented" on those would be the kind
+                // of true-sounding number this spike has been misled by before.
+                backbuffer != nullptr ? ", presented"
+                                      : (g_swapchain != nullptr ? ", not presented (mid-frame "
+                                                                  "resolve)"
+                                                                : ""));
 
     // What is actually IN the constant buffers we bind. A register file that is
     // mostly zero is not a neutral starting state: the translated shaders
@@ -3566,6 +3578,7 @@ void PresentTarget() {
     g_queue->waitForCommandFence(g_upload_fence.get());
     g_swapchain->present(swap_index, nullptr, 0);
     ++g_presents;
+    ++g_presents_closed;
 #ifdef _WIN32
     PumpWindow();
 #endif
