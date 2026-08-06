@@ -89,13 +89,33 @@ struct FetchedAttribute {
     // offset 0 with the same stride, so they would all alias slot 0.
     uint32_t fetch_const = 0;
 
+    // ⚠ The vfetch destination swizzle, bits 0-11 of word 1 -- FOUR 3-bit lanes,
+    // lane i saying where register component i comes from (0-3 = xyzw, 4 = 0.0,
+    // 5 = 1.0, 7 = untouched).
+    //
+    // Two of them matter, and the whole magenta wash lived in the gap between:
+    //
+    //   dst_swiz    what the RUNTIME patched, i.e. what the GPU would do.
+    //   shader_swiz what the container held when XenosRecomp compiled it, i.e.
+    //               what the generated HLSL hard-codes -- it emits
+    //               `r0.<lanes> = iColor0.<swizzled>;` from the COMPILE-TIME
+    //               word, and it can never learn about a later patch.
+    //
+    // When they agree the shader already does the reorder and the upload must
+    // hand over memory order. When they disagree -- and for D3DCOLOR they do,
+    // because that is exactly how the D3D9 runtime turns ARGB into RGBA -- the
+    // difference has to be applied CPU-side or the channels land wrong.
+    uint32_t dst_swiz = 0;
+    uint32_t shader_swiz = 0;
+
     // "Is this the same layout the runtime patched last time?" -- asked once
     // per draw, so it must not be a string compare or a re-decode.
     bool operator==(const FetchedAttribute& o) const {
         return usage == o.usage && usage_index == o.usage_index &&
                instruction == o.instruction && format == o.format && stride == o.stride &&
                offset == o.offset && normalized == o.normalized && is_signed == o.is_signed &&
-               fetch_const == o.fetch_const;
+               fetch_const == o.fetch_const && dst_swiz == o.dst_swiz &&
+               shader_swiz == o.shader_swiz;
     }
     bool operator!=(const FetchedAttribute& o) const { return !(*this == o); }
 };
@@ -386,6 +406,89 @@ uint32_t ComponentBytes(uint32_t gpu_format) {
     }
 }
 
+uint32_t ComponentCount(uint32_t gpu_format) {
+    switch (gpu_format) {
+        case 36: return 1;   // 32_FLOAT
+        case 37: return 2;   // 32_32_FLOAT
+        case 57: return 3;   // 32_32_32_FLOAT
+        case 6:  return 4;   // 8_8_8_8
+        case 38: return 4;   // 32_32_32_32_FLOAT
+        default: return 0;
+    }
+}
+
+// One lane of a vfetch destination swizzle. 0-3 name a fetched component, 4 and
+// 5 are the constants 0.0 and 1.0, 7 means "leave the register alone".
+uint32_t SwizzleLane(uint32_t swiz, uint32_t lane) { return (swiz >> (lane * 3)) & 0x7; }
+
+const char* SwizzleText(uint32_t swiz, char (&buf)[8]) {
+    static const char kNames[8] = {'x', 'y', 'z', 'w', '0', '1', '?', '_'};
+    for (uint32_t i = 0; i < 4; ++i) buf[i] = kNames[SwizzleLane(swiz, i)];
+    buf[4] = '\0';
+    return buf;
+}
+
+// Build the byte permutation that turns one attribute's GUEST bytes into the
+// bytes the host input assembler must see. Returns the attribute width, or 0 if
+// the format is not understood (in which case the caller must copy through).
+//
+// Two corrections compose here, and keeping them in one table is what makes the
+// order impossible to get wrong:
+//
+//  1. ENDIAN. The vertex fetch constant asks for 8in32, so the GPU reverses
+//     every 4-byte GROUP before it looks at components. For an all-32-bit
+//     attribute that is the same thing as reversing each component, which is
+//     why the old per-component swap looked right for years of float data. For
+//     8_8_8_8 it is NOT: the four bytes are one dword, the reverse applies to
+//     all four of them, and component 0 is then the LOW byte of the result
+//     (rexglue dxbc_translator_fetch.cpp:323 -- offsets 0/8/16/24). So a
+//     D3DCOLOR stored big-endian as AA RR GG BB fetches as (B, G, R, A).
+//
+//  2. SWIZZLE DELTA. The GPU then applies the PATCHED dst_swiz; the generated
+//     shader applies the COMPILE-TIME one. Only the difference is ours to fix:
+//     lane i of the register must end up holding fetched component
+//     dst_swiz[i], and the shader will read it out of input component
+//     shader_swiz[i] -- so upload component shader_swiz[i] must carry fetched
+//     component dst_swiz[i]. With D3DCOLOR's patched zyxw against the
+//     container's xyzw that turns (B, G, R, A) back into (R, G, B, A).
+//
+// When nothing is patched the two swizzles agree, the delta is the identity,
+// and all that survives is the endian reverse -- i.e. the previous behaviour
+// for every attribute except the packed one.
+uint32_t BuildAttributePermutation(const FetchedAttribute& a, uint8_t perm[16]) {
+    const uint32_t width = AttributeBytes(a.format);
+    const uint32_t comp_bytes = ComponentBytes(a.format);
+    const uint32_t comps = ComponentCount(a.format);
+    if (width == 0 || width > 16 || comp_bytes == 0 || comps == 0) return 0;
+
+    // Which fetched component each UPLOAD component must carry. Identity for
+    // anything the two swizzles do not both name -- an upload component the
+    // shader never reads is a don't-care, and guessing at it would be noise.
+    uint8_t map[4] = {0, 1, 2, 3};
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+        const uint32_t src = SwizzleLane(a.dst_swiz, lane);       // what the GPU fetches
+        const uint32_t dst = SwizzleLane(a.shader_swiz, lane);    // where the shader reads
+        if (src > 3 || dst > 3) continue;                          // 0.0/1.0/untouched
+        if (src >= comps || dst >= comps) continue;                // beyond this format
+        map[dst] = uint8_t(src);
+    }
+
+    for (uint32_t p = 0; p < comps; ++p) {
+        for (uint32_t t = 0; t < comp_bytes; ++t) {
+            const uint32_t k = map[p] * comp_bytes + t;   // byte k of the FETCHED value
+            perm[p * comp_bytes + t] = uint8_t((k & ~3u) + (3u - (k & 3u)));   // 8in32
+        }
+    }
+    return width;
+}
+
+bool PermutationIsIdentity(const uint8_t perm[16], uint32_t width) {
+    for (uint32_t i = 0; i < width; ++i) {
+        if (perm[i] != i) return false;
+    }
+    return true;
+}
+
 // Semantic name and Vulkan location MUST match what XenosRecomp emitted into the
 // shader, or D3D12 fails to match by semantic and Vulkan fails to match by
 // location. Mirrored from its USAGE_SEMANTICS / USAGE_LOCATIONS tables --
@@ -460,6 +563,8 @@ FetchedAttribute DecodeVfetch(uint32_t w0, uint32_t w1, uint32_t w2) {
     a.stride = (w2 & 0xFF) * 4;              // the instruction stores dwords
     a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
     a.fetch_const = ((w0 >> 20) & 0x1F) * 3 + ((w0 >> 25) & 0x3);
+    a.dst_swiz = w1 & 0xFFF;
+    a.shader_swiz = a.dst_swiz;   // overwritten by the caller that has the container word
     return a;
 }
 
@@ -705,6 +810,12 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
         a.stride = (w2 & 0xFF) * 4;
         a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
         a.fetch_const = ((w0 >> 20) & 0x1F) * 3 + ((w0 >> 25) & 0x3);
+        a.dst_swiz = w1 & 0xFFF;
+        // The compiled swizzle is what the generated HLSL froze in; it comes
+        // from the container, never from the patched copy.
+        a.shader_swiz = (uint32_t(el.address) * 3 + 2) * 4 <= s.code.size()
+                            ? LoadBE32(&s.code[(uint32_t(el.address) * 3 + 1) * 4]) & 0xFFF
+                            : a.dst_swiz;
         if (a.format == 0 && a.stride == 0) {
             if (!s.logged_placeholder) {
                 s.logged_placeholder = true;
@@ -807,6 +918,7 @@ void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
             return;
         }
         FetchedAttribute a = DecodeVfetch(w0, w1, w2);
+        a.shader_swiz = LoadBE32(&s.code[(d + 1) * 4]) & 0xFFF;
         a.usage = el.usage;
         a.usage_index = el.usage_index;
         a.instruction = el.address;
@@ -833,11 +945,20 @@ void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
                 s.layout_versions, s.entry->name, ucode_ea, variant, decl_ea);
     for (const auto& a : s.attributes) {
         const auto rf = ToRenderFormat(a.format, a.normalized, a.is_signed);
+        char patched[8], compiled[8];
+        uint8_t perm[16] = {};
+        const uint32_t width = BuildAttributePermutation(a, perm);
         REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {:<4} "
-                    "fetch-const {} -> plume {}",
+                    "fetch-const {} -> plume {} , swizzle patched {} vs compiled {}{}",
                     UsageName(a.usage), a.usage_index, a.instruction,
                     a.format, VertexFormatName(a.format), a.stride, a.offset,
-                    a.fetch_const, static_cast<uint32_t>(rf));
+                    a.fetch_const, static_cast<uint32_t>(rf),
+                    SwizzleText(a.dst_swiz, patched), SwizzleText(a.shader_swiz, compiled),
+                    a.dst_swiz == a.shader_swiz ? "" : "  <-- DIFFERS, compensated CPU-side");
+        if (width != 0) {
+            REXLOG_WARN("      upload byte order {} {} {} {}{}", perm[0], perm[1],
+                        perm[2], perm[3], width > 4 ? " ..." : "");
+        }
         if (rf == plume::RenderFormat::UNKNOWN) {
             REXLOG_WARN("      ^^ UNMAPPED GPUVERTEXFORMAT {}", a.format);
         }
@@ -996,14 +1117,15 @@ void SnapshotDrawVertices(const uint8_t* base) {
         }
         const uint32_t stride = (stream < kMaxStreams && g_streams[stream].stride)
                                     ? g_streams[stream].stride : a.stride;
-        const uint32_t comp = ComponentBytes(a.format);
 
-        // Byte-swap the first vertex's worth of this attribute and print it, so
-        // the swap width can be checked against plausible values rather than
-        // assumed correct.
+        // Reorder the first vertex's worth of this attribute with the SAME
+        // permutation the upload uses and print both ends of it, so the guest
+        // bytes and the value the shader will see can be read off against each
+        // other instead of assumed to agree.
         uint8_t v[16] = {};
-        const uint32_t width = AttributeBytes(a.format);
-        if (width == 0 || width > sizeof(v) || comp == 0) continue;
+        uint8_t perm[16] = {};
+        const uint32_t width = BuildAttributePermutation(a, perm);
+        if (width == 0 || width > sizeof(v)) continue;
 
         // BaseAddress is PHYSICAL. Reading it as a virtual address is what used
         // to fault here -- and what made device+1152+fc*8 look like the wrong
@@ -1019,10 +1141,7 @@ void SnapshotDrawVertices(const uint8_t* base) {
         const uint32_t ea = va + start_vertex * stride + a.offset;
         const uint8_t* p = resolve(ea, width);
         if (p == nullptr) continue;
-        for (uint32_t b = 0; b < width; ++b) {
-            const uint32_t grp = b / comp, idx = b % comp;
-            v[b] = p[grp * comp + (comp - 1 - idx)];   // reverse WITHIN each component
-        }
+        for (uint32_t b = 0; b < width; ++b) v[b] = p[perm[b]];
         if (a.format == 57 || a.format == 37 || a.format == 36 || a.format == 38) {
             float f[4] = {};
             std::memcpy(f, v, width);
@@ -1031,9 +1150,10 @@ void SnapshotDrawVertices(const uint8_t* base) {
                         f[0], width > 4 ? f[1] : 0.0f, width > 8 ? f[2] : 0.0f,
                         width > 12 ? f[3] : 0.0f);
         } else {
-            REXLOG_WARN("   {}{} s{} @{:08X} stride {} -> {:02X} {:02X} {:02X} {:02X}",
+            REXLOG_WARN("   {}{} s{} @{:08X} stride {} -> guest {:02X} {:02X} {:02X} {:02X} "
+                        "= shader RGBA {:02X} {:02X} {:02X} {:02X}",
                         UsageName(a.usage), a.usage_index, stream, ea, stride,
-                        v[0], v[1], v[2], v[3]);
+                        p[0], p[1], p[2], p[3], v[0], v[1], v[2], v[3]);
         }
     }
 }
@@ -1764,14 +1884,21 @@ bool EnsureOffscreen() {
     return true;
 }
 
-// Copy one slot's vertex range out of guest memory, byte-swapping per COMPONENT
-// for each attribute that lives in that slot.
+// Copy one slot's vertex range out of guest memory, rewriting each attribute's
+// bytes into the order the host input assembler must see.
 //
-// The swap width is per component, not per vertex and not a blanket dword swap:
-// dword-swapping an 8_8_8_8 colour reverses its channels and no DXGI format
-// undoes that. Bytes not covered by any attribute are copied through untouched
-// rather than zeroed -- padding we have not identified is not the same thing as
-// padding we know to be unused.
+// ⚠ The swap is 8in32 -- a blanket dword reverse -- because that is what the
+// vertex fetch constant asks the GPU for, and it applies to the packed 8_8_8_8
+// colour exactly as much as it does to a float. The old code reversed WITHIN
+// each component instead, which is the same thing for 32-bit components and a
+// no-op for 8-bit ones, so a D3DCOLOR reached the shader still in guest byte
+// order: A R G B read as R G B A. Grey asphalt (80 80 80 with alpha FF) came
+// out as red 1.0, green 0.5, blue 0.5 -- the magenta wash over the whole race.
+//
+// The reorder is not just the endian, though: see BuildAttributePermutation for
+// the swizzle half. Bytes not covered by any attribute are copied through
+// untouched rather than zeroed -- padding we have not identified is not the
+// same thing as padding we know to be unused.
 bool BuildSlotBytes(const std::vector<FetchedAttribute>& attributes,
                     uint32_t fetch_const, uint32_t stride,
                     uint32_t start_vertex, uint32_t vertex_count, const uint8_t* base,
@@ -1798,15 +1925,17 @@ bool BuildSlotBytes(const std::vector<FetchedAttribute>& attributes,
 
     for (const auto& a : attributes) {
         if (a.fetch_const != fetch_const) continue;
-        const uint32_t comp = ComponentBytes(a.format);
-        const uint32_t width = AttributeBytes(a.format);
-        if (comp <= 1 || width == 0) continue;   // single-byte components need no swap
+        uint8_t perm[16] = {};
+        const uint32_t width = BuildAttributePermutation(a, perm);
+        // A format with no permutation is one we do not understand well enough
+        // to touch; copying it through is the only honest option.
+        if (width == 0 || PermutationIsIdentity(perm, width)) continue;
         for (uint32_t v = 0; v < vertex_count; ++v) {
             const uint32_t at = v * stride + a.offset;
             if (at + width > bytes) break;       // attribute runs past the range
-            for (uint32_t g = 0; g + comp <= width; g += comp) {
-                std::reverse(out.begin() + at + g, out.begin() + at + g + comp);
-            }
+            uint8_t tmp[16];
+            std::memcpy(tmp, &out[at], width);
+            for (uint32_t b = 0; b < width; ++b) out[at + b] = tmp[perm[b]];
         }
     }
     return true;
