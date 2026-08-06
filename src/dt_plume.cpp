@@ -1294,6 +1294,15 @@ struct DecodedTexture {
     uint32_t min_filter = 1;   // dword_3 +21
     uint32_t clamp_x = 0;      // dword_0 +10, ClampMode
     uint32_t clamp_y = 0;      // dword_0 +13
+    // TEX_FORMAT_COMP / GPUSIGN, dword_0 +2/+4/+6/+8, one TextureSign per DATA
+    // component (before the swizzle). 0 unsigned, 1 signed, 2 unsigned-biased,
+    // 3 GAMMA -- and kGamma means the hardware LINEARISES the byte on fetch. A
+    // reader that skips that hands the shader gamma-encoded numbers as if they
+    // were linear, which is a contrast distortion and nothing else, so it is
+    // decoded and reported rather than assumed to be zero.
+    uint32_t sign[4] = {0, 0, 0, 0};
+    // dword_3 +0, TextureNumFormat: 0 fraction (byte/255), 1 integer (byte).
+    uint32_t num_format = 0;
     bool valid = false;
 };
 
@@ -1330,6 +1339,8 @@ DecodedTexture DecodeFetchConstantAt(uint32_t ea, const uint8_t* base) {
     out.min_filter = (d[3] >> 21) & 0x3;
     out.clamp_x = (d[0] >> 10) & 0x7;
     out.clamp_y = (d[0] >> 13) & 0x7;
+    for (uint32_t i = 0; i < 4; ++i) out.sign[i] = (d[0] >> (2 + i * 2)) & 0x3;
+    out.num_format = d[3] & 0x1;
     out.valid = (type == 2) && out.base_address != 0 && out.width > 0 && out.height > 0;
     return out;
 }
@@ -1360,6 +1371,9 @@ DecodedTexture ReadTextureFetchConstant(uint32_t sampler, const uint8_t* base) {
     out.min_filter = (d[3] >> 21) & 0x3;                // dword_3 +21
     out.clamp_x = (d[0] >> 10) & 0x7;                   // dword_0 +10
     out.clamp_y = (d[0] >> 13) & 0x7;                   // dword_0 +13
+    for (uint32_t i = 0; i < 4; ++i)                    // dword_0 +2/+4/+6/+8
+        out.sign[i] = (d[0] >> (2 + i * 2)) & 0x3;      // TextureSign, 3 == kGamma
+    out.num_format = d[3] & 0x1;                        // dword_3 +0
     // type 2 == kTexture; anything else is not a texture binding.
     out.valid = (type == 2) && out.base_address != 0 && out.width > 0 && out.height > 0;
     return out;
@@ -1870,10 +1884,25 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     g_textures.push_back(std::move(texture));
     g_texture_index[key] = slot;
     REXLOG_WARN("plume: uploaded texture {}x{} guest format {} as plume format {} {} base {:08X} "
-                "swizzle {} ({:03X}) endian {} -> heap slot {}",
+                "swizzle {} ({:03X}) endian {} sign {}{}{}{} numfmt {} -> heap slot {}",
                 t.width, t.height, t.format, static_cast<uint32_t>(up.format),
                 t.tiled ? "tiled" : "linear", t.base_address, SwizzleName(t.swizzle), t.swizzle,
-                t.endianness, slot);
+                t.endianness, t.sign[0], t.sign[1], t.sign[2], t.sign[3], t.num_format, slot);
+
+    // DT_PLUME_TEXDUMP=<dir>: the staged RGBA8 bytes, exactly as the GPU will
+    // see them. A palette is 64x1024 of shading ramps and no log line can say
+    // what is in it; the file can be read against the referee's colours.
+    if (const char* dump_dir = std::getenv("DT_PLUME_TEXDUMP")) {
+        if (dump_dir[0] != '\0' && up.block == 1) {
+            const std::string path = fmt::format("{}/tex_{:08X}_{}x{}_f{}_s{:03X}.raw", dump_dir,
+                                                 t.base_address, t.width, t.height, t.format,
+                                                 t.swizzle);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(up.data.data(), 1, up.data.size(), f);
+                std::fclose(f);
+            }
+        }
+    }
     return slot;
 }
 
@@ -2295,6 +2324,29 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
                 }
                 REXLOG_WARN("plume: draw {} slot0 stride {} positions: {}",
                             c.recorded_draws, stride, pos);
+            }
+            // The palette lookup's ROW is TEXCOORD1.y, and 1024 rows of shading
+            // ramp is a lot of picture riding on two floats we never printed.
+            // Reported from the HOST-ORDER bytes, i.e. exactly what the input
+            // assembler will hand the shader -- decoding the guest copy again
+            // would only re-test the decoder.
+            if (c.recorded_draws <= 2) {
+                const uint32_t stride = c.slots[sl].stride;
+                for (const auto& a : c.attributes) {
+                    if (a.fetch_const != c.slot_consts[sl]) continue;
+                    std::string vals;
+                    for (uint32_t v = 0; v < vertex_count && v < 6; ++v) {
+                        float f[4] = {};
+                        const uint32_t at = v * stride + a.offset;
+                        for (uint32_t k = 0; k < 4 && (at + k * 4 + 4) <= bytes.size(); ++k)
+                            std::memcpy(&f[k], bytes.data() + at + k * 4, sizeof(float));
+                        vals += fmt::format("({:.4f},{:.4f},{:.4f},{:.4f}) ", f[0], f[1], f[2],
+                                            f[3]);
+                    }
+                    REXLOG_WARN("plume: draw {} ps {} attr usage {}.{} fmt {} off {} raw floats: {}",
+                                c.recorded_draws, s.entry != nullptr ? s.entry->name : "?",
+                                a.usage, a.usage_index, a.format, a.offset, vals);
+                }
             }
         }
         Step("createBuffer(vertex)");
