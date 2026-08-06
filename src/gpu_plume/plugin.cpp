@@ -77,6 +77,9 @@ constexpr uint32_t kReg_COHER_STATUS_HOST = 0x0A31;
 constexpr uint32_t kReg_SCRATCH_UMSK = 0x01DC;
 constexpr uint32_t kReg_SCRATCH_ADDR = 0x01DD;
 constexpr uint32_t kReg_SCRATCH_REG0 = 0x0578;   // "interrupt sync" per the table
+constexpr uint32_t kReg_VGT_EVENT_INITIATOR = 0x21F9;
+constexpr uint32_t kReg_PA_SC_VIZ_QUERY_STATUS_0 = 0x0C44;
+constexpr uint32_t kReg_PA_SC_VIZ_QUERY_STATUS_1 = 0x0C45;
 
 // The guest's "nothing written yet" sentinel for the ring write pointer, as
 // used by rexglue's command processor.
@@ -232,7 +235,9 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
       ++wptr_writes_;
       write_ptr_.store(value);
     }
-    if (r < kRegisterCount) registers_[r] = value;
+    // Same side-effectful path as packet writes (scratch mirror, COHER flag):
+    // rexglue routes MMIO and packets through one WriteRegister for a reason.
+    WritePacketRegister(r, value);
   }
 
   // Consume the ring. Moving the read pointer is NOT enough on its own: the
@@ -486,6 +491,157 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
             rex::thread::Sleep(std::chrono::milliseconds(wait >= 0x100 ? wait / 0x100 : 1));
           }
         } while (!matched);
+        break;
+      }
+      // -- The full guest-visible side-effect surface, ported in ONE sweep
+      // from rexglue's generic command_processor.cpp rather than discovered
+      // one hang at a time. That file is the complete specification of what a
+      // Xenos owes the guest short of drawing; after this block, anything the
+      // guest still waits on is provably a product of EXECUTION, not
+      // bookkeeping. Every case follows the reference exactly.
+      case 0x21: {    // REG_RMW -- register read/modify/write
+        const uint32_t rmw_info = reader->ReadAndSwap<uint32_t>();
+        const uint32_t and_mask = reader->ReadAndSwap<uint32_t>();
+        const uint32_t or_mask = reader->ReadAndSwap<uint32_t>();
+        const uint32_t r = rmw_info & 0x1FFF;
+        uint32_t value = r < kRegisterCount ? registers_[r] : 0;
+        value &= ((rmw_info >> 31) & 0x1) ? registers_[and_mask & 0x1FFF] : and_mask;
+        value |= ((rmw_info >> 30) & 0x1) ? registers_[or_mask & 0x1FFF] : or_mask;
+        WritePacketRegister(r, value);
+        break;
+      }
+      case 0x3E: {    // REG_TO_MEM -- register value into guest memory
+        const uint32_t reg_addr = reader->ReadAndSwap<uint32_t>();
+        const uint32_t mem_addr = reader->ReadAndSwap<uint32_t>();
+        const uint32_t r = reg_addr & 0x1FFF;
+        StoreGuest(mem_addr, r < kRegisterCount ? registers_[r] : 0);
+        break;
+      }
+      case 0x45: {    // COND_WRITE -- conditional write to memory or register
+        const uint32_t wait_info = reader->ReadAndSwap<uint32_t>();
+        const uint32_t poll_addr = reader->ReadAndSwap<uint32_t>();
+        const uint32_t ref = reader->ReadAndSwap<uint32_t>();
+        const uint32_t mask = reader->ReadAndSwap<uint32_t>();
+        const uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
+        const uint32_t write_data = reader->ReadAndSwap<uint32_t>();
+        uint32_t value;
+        if (wait_info & 0x10) {
+          value = rex::memory::load<uint32_t>(
+              memory_->TranslatePhysical(poll_addr & ~uint32_t(0x3)));
+          value = GpuSwap(value, poll_addr & 0x3);
+        } else {
+          const uint32_t pr = poll_addr & 0x1FFF;
+          value = pr < kRegisterCount ? registers_[pr] : 0;
+        }
+        bool matched;
+        switch (wait_info & 0x7) {
+          case 0x1: matched = (value & mask) < ref; break;
+          case 0x2: matched = (value & mask) <= ref; break;
+          case 0x3: matched = (value & mask) == ref; break;
+          case 0x4: matched = (value & mask) != ref; break;
+          case 0x5: matched = (value & mask) >= ref; break;
+          case 0x6: matched = (value & mask) > ref; break;
+          case 0x7: matched = true; break;
+          default: matched = false; break;
+        }
+        if (matched) {
+          if (wait_info & 0x100) {
+            StoreGuest(write_addr, write_data);
+          } else {
+            WritePacketRegister(write_addr & 0x1FFF, write_data);
+          }
+        }
+        break;
+      }
+      case 0x46: {    // EVENT_WRITE -- initiator into VGT_EVENT_INITIATOR
+        const uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+        WritePacketRegister(kReg_VGT_EVENT_INITIATOR, initiator & 0x3F);
+        break;   // remaining words (if any) skipped by declared length
+      }
+      case 0x5A: {    // EVENT_WRITE_EXT -- screen-extent event, writes 6 shorts
+        const uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+        uint32_t address = reader->ReadAndSwap<uint32_t>();
+        WritePacketRegister(kReg_VGT_EVENT_INITIATOR, initiator & 0x3F);
+        address &= ~uint32_t(0x3);
+        // Reference values (rexglue): full-surface extents, 8in16-swapped.
+        const uint16_t extents[6] = {
+            0, uint16_t(8192 >> 3), 0, uint16_t(8192 >> 3), 0, 1};
+        uint8_t* dst = memory_->TranslatePhysical<uint8_t*>(address);
+        if (dst != nullptr) {
+          for (int i = 0; i < 6; ++i) {
+            dst[i * 2 + 0] = uint8_t(extents[i] >> 8);
+            dst[i * 2 + 1] = uint8_t(extents[i]);
+          }
+        }
+        break;
+      }
+      case 0x4F: {    // MEM_WRITE_CNTR -- CP_PROG_COUNTER to memory
+        const uint32_t mem_addr = reader->ReadAndSwap<uint32_t>();
+        StoreGuest(mem_addr, 0);   // we have no microcode counter; 0, like idle
+        break;
+      }
+      case 0x23: {    // VIZ_QUERY -- fake every query visible (reference does)
+        const uint32_t dword0 = reader->ReadAndSwap<uint32_t>();
+        const uint32_t id = dword0 & 0x3F;
+        if (dword0 & 0x100) {
+          WritePacketRegister(kReg_VGT_EVENT_INITIATOR, 8);   // VIZQUERY_END
+          if (id < 32) {
+            registers_[kReg_PA_SC_VIZ_QUERY_STATUS_0] |= uint32_t(1) << id;
+          } else {
+            registers_[kReg_PA_SC_VIZ_QUERY_STATUS_1] |= uint32_t(1) << (id - 32);
+          }
+        } else {
+          WritePacketRegister(kReg_VGT_EVENT_INITIATOR, 7);   // VIZQUERY_START
+        }
+        break;
+      }
+      case 0x2D: {    // SET_CONSTANT -- register ranges by type
+        const uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
+        const uint32_t index = offset_type & 0x7FF;
+        uint32_t rbase;
+        switch ((offset_type >> 16) & 0xFF) {
+          case 0: rbase = index + 0x4000; break;   // ALU
+          case 1: rbase = index + 0x4800; break;   // FETCH
+          case 2: rbase = index + 0x4900; break;   // BOOL
+          case 3: rbase = index + 0x4908; break;   // LOOP
+          case 4: rbase = index + 0x2000; break;   // REGISTERS
+          default: rbase = UINT32_MAX; break;
+        }
+        for (uint32_t i = 0; i + 1 < count; ++i) {
+          const uint32_t value = reader->ReadAndSwap<uint32_t>();
+          if (rbase != UINT32_MAX) WritePacketRegister(rbase + i, value);
+        }
+        break;
+      }
+      case 0x55:      // SET_CONSTANT2 -- raw register index
+      case 0x56: {    // SET_SHADER_CONSTANTS -- same shape
+        const uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
+        const uint32_t rbase = offset_type & 0xFFFF;
+        for (uint32_t i = 0; i + 1 < count; ++i) {
+          WritePacketRegister(rbase + i, reader->ReadAndSwap<uint32_t>());
+        }
+        break;
+      }
+      case 0x2F: {    // LOAD_ALU_CONSTANT -- register ranges from guest memory
+        const uint32_t address = reader->ReadAndSwap<uint32_t>() & 0x3FFFFFFF;
+        const uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
+        const uint32_t index = offset_type & 0x7FF;
+        const uint32_t size_dwords = reader->ReadAndSwap<uint32_t>() & 0xFFF;
+        uint32_t rbase;
+        switch ((offset_type >> 16) & 0xFF) {
+          case 0: rbase = index + 0x4000; break;
+          case 1: rbase = index + 0x4800; break;
+          case 2: rbase = index + 0x4900; break;
+          case 3: rbase = index + 0x4908; break;
+          case 4: rbase = index + 0x2000; break;
+          default: rbase = UINT32_MAX; break;
+        }
+        const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(address);
+        if (rbase != UINT32_MAX && src != nullptr) {
+          for (uint32_t i = 0; i < size_dwords; ++i) {
+            WritePacketRegister(rbase + i, rex::memory::load_and_swap<uint32_t>(src + i * 4));
+          }
+        }
         break;
       }
       case 0x3D: {    // MEM_WRITE -- N words to consecutive addresses

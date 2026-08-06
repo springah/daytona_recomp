@@ -10,6 +10,7 @@
 #include "dt_plume.h"
 #include "dt_shader_patchtest.h"
 #include <rex/hook.h>
+#include <rex/chrono/clock.h>
 #include <rex/logging.h>
 #include <rex/system/xtypes.h>
 #include <cstdio>
@@ -428,15 +429,21 @@ REX_HOOK_RAW(sub_82234418) {
         // Wrapped range: [start..mask] U [0..end].
         waits = (reader > start) || (reader <= end);
     }
+    // Rate-limited, not capped: the parked call arrives after boot's routine
+    // waits and a first-N cap spends itself before the one that matters.
     static uint32_t logged = 0;
-    if (waits && logged < 24) {
+    static uint64_t last_tick = 0;
+    const uint64_t now_tick = static_cast<uint64_t>(rex::chrono::Clock::QueryHostTickCount());
+    const bool may_log = waits && (logged < 8 || now_tick - last_tick > 500000000ull);
+    if (may_log) {
         ++logged;
+        last_tick = now_tick;
         REXLOG_WARN("Daytona ring-range WAITING #{}: start={:08X} size={:08X} end={:08X} "
                     "reader={:08X}{}",
                     logged, start, size, end, reader, start >= end ? " (WRAPPED)" : "");
     }
     __imp__sub_82234418(ctx, base);
-    if (waits && logged <= 24) {
+    if (may_log) {
         REXLOG_WARN("Daytona ring-range WAITING #{} satisfied, reader now {:08X}", logged,
                     blk != 0 ? REX_LOAD_U32(blk + 60) : 0xDEADDEADu);
     }
