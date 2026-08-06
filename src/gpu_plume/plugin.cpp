@@ -46,8 +46,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -234,6 +236,12 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
       ++wptr_writes_;
       write_ptr_.store(value);
+      // Wake the drain NOW. Its idle path slept 1ms between polls, and that
+      // millisecond multiplied: every kick->drain->writeback round-trip in a
+      // frame paid it, and boot ran at ~5fps with the main thread busy-spinning
+      // on a cursor only the drain advances. A kick is the one event the drain
+      // exists to service; sleeping through it is the wrong latency trade.
+      wake_cv_.notify_one();
     }
     // Same side-effectful path as packet writes (scratch mirror, COHER flag):
     // rexglue routes MMIO and packets through one WriteRegister for a reason.
@@ -257,7 +265,10 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
       const uint32_t write_ptr = write_ptr_.load();
       if (write_ptr == kWritePointerUnset || write_ptr == read_ptr_ || ring_ptr_ == 0 ||
           memory_ == nullptr) {
-        rex::thread::Sleep(std::chrono::milliseconds(1));
+        // Parked until a kick (WPTR write) wakes us; the timeout is only a
+        // safety net against a missed notify, not the service latency.
+        std::unique_lock<std::mutex> lk(wake_mutex_);
+        wake_cv_.wait_for(lk, std::chrono::milliseconds(1));
         continue;
       }
       rex::memory::RingBuffer reader(memory_->TranslatePhysical(ring_ptr_), ring_size_);
@@ -528,7 +539,15 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
                           is_memory ? "mem" : "reg", poll_addr, wait_info & 0x7, ref, mask,
                           value);
             }
-            rex::thread::Sleep(std::chrono::milliseconds(wait >= 0x100 ? wait / 0x100 : 1));
+            // The value being polled is written by a guest CPU thread (the
+            // scratch-mailbox fill), which lands within microseconds -- a 1ms
+            // sleep per poll made every kick handshake a millisecond, and a
+            // frame has many. Spin-yield first; sleep only if it drags.
+            if (spins < 500) {
+              std::this_thread::yield();
+            } else {
+              rex::thread::Sleep(std::chrono::milliseconds(wait >= 0x100 ? wait / 0x100 : 1));
+            }
           }
         } while (!matched);
         break;
@@ -955,6 +974,9 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t zpds_ = 0;
   std::mutex pending_cs_mutex_;
   std::vector<uint32_t> pending_cs_;
+  // Kick wake-up: WPTR MMIO writes notify, the drain waits. See DrainLoop.
+  std::mutex wake_mutex_;
+  std::condition_variable wake_cv_;
   uint32_t pending_cs_ticks_ = 0;
   bool opcode_seen_[128] = {};
   std::vector<uint32_t> reg_reads_ = std::vector<uint32_t>(kRegisterCount, 0);

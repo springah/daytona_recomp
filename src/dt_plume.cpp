@@ -2507,7 +2507,19 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
 }
 
 void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
-    if (!Enabled() || !g_init_ok || dest_texture_ea == 0 || base == nullptr) return;
+    // Every early-out here logs its first few hits: 362 resolves ran in the
+    // first post-predication boot and produced zero log lines, which made
+    // "handshake not wired" and "handshake wired but starved of pixels"
+    // indistinguishable. Silence is the one thing this function must not do.
+    static uint32_t entries = 0;
+    const uint32_t entry = ++entries;
+    if (!Enabled() || !g_init_ok || dest_texture_ea == 0 || base == nullptr) {
+        if (entry <= 4) {
+            REXLOG_WARN("plume: RESOLVE entry #{} early-out (enabled={} init={} dest={:08X})",
+                        entry, Enabled(), g_init_ok, dest_texture_ea);
+        }
+        return;
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
 
     // Submit whatever this frame has recorded, capturing the pixels. A resolve
@@ -2518,7 +2530,14 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
         EndFrame();
         g_capture_resolve = false;
     }
-    if (g_resolve_pixels.empty()) return;
+    if (g_resolve_pixels.empty()) {
+        if (entry <= 4 || (entry % 512) == 0) {
+            REXLOG_WARN("plume: RESOLVE entry #{} -- no pixels ever captured (frame_open={}, "
+                        "dest={:08X}); the recorder has not drawn anything yet",
+                        entry, g_frame_open, dest_texture_ea);
+        }
+        return;
+    }
 
     // The destination's fetch constant is embedded in the D3DBaseTexture
     // header. XDK 20500's layout puts it after seven bookkeeping dwords
@@ -2552,7 +2571,12 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
     const uint32_t needed = t.tiled
         ? (aligned_pitch * ((t.height + 31u) & ~31u) * 4u)
         : (pitch_texels * t.height * 4u);
-    const uint32_t va = dt_guest_mem::PhysicalToVirtual(t.base_address, needed);
+    // The fetch constant's base is a GPU address, and those carry bits above
+    // the 512 MB physical range (measured: B0898000 for the 1080p resolve
+    // target). Same mask as the INDIRECT_BUFFER pointer fix: the physical
+    // address is the low 29 bits (rexglue round-trips via CpuToGpu).
+    const uint32_t phys = t.base_address & 0x1FFFFFFFu;
+    const uint32_t va = dt_guest_mem::PhysicalToVirtual(phys, needed);
     uint8_t* dst = va != 0
         ? const_cast<uint8_t*>(dt_guest_mem::Resolve(base, va, needed))
         : nullptr;
