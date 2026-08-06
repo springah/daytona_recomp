@@ -212,17 +212,22 @@
 #define SessionAllocFree             sub_82459EF8
 // XamSessionCreateHandle + XamSessionRefObjByHandle + XMsgStartIORequest — create session
 #define SessionCreate                sub_82459FD0
-// XamSessionRefObjByHandle + XMsgStartIORequest (op variant 1)
+// XamSessionRefObjByHandle + XMsgStartIORequest (op variant 1; a second alias
+// "SessionJoin" used to be defined for this address further down the file --
+// removed, the guess was never evidenced and the duplicate was inherited noise)
 #define SessionOp1                   sub_8245A180
-// XamSessionRefObjByHandle + XMsgStartIORequest (op variant 2)
+// XamSessionRefObjByHandle + XMsgStartIORequest (op variant 2; was also aliased
+// "SessionLeave")
 #define SessionOp2                   sub_8245A230
-// XamSessionRefObjByHandle + XMsgStartIORequest (op variant 3)
+// XamSessionRefObjByHandle + XMsgStartIORequest (op variant 3; was also aliased
+// "SessionDelete")
 #define SessionOp3                   sub_8245A2E0
 // XamSessionRefObjByHandle + XMsgStartIORequest (op variant 4)
 #define SessionOp4                   sub_8245A390
 // XamSessionRefObjByHandle + XMsgStartIORequest (op variant 5)
 #define SessionOp5                   sub_8245A438
-// XamSessionRefObjByHandle + XMsgStartIORequest (op variant 6)
+// XamSessionRefObjByHandle + XMsgStartIORequest (op variant 6; was also aliased
+// "SessionModify")
 #define SessionOp6                   sub_8245A4E0
 // XamSessionRefObjByHandle + XMsgStartIORequest (op variant 7)
 #define SessionOp7                   sub_8245A5C0
@@ -503,10 +508,6 @@
 // ExFreePool (generic pool free)
 #define PoolFree                     sub_8247CD60
 
-// ── Game boot video query (0x82131xxx) ────────────────────────────────────────
-// XamNotifyCreateListener — register notify listener in platform init
-#define PlatformCreateNotifyListener sub_8220F270
-
 // ── Game globals / context accessors (0x82180Axxx) ───────────────────────────
 // Loads the main game-context singleton pointer from global BSS
 #define GetGameCtx                   sub_82180A58
@@ -776,17 +777,6 @@
 // Acquire hash table entry lock (r3 = slot bucket index)
 #define TexHashLock                  sub_824E30B0
 
-// ── Session management (0x8245xxxx) ──────────────────────────────────────────
-// SessionCreate is already defined above; additional session operations below:
-// Session join (XamSessionRefObjByHandle + XMsgStartIORequest)
-#define SessionJoin                  sub_8245A180
-// Session leave
-#define SessionLeave                 sub_8245A230
-// Session delete
-#define SessionDelete                sub_8245A2E0
-// Session modify
-#define SessionModify                sub_8245A4E0
-
 // ── Shader compilation infrastructure (0x823Cxxxx / 0x823Bxxxx / 0x823867xxxx) ─
 // Shader assert/error reporter: r3=fatal, r4=line, r5=file, r6=msg, r7=code
 #define ShaderAssert                 sub_822FE3C8
@@ -845,8 +835,7 @@
 #define TaskDispatch                 sub_8247BDF0
 // Compute variable-length integer byte size (thresholds: 15/127/16383 = 1/2/3/4 bytes)
 #define TaskVarIntSize               sub_8247BC50
-// Wrap ExFreePool: frees r4 (pool tag already embedded in caller context)
-#define PoolFree                     sub_8247CD60
+// (PoolFree = sub_8247CD60 is defined once, in the kernel pool-alloc block above)
 // Initialize 3-word linked-list pool header: [0]=vtable, [4]=null, [8]=null
 #define PoolListInit                 sub_8247CD68
 // Atomic-increment global work queue counter using lwarx/stwcx CAS loop
