@@ -49,6 +49,8 @@ bool g_init_ok = false;
 // Init() reads DT_PLUME_PERSIST, and Init() comes first in the file. See the
 // frame-target block for what it means.
 bool g_persist = true;
+// Likewise: the texture cache's content check, declared early for Init().
+bool g_texprobe = true;
 
 std::unique_ptr<plume::RenderInterface> g_interface;
 std::unique_ptr<plume::RenderDevice> g_device;
@@ -599,6 +601,7 @@ bool Init() {
     // only the guest's clear clears it. DT_PLUME_PERSIST=0 goes back to
     // clearing at the top of every frame, which is the A/B for this.
     if (const char* p = std::getenv("DT_PLUME_PERSIST")) g_persist = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_TEXPROBE")) g_texprobe = std::atoi(p) != 0;
     REXLOG_WARN("plume: frame target {} across Swaps (DT_PLUME_PERSIST={})",
                 g_persist ? "PERSISTS -- only the guest clear clears it" : "is cleared every frame",
                 g_persist ? 1 : 0);
@@ -1415,6 +1418,12 @@ struct TextureUpload {
     uint32_t row_bytes = 0;   // bytes in one row of blocks
     uint32_t rows = 0;        // rows of blocks
     uint32_t block = 1;       // texels per block edge
+    // Where the bytes came from, so a later bind can ask whether they changed
+    // without re-deriving the per-format size. `alias` is the 360 memory window
+    // ResolveTextureMemory picked; the same address reads differently through
+    // each of them, so a probe has to use the one the upload used.
+    uint32_t source_bytes = 0;
+    uint32_t source_alias = 0;
 };
 
 // Where a texture's bytes actually live.
@@ -1424,7 +1433,7 @@ struct TextureUpload {
 // memory into several windows, and a mapped-but-stale one reads as zeros. Pick
 // the alias that actually HAS content, and say which.
 const uint8_t* ResolveTextureMemory(const DecodedTexture& t, const uint8_t* base,
-                                    uint32_t needed) {
+                                    uint32_t needed, uint32_t* out_alias = nullptr) {
     static constexpr uint32_t kAliases[] = {0xA0000000u, 0xC0000000u, 0xE0000000u, 0x80000000u};
     const uint8_t* src = nullptr;
     for (uint32_t alias : kAliases) {
@@ -1439,6 +1448,7 @@ const uint8_t* ResolveTextureMemory(const DecodedTexture& t, const uint8_t* base
         }
         if (src == nullptr || nonzero != 0) {
             src = p;
+            if (out_alias != nullptr) *out_alias = alias;
             if (nonzero != 0) break;
         }
     }
@@ -1508,7 +1518,8 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
         const uint32_t needed =
             t.tiled ? (((src_blocks + 31u) & ~31u) * ((out.rows + 31u) & ~31u) * block_bytes)
                     : (src_blocks * block_bytes * out.rows);
-        const uint8_t* src = ResolveTextureMemory(t, base, needed);
+        out.source_bytes = needed;
+        const uint8_t* src = ResolveTextureMemory(t, base, needed, &out.source_alias);
         if (src == nullptr) return false;
 
         out.data.resize(size_t(out.row_bytes) * out.rows);
@@ -1559,7 +1570,8 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
         const uint32_t needed =
             t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * kTexelBytes)
                     : (src_pitch * t.height * kTexelBytes);
-        const uint8_t* src = ResolveTextureMemory(t, base, needed);
+        out.source_bytes = needed;
+        const uint8_t* src = ResolveTextureMemory(t, base, needed, &out.source_alias);
         if (src == nullptr) return false;
 
         out.data.resize(size_t(t.width) * t.height * 4);
@@ -1619,7 +1631,8 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
     const uint32_t src_pitch = std::max(pitch_texels, t.width);
     const uint32_t needed = t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * 4u)
                                     : (src_pitch * t.height * 4u);
-    const uint8_t* src = ResolveTextureMemory(t, base, needed);
+    out.source_bytes = needed;
+    const uint8_t* src = ResolveTextureMemory(t, base, needed, &out.source_alias);
     if (src == nullptr) return false;
 
     out.data.resize(size_t(t.width) * t.height * 4);
@@ -1772,14 +1785,50 @@ std::unique_ptr<plume::RenderDescriptorSet> g_texture_set;
 std::unique_ptr<plume::RenderDescriptorSet> g_sampler_set;
 std::unique_ptr<plume::RenderSampler> g_sampler;
 std::vector<std::unique_ptr<plume::RenderTexture>> g_textures;
-// Cache key -> heap slot. Keyed on the base address AND on the format and
+// Textures replaced by a re-upload at a different size. The old one may still
+// be referenced by draws already recorded into the open command list, so it
+// cannot be freed until that frame's fence signals -- same rule, and the same
+// release point, as g_frame_buffers.
+std::vector<std::unique_ptr<plume::RenderTexture>> g_texture_graveyard;
+
+// What the cache remembers about an uploaded texture. It used to remember only
+// the heap slot, and that was the bug behind two defects at once: a hit never
+// looked at the guest memory again, so a texture was uploaded ONCE, for all
+// time. The game reuses addresses -- streamed UI art lands on a freed
+// allocation, and the resolve destination the scene composites from is rewritten
+// every single frame -- so the second and every later bind was served whatever
+// happened to be in memory the first time. Measured: 110C5000 (1920x1080, the
+// scene's resolve destination) was uploaded 49ms BEFORE the first resolve ever
+// wrote it, and never again, which is why the compositing pass painted black
+// over the 3D scene and left the HUD floating on it.
+struct TexCache {
+    uint32_t slot = 0;
+    uint32_t width = 0, height = 0;
+    plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
+    uint32_t source_bytes = 0;
+    uint32_t source_alias = 0;
+    uint64_t probe = 0;        // sampled hash of the source at upload time
+    uint32_t resolve_stamp = 0;   // g_resolve_written value the upload saw
+    uint32_t reuploads = 0;
+};
+// Cache key -> entry. Keyed on the base address AND on the format and
 // swizzle, not on the address alone: the upload bakes the swizzle in (k_8_8 is
 // expanded channel by channel on the CPU), so two bindings of the same memory
 // with different destination selection are two different host textures. Keying
 // on the address alone would hand the second one the first one's picture, and
 // the symptom -- one surface wearing another's palette index -- looks like a
 // decode bug rather than a cache bug.
-std::unordered_map<uint64_t, uint32_t> g_texture_index;
+std::unordered_map<uint64_t, TexCache> g_texture_index;
+// Destination physical address -> the frame index whose pixels were last
+// scattered there by OnResolve. A texture bound at that address is stale the
+// moment this moves; it is exact, unlike the byte probe, because we are the
+// ones who wrote it.
+std::unordered_map<uint32_t, uint32_t> g_resolve_written;
+// DT_PLUME_TEXPROBE=0 turns off the sampled-content check (g_texprobe, declared
+// at the top of this namespace because Init() reads its environment variable);
+// the resolve stamp still invalidates, which is the A/B for "is this texture
+// stale or is it decoded wrong".
+uint32_t g_texture_reuploads = 0;
 uint64_t TextureCacheKey(const DecodedTexture& t) {
     return uint64_t(t.base_address) | (uint64_t(t.format) << 32) | (uint64_t(t.swizzle) << 40);
 }
@@ -1849,16 +1898,72 @@ uint32_t EnsureSampler(const DecodedTexture& t) {
     return slot;
 }
 
+// A sampled hash of a texture's source bytes. Not a checksum of the whole
+// surface: at 1080p that is 8 MB, and this runs on every binding of every draw.
+// 32 windows of 16 bytes, spread across the range, is 512 bytes -- enough to
+// tell "different art" from "the same art", which is the only question a cache
+// has to answer, and cheap enough to ask thousands of times a frame.
+//
+// It cannot see a change confined to bytes it does not sample. That is why the
+// resolve destinations do not rely on it (see g_resolve_written): for those we
+// know exactly when they changed, because we changed them.
+uint64_t ProbeSource(const DecodedTexture& t, uint32_t alias, uint32_t source_bytes,
+                     const uint8_t* base) {
+    if (source_bytes == 0) return 0;
+    const uint8_t* p = dt_guest_mem::Resolve(base, alias | t.base_address, source_bytes);
+    if (p == nullptr) return 0;
+    constexpr uint32_t kWindows = 32, kWindowBytes = 16;
+    uint64_t h = 1469598103934665603ull;                 // FNV-1a
+    for (uint32_t w = 0; w < kWindows; ++w) {
+        uint64_t at = uint64_t(source_bytes - kWindowBytes) * w / (kWindows - 1);
+        for (uint32_t i = 0; i < kWindowBytes; ++i) {
+            h = (h ^ p[at + i]) * 1099511628211ull;
+        }
+        if (source_bytes <= kWindowBytes) break;
+    }
+    return h;
+}
+
 // Upload the texture bound to `sampler` and return its slot in the bindless
 // heap, or UINT32_MAX. Cached by guest base address: the menu rebinds the same
 // 1920x1080 surface every draw, and untiling it each time would be absurd.
+//
+// A cache HIT still has to ask whether the bytes are the ones that were
+// uploaded. See TexCache for what happened when it did not.
 uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     if (g_control_texture_only) return 0;   // every slot is the checker
     const DecodedTexture t = ReadTextureFetchConstant(sampler, base);
     if (!t.valid) return UINT32_MAX;
     const uint64_t key = TextureCacheKey(t);
     auto it = g_texture_index.find(key);
-    if (it != g_texture_index.end()) return it->second;
+    uint32_t reuse_slot = UINT32_MAX;
+    if (it != g_texture_index.end()) {
+        TexCache& c = it->second;
+        // Exact: did WE write new pixels there since the upload?
+        uint32_t stamp = 0;
+        if (auto rw = g_resolve_written.find(t.base_address & 0x1FFFFFFFu);
+            rw != g_resolve_written.end()) {
+            stamp = rw->second;
+        }
+        const char* why = nullptr;
+        if (stamp != c.resolve_stamp) {
+            why = "resolved into";
+        } else if (g_texprobe &&
+                   ProbeSource(t, c.source_alias, c.source_bytes, base) != c.probe) {
+            why = "contents changed";
+        }
+        if (why == nullptr) return c.slot;
+
+        ++c.reuploads;
+        ++g_texture_reuploads;
+        if (c.reuploads <= 2 || (g_texture_reuploads % 2048) == 0) {
+            REXLOG_WARN("plume: texture {:08X} {}x{} {} -- re-uploading (this one {} times, {} "
+                        "re-uploads overall)",
+                        t.base_address, t.width, t.height, why, c.reuploads,
+                        g_texture_reuploads);
+        }
+        reuse_slot = c.slot;
+    }
 
     // Say it out loud when one address is bound two ways -- that is the case
     // the key above exists for, and if it never happens the extra key bits are
@@ -1888,7 +1993,11 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     // completely different fixes, and the readback cannot tell them apart.
     // Counted over raw bytes so it means something for compressed data too,
     // where there are no texels to inspect without a decompressor.
-    {
+    //
+    // Only on the FIRST upload of an address: re-uploads now happen every frame
+    // for the resolve destinations, and an 8 MB byte count plus a log line at
+    // 60 Hz is a measurement that pays for nothing.
+    if (reuse_slot == UINT32_MAX) {
         size_t nonzero = 0;
         for (uint8_t byte : up.data) nonzero += (byte != 0);
         REXLOG_WARN("plume: texture {:08X} {}x{} read as {} rows x {} B: {} of {} bytes non-zero "
@@ -1897,9 +2006,25 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
                     up.data.size(), t.endianness);
     }
 
-    auto texture = g_device->createTexture(
-        plume::RenderTextureDesc::Texture2D(t.width, t.height, 1, up.format));
-    if (texture == nullptr) return UINT32_MAX;
+    // A re-upload keeps its heap slot and, when the geometry has not changed,
+    // its texture object: overwriting the pixels of a texture the open command
+    // list already references is fine (the upload list is submitted and waited
+    // on before that list is ever recorded further), whereas FREEING it is not.
+    plume::RenderTexture* target = nullptr;
+    std::unique_ptr<plume::RenderTexture> fresh;
+    if (reuse_slot != UINT32_MAX) {
+        const TexCache& c = g_texture_index[key];
+        if (c.width == t.width && c.height == t.height && c.format == up.format) {
+            target = g_textures[reuse_slot].get();
+        }
+    }
+    if (target == nullptr) {
+        fresh = g_device->createTexture(
+            plume::RenderTextureDesc::Texture2D(t.width, t.height, 1, up.format));
+        if (fresh == nullptr) return UINT32_MAX;
+        target = fresh.get();
+    }
+    plume::RenderTexture* texture = target;
 
     // D3D12 wants each row of a buffer->texture copy 256-byte aligned, so the
     // staging copy is repacked to that pitch rather than the texture's own.
@@ -1923,35 +2048,65 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     const uint32_t footprint_texels = (padded / block_bytes) * up.block;
 
     g_upload_cmd->begin();
-    const plume::RenderTextureBarrier to_dst(texture.get(), plume::RenderTextureLayout::COPY_DEST);
+    const plume::RenderTextureBarrier to_dst(texture, plume::RenderTextureLayout::COPY_DEST);
     g_upload_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_dst, 1);
     g_upload_cmd->copyTextureRegion(
-        plume::RenderTextureCopyLocation::Subresource(texture.get()),
+        plume::RenderTextureCopyLocation::Subresource(texture),
         plume::RenderTextureCopyLocation::PlacedFootprint(
             staging.get(), up.format, t.width, t.height, 1, footprint_texels));
-    const plume::RenderTextureBarrier to_read(texture.get(),
-                                              plume::RenderTextureLayout::SHADER_READ);
+    const plume::RenderTextureBarrier to_read(texture, plume::RenderTextureLayout::SHADER_READ);
     g_upload_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
     g_upload_cmd->end();
     const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
     g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_upload_fence.get());
     g_queue->waitForCommandFence(g_upload_fence.get());
 
-    const uint32_t slot = uint32_t(g_textures.size());
-    g_texture_set->setTexture(slot, texture.get(), plume::RenderTextureLayout::SHADER_READ);
-    g_textures.push_back(std::move(texture));
-    g_texture_index[key] = slot;
-    REXLOG_WARN("plume: uploaded texture {}x{} guest format {} as plume format {} {} base {:08X} "
-                "swizzle {} ({:03X}) endian {} sign {}{}{}{} numfmt {} -> heap slot {}",
-                t.width, t.height, t.format, static_cast<uint32_t>(up.format),
-                t.tiled ? "tiled" : "linear", t.base_address, SwizzleName(t.swizzle), t.swizzle,
-                t.endianness, t.sign[0], t.sign[1], t.sign[2], t.sign[3], t.num_format, slot);
+    uint32_t slot = reuse_slot;
+    if (slot == UINT32_MAX) {
+        slot = uint32_t(g_textures.size());
+        g_textures.push_back(nullptr);
+    }
+    if (fresh != nullptr) {
+        // The slot's previous texture (if any) outlives this call: draws already
+        // recorded still point at it.
+        if (g_textures[slot] != nullptr) {
+            g_texture_graveyard.push_back(std::move(g_textures[slot]));
+        }
+        g_textures[slot] = std::move(fresh);
+        g_texture_set->setTexture(slot, g_textures[slot].get(),
+                                  plume::RenderTextureLayout::SHADER_READ);
+    }
+
+    TexCache& c = g_texture_index[key];
+    c.slot = slot;
+    c.width = t.width;
+    c.height = t.height;
+    c.format = up.format;
+    c.source_bytes = up.source_bytes;
+    c.source_alias = up.source_alias;
+    c.probe = ProbeSource(t, up.source_alias, up.source_bytes, base);
+    if (auto rw = g_resolve_written.find(t.base_address & 0x1FFFFFFFu);
+        rw != g_resolve_written.end()) {
+        c.resolve_stamp = rw->second;
+    }
+    if (reuse_slot == UINT32_MAX) {
+        REXLOG_WARN("plume: uploaded texture {}x{} guest format {} as plume format {} {} base "
+                    "{:08X} swizzle {} ({:03X}) endian {} sign {}{}{}{} numfmt {} -> heap slot {}",
+                    t.width, t.height, t.format, static_cast<uint32_t>(up.format),
+                    t.tiled ? "tiled" : "linear", t.base_address, SwizzleName(t.swizzle),
+                    t.swizzle, t.endianness, t.sign[0], t.sign[1], t.sign[2], t.sign[3],
+                    t.num_format, slot);
+    }
 
     // DT_PLUME_TEXDUMP=<dir>: the staged RGBA8 bytes, exactly as the GPU will
     // see them. A palette is 64x1024 of shading ramps and no log line can say
     // what is in it; the file can be read against the referee's colours.
     if (const char* dump_dir = std::getenv("DT_PLUME_TEXDUMP")) {
-        if (dump_dir[0] != '\0' && up.block == 1) {
+        // A re-upload rewrites the file, so the dump always holds the CURRENT
+        // art -- but not for the 8 MB resolve destinations, which change every
+        // frame and would turn the dump into a 480 MB/s write.
+        const bool too_big_to_redump = reuse_slot != UINT32_MAX && up.data.size() > (1u << 20);
+        if (dump_dir[0] != '\0' && up.block == 1 && !too_big_to_redump) {
             const std::string path = fmt::format("{}/tex_{:08X}_{}x{}_f{}_s{:03X}.raw", dump_dir,
                                                  t.base_address, t.width, t.height, t.format,
                                                  t.swizzle);
@@ -2700,6 +2855,8 @@ void EndFrame() {
 
     const size_t buffers = g_frame_buffers.size();
     g_frame_buffers.clear();
+    // Textures a re-upload replaced. The fence above is what makes this safe.
+    g_texture_graveyard.clear();
 
     if (!report) return;
 
@@ -3503,8 +3660,10 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
     // times a second but the pixels only change when a frame is captured, and
     // a full 1080p tiled write is ~2M TiledOffset2D computations -- repeating
     // it for identical pixels was a large slice of the 18fps-instead-of-60.
-    static std::unordered_map<uint32_t, uint32_t> written;   // dest phys -> frame
-    auto& stamp = written[phys];
+    // g_resolve_written, not a local static, because EnsureTexture reads it: a
+    // texture bound at an address we have just scattered into is stale, and
+    // this stamp is the exact signal for that (see TexCache).
+    auto& stamp = g_resolve_written[phys];
     if (stamp == g_frame_index + 1u) return;   // +1: 0 must not match a fresh entry
     stamp = g_frame_index + 1u;
 
