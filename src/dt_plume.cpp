@@ -299,6 +299,27 @@ uint64_t g_draws_unresolved = 0;     // a draw whose VS or PS we have no blob fo
 // BeginFrame, so there is no open frame to attribute it to.
 uint64_t g_draws_nopipe = 0;
 uint32_t g_combo_overflow = 0;
+
+// Render-state census (opt-in: DT_PLUME_STATECENSUS=1). Which of the three
+// remaining unshadowed render states does the game actually VARY? Depth
+// (+10548 RB_DEPTHCONTROL), alpha test (+10556 RB_COLORCONTROL) and cull
+// (+10568 PA_SU_SC_MODE_CNTL) are all defaulted in the pipeline desc, and
+// wiring a state the game never changes is dead code with a pipeline
+// explosion attached. So count the DISTINCT triples first, then wire only
+// what moves. Kept as an opt-in rather than deleted: the question comes back
+// every time a new scene renders wrong.
+bool g_statecensus = false;
+struct StateSample {
+    uint32_t depth = 0;      // RB_DEPTHCONTROL
+    uint32_t color = 0;      // RB_COLORCONTROL
+    uint32_t cull = 0;       // PA_SU_SC_MODE_CNTL
+    uint64_t draws = 0;
+};
+constexpr uint32_t kMaxStateSamples = 64;
+StateSample g_state_samples[kMaxStateSamples];
+uint32_t g_state_sample_count = 0;
+uint32_t g_state_sample_overflow = 0;
+
 bool g_bisected = false;   // the pipeline-failure bisect runs once, not per combo
 uint32_t g_decl_changes = 0;
 
@@ -652,6 +673,7 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_PROF")) g_prof = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_ARENA")) g_arena = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_SWAPPRESENT")) g_swap_present = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_STATECENSUS")) g_statecensus = std::atoi(p) != 0;
     REXLOG_WARN("plume: the swapchain is presented {} (DT_PLUME_SWAPPRESENT={})",
                 g_swap_present ? "at the guest's Swap ONLY -- a mid-frame resolve closes and "
                                  "captures the frame but does not put it on the screen"
@@ -4008,13 +4030,51 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
     static uint32_t shadow_dev = 0;
     static const uint8_t* blend_ptr = nullptr;
     static const uint8_t* cwmask_ptr = nullptr;
+    static const uint8_t* depth_ptr = nullptr;
+    static const uint8_t* color_ptr = nullptr;
+    static const uint8_t* cull_ptr = nullptr;
     if (shadow_dev != device_ea) {
         shadow_dev = device_ea;
         blend_ptr = dt_guest_mem::Resolve(base, device_ea + 10552, 4);
         cwmask_ptr = dt_guest_mem::Resolve(base, device_ea + 10460, 4);
+        depth_ptr = dt_guest_mem::Resolve(base, device_ea + 10548, 4);
+        color_ptr = dt_guest_mem::Resolve(base, device_ea + 10556, 4);
+        cull_ptr = dt_guest_mem::Resolve(base, device_ea + 10568, 4);
     }
     const uint32_t blend = blend_ptr != nullptr ? LoadBE32(blend_ptr) : 0x00010001u;
     const uint8_t write_mask = cwmask_ptr != nullptr ? uint8_t(LoadBE32(cwmask_ptr) & 0xF) : 0xFu;
+    const uint32_t depthctl = depth_ptr != nullptr ? LoadBE32(depth_ptr) : 0u;
+    const uint32_t colorctl = color_ptr != nullptr ? LoadBE32(color_ptr) : 0u;
+    const uint32_t cullctl = cull_ptr != nullptr ? LoadBE32(cull_ptr) : 0u;
+
+    if (g_statecensus) {
+        StateSample* s = nullptr;
+        for (uint32_t i = 0; i < g_state_sample_count; ++i) {
+            if (g_state_samples[i].depth == depthctl && g_state_samples[i].color == colorctl &&
+                g_state_samples[i].cull == cullctl) {
+                s = &g_state_samples[i];
+                break;
+            }
+        }
+        if (s == nullptr) {
+            if (g_state_sample_count >= kMaxStateSamples) {
+                ++g_state_sample_overflow;
+            } else {
+                s = &g_state_samples[g_state_sample_count++];
+                s->depth = depthctl;
+                s->color = colorctl;
+                s->cull = cullctl;
+                REXLOG_WARN("plume: state census #{} -- DEPTHCONTROL {:08X} (z {} write {} "
+                            "func {}) COLORCONTROL {:08X} (atest {} func {}) MODE_CNTL {:08X} "
+                            "(cull_front {} cull_back {} face {}) vs {:016X} ps {:016X}",
+                            g_state_sample_count - 1, depthctl, (depthctl >> 1) & 1,
+                            (depthctl >> 2) & 1, (depthctl >> 4) & 7, colorctl,
+                            (colorctl >> 3) & 1, colorctl & 7, cullctl, cullctl & 1,
+                            (cullctl >> 1) & 1, (cullctl >> 2) & 1, vs, ps);
+            }
+        }
+        if (s != nullptr) ++s->draws;
+    }
 
     Combo* found = nullptr;
     for (uint32_t i = 0; i < g_combo_count; ++i) {
@@ -4592,6 +4652,20 @@ void Dump(const char* reason) {
     }
     if (g_draws_unresolved) {
         REXLOG_WARN("   WARNING: {} draws used a shader object we never saw created", g_draws_unresolved);
+    }
+
+    if (g_statecensus) {
+        REXLOG_WARN("   --- render-state census: {} distinct (depth, colour, cull) triples{} ---",
+                    g_state_sample_count,
+                    g_state_sample_overflow ? " (TABLE FULL -- incomplete)" : "");
+        for (uint32_t i = 0; i < g_state_sample_count; ++i) {
+            const StateSample& s = g_state_samples[i];
+            REXLOG_WARN("   [{:2}] DEPTH {:08X} z={} zw={} zfunc={} | COLOR {:08X} atest={} "
+                        "afunc={} | CULL {:08X} f={} b={} face={} | {} draws",
+                        i, s.depth, (s.depth >> 1) & 1, (s.depth >> 2) & 1, (s.depth >> 4) & 7,
+                        s.color, (s.color >> 3) & 1, s.color & 7, s.cull, s.cull & 1,
+                        (s.cull >> 1) & 1, (s.cull >> 2) & 1, s.draws);
+        }
     }
 
     // This is the number the renderer actually needs: one plume pipeline per row.
