@@ -514,10 +514,51 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         break;
       }
       case 0x5B: {    // EVENT_WRITE_ZPD -- z-pass done, i.e. an occlusion query
+        // ⚠ This packet HAS a memory side effect and skipping it caused an
+        // interrupt STORM: 2.7 million re-arms in 40 seconds. The protocol
+        // (from rexglue's handler, which is the reference): D3D pre-writes
+        // 0xFFFFFEED markers into the sample-count struct at
+        // [RB_SAMPLE_COUNT_ADDR] on D3DISSUE_END; the GPU's ZPD event
+        // OVERWRITES the struct with real counts; the guest's XPS/tiling
+        // callback polls the struct and treats a surviving marker as "query
+        // still running" -- and re-queues its command buffer, forever. The
+        // earlier version of this case read the packet and wrote nothing,
+        // WITH a comment predicting a stalled query would hang. It did.
+        //
+        // No depth work happens here, so report a fixed non-zero sample count
+        // (rexglue's own workaround, cvar default 1000) on the end-marker.
         reader->ReadAndSwap<uint32_t>();   // initiator
-        // The guest polls for the "finished" marker. Reporting zero samples is
-        // a lie, but a stalled query is a hang, and this renderer does not do
-        // occlusion queries yet.
+        const uint32_t counts_addr = registers_[0x2325];   // RB_SAMPLE_COUNT_ADDR
+        if (zpds_ < 12) {
+          const uint8_t* q = counts_addr ? memory_->TranslatePhysical<const uint8_t*>(counts_addr)
+                                         : nullptr;
+          uint32_t w[8] = {};
+          if (q) std::memcpy(w, q, 32);
+          REXLOG_WARN("rexgpu-plume: ZPD #{} counts_addr={:08X} struct: {:08X} {:08X} {:08X} "
+                      "{:08X} {:08X} {:08X} {:08X} {:08X}",
+                      zpds_, counts_addr, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        }
+        ++zpds_;
+        if (counts_addr != 0) {
+          uint8_t* p = memory_->TranslatePhysical<uint8_t*>(counts_addr);
+          if (p != nullptr) {
+            // Struct is LITTLE-endian (le<> fields; D3D writes it swapped).
+            auto ld = [&](uint32_t off) {
+              uint32_t v;
+              std::memcpy(&v, p + off, 4);
+              return v;
+            };
+            const uint32_t kFinished = 0xEDFEFFFFu;   // 0xFFFFFEED as LE bytes
+            const bool end_zpass = ld(16) == kFinished && ld(20) == kFinished;
+            const bool end_zfail = ld(8) == kFinished && ld(12) == kFinished;
+            std::memset(p, 0, 32);
+            if (end_zpass || end_zfail) {
+              const uint32_t fake = 1000;
+              std::memcpy(p + 16, &fake, 4);   // ZPass_A
+              std::memcpy(p + 0, &fake, 4);    // Total_A
+            }
+          }
+        }
         break;
       }
       case 0x64:      // XE_SWAP -- rexglue's VdSwap token; count it, the
@@ -549,6 +590,16 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         // The stream itself guarantees the ordering this needs: the scratch
         // writeback that fills the mailbox executes BEFORE this packet, in
         // this same drain. rexglue dispatches inline for the same reason.
+        //
+        // PACED, and the pacing is a hypothesis under test. Measured: the XPS
+        // worker re-queues its buffer 65000 times a second against our
+        // near-zero interrupt latency (13.8M INTERRUPT packets in 80s), where
+        // real-hardware execution latency would pace the same loop at frame
+        // rate. A short inline sleep BEFORE the dispatch preserves stream
+        // order and mailbox coherence -- unlike the batching deferral that
+        // lost callbacks -- and models the one thing a discard-the-draws GPU
+        // lacks: time passing between submission and completion.
+        rex::thread::Sleep(std::chrono::milliseconds(1));
         for (uint32_t n = 0; n < 6; ++n) {
           if (cpu_mask & (1u << n)) DispatchInterrupt(1, n);
         }
@@ -641,9 +692,9 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
     function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                            uint32_t(std::size(args)));
     if (source == 0) ++vblanks_;
-    if (source == 0 && (vblanks_ % 3600) == 0) {
-      REXLOG_INFO("rexgpu-plume: {} vblanks dispatched, ring read pointer {:08X}",
-                  vblanks_, read_ptr_);
+    if (source == 0 && (vblanks_ % 600) == 0) {
+      REXLOG_WARN("rexgpu-plume: {} vblanks; {} INTERRUPT packets seen; read pointer {:08X}",
+                  vblanks_, cs_interrupts_, read_ptr_);
     }
   }
 
@@ -672,6 +723,7 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t scratch_writebacks_ = 0;
   uint64_t fences_ = 0;
   uint32_t swaps_ = 0;
+  uint64_t zpds_ = 0;
   std::mutex pending_cs_mutex_;
   std::vector<uint32_t> pending_cs_;
   uint32_t pending_cs_ticks_ = 0;

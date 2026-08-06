@@ -226,13 +226,38 @@ REX_HOOK_RAW(sub_822346A0) {
     daytona_debug::RecordHook(daytona_debug::HookId::kD3DInterruptCallback, ctx);
     if (ctx.r3.u32 == 1) {
         static uint32_t calls = 0;
-        if (++calls <= 8) {
-            const uint32_t block = REX_LOAD_U32(ctx.r4.u32 + 11028);
-            const uint32_t cb = block != 0 ? REX_LOAD_U32(block + 16) : 0;
-            const uint32_t cb_ctx = block != 0 ? REX_LOAD_U32(block + 20) : 0;
-            REXLOG_WARN("Daytona ISR source-1 #{}: device={:08X} block={:08X} callback={:08X} "
-                        "ctx={:08X}", calls, ctx.r4.u32, block, cb, cb_ctx);
+        ++calls;
+        // The pending word at [block+0] is the delivery-race probe. The ISR
+        // clears (1 << cpu) in it under a spinlock, so SOMETHING guest-side
+        // sets it -- and if this interrupt arrives before that set, the clear
+        // no-ops and whoever waits for the bit to drop waits forever. Log the
+        // word BEFORE __imp__ (the ISR's clear) and AFTER, every time: a
+        // delivery where before==after is a no-op clear, i.e. the race hit.
+        const uint32_t block = REX_LOAD_U32(ctx.r4.u32 + 11028);
+        const uint32_t cb = block != 0 ? REX_LOAD_U32(block + 16) : 0;
+        const uint32_t cb_ctx = block != 0 ? REX_LOAD_U32(block + 20) : 0;
+        const uint32_t pending_before = block != 0 ? REX_LOAD_U32(block + 0) : 0xDEADDEAD;
+        __imp__sub_822346A0(ctx, base);
+        const uint32_t pending_after = block != 0 ? REX_LOAD_U32(block + 0) : 0xDEADDEAD;
+        // Storm-aware: 2.7M deliveries in 40s means per-call logging is the
+        // problem, not the probe. Log the first few and every 100000th, and
+        // for the XPS notify dump its ctx block -- the re-arm decision reads
+        // from there, and diffing it against xenos names the field that never
+        // completes under plume.
+        if (calls <= 6 || (calls % 100000) == 0) {
+            REXLOG_WARN("Daytona ISR source-1 #{}: callback={:08X} ctx={:08X} pending "
+                        "{:08X}->{:08X}{}",
+                        calls, cb, cb_ctx, pending_before, pending_after,
+                        pending_before == pending_after ? "  << NO-OP CLEAR" : "");
+            if (cb == 0x8223C150u && cb_ctx != 0) {
+                std::string w;
+                for (uint32_t i = 0; i < 24; ++i) {
+                    w += fmt::format("{:08X} ", REX_LOAD_U32(cb_ctx + i * 4));
+                }
+                REXLOG_WARN("Daytona xps-ctx @{:08X}: {}", cb_ctx, w);
+            }
         }
+        return;
     }
     __imp__sub_822346A0(ctx, base);
 }
