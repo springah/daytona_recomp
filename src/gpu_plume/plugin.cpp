@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <cstring>
 #include <vector>
 
@@ -72,6 +73,10 @@ constexpr uint32_t kReg_CP_RB_WPTR = 0x01C5;
 constexpr uint32_t kReg_D1MODE_V_COUNTER = 0x194C;
 constexpr uint32_t kReg_INTERRUPT_STATUS = 0x1951;
 constexpr uint32_t kReg_D1MODE_VIEWPORT_SIZE = 0x1961;
+constexpr uint32_t kReg_COHER_STATUS_HOST = 0x0A31;
+constexpr uint32_t kReg_SCRATCH_UMSK = 0x01DC;
+constexpr uint32_t kReg_SCRATCH_ADDR = 0x01DD;
+constexpr uint32_t kReg_SCRATCH_REG0 = 0x0578;   // "interrupt sync" per the table
 
 // The guest's "nothing written yet" sentinel for the ring write pointer, as
 // used by rexglue's command processor.
@@ -289,6 +294,41 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
     }
   }
 
+  // A register write from the COMMAND STREAM, with the side effects the guest
+  // depends on. Two of them, both copied from rexglue's WriteRegister because
+  // they are hardware behaviour, not emulator invention:
+  //
+  //   - SCRATCH WRITEBACK. A write to SCRATCH_REG0..7 whose bit is set in
+  //     SCRATCH_UMSK is mirrored into guest memory at SCRATCH_ADDR + reg*4.
+  //     ⚠ This is the swap release latch. D3D's swap sequence is
+  //         type-0 write SCRATCH_REG -> WAIT_REG_MEM [mem]==value -> INTERRUPT
+  //     with SCRATCH_ADDR aimed at the block the ISR reads its callback from:
+  //     the scratch writeback stores the release value, the wait observes it,
+  //     and only then does the interrupt fire -- by which time the guest has
+  //     filled in the callback. Without the writeback the wait parks forever
+  //     (measured: WAIT_REG_MEM mem 10090046 ==1, current=00000000, 1000+
+  //     spins) and no swap ever retires.
+  //
+  //   - COHER_STATUS_HOST writes SET bit 31 (the "flush requested" flag the
+  //     next WAIT_REG_MEM poll acknowledges by clearing).
+  void WritePacketRegister(uint32_t r, uint32_t value) {
+    if (r >= kRegisterCount) return;
+    if (r == kReg_COHER_STATUS_HOST) value |= 0x80000000u;
+    registers_[r] = value;
+    if (r >= kReg_SCRATCH_REG0 && r < kReg_SCRATCH_REG0 + 8) {
+      const uint32_t scratch = r - kReg_SCRATCH_REG0;
+      if ((registers_[kReg_SCRATCH_UMSK] >> scratch) & 1) {
+        const uint32_t addr = registers_[kReg_SCRATCH_ADDR] + scratch * 4;
+        rex::memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(addr), value);
+        if (scratch_writebacks_ < 8) {
+          REXLOG_WARN("rexgpu-plume: scratch writeback -- reg {} value {:08X} -> phys {:08X}",
+                      scratch, value, addr);
+        }
+        ++scratch_writebacks_;
+      }
+    }
+  }
+
   void StoreGuest(uint32_t address, uint32_t value) {
     const uint32_t endianness = address & 0x3;
     address &= ~uint32_t(0x3);
@@ -310,8 +350,7 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         const bool one_reg = ((packet >> 15) & 0x1) != 0;
         for (uint32_t i = 0; i < count; ++i) {
           const uint32_t value = reader->ReadAndSwap<uint32_t>();
-          const uint32_t r = one_reg ? base : base + i;
-          if (r < kRegisterCount) registers_[r] = value;
+          WritePacketRegister(one_reg ? base : base + i, value);
         }
         return true;
       }
@@ -321,8 +360,8 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         const uint32_t r1 = (packet >> 11) & 0x7FF;
         const uint32_t v0 = reader->ReadAndSwap<uint32_t>();
         const uint32_t v1 = reader->ReadAndSwap<uint32_t>();
-        if (r0 < kRegisterCount) registers_[r0] = v0;
-        if (r1 < kRegisterCount) registers_[r1] = v1;
+        WritePacketRegister(r0, v0);
+        WritePacketRegister(r1, v1);
         return true;
       }
       case 2:     // nop, carries no data
@@ -358,6 +397,12 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
           REXLOG_WARN("rexgpu-plume: indirect buffer at {:08X}, {} words", list_ptr, list_words);
         }
         ++indirect_buffers_;
+        if (list_words != 0 && indirect_depth_ >= 4) {
+          // A silent skip here silently drops every packet inside -- including
+          // fences -- and a dropped fence is a guest that waits forever.
+          REXLOG_WARN("rexgpu-plume: indirect buffer SKIPPED at depth {} ({} words) -- "
+                      "fences inside it are lost", indirect_depth_, list_words);
+        }
         if (list_words != 0 && indirect_depth_ < 4) {
           ++indirect_depth_;
           rex::memory::RingBuffer sub(memory_->TranslatePhysical(list_ptr),
@@ -370,10 +415,77 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
           // every packet in every indirect buffer went missing while the walk
           // looked like it was running. rexglue's do/while is load-bearing.
           do {
-            if (!ExecutePacket(&sub)) break;
+            if (!ExecutePacket(&sub)) {
+              // Breaking here abandons the REST of the buffer -- the fences
+              // sit at the end, so this is exactly how they get dropped.
+              REXLOG_WARN("rexgpu-plume: packet failed inside indirect buffer at {:08X} -- "
+                          "{} of {} words abandoned",
+                          list_ptr, sub.read_count() / 4, list_words);
+              break;
+            }
           } while (sub.read_count() >= sizeof(uint32_t));
           --indirect_depth_;
         }
+        break;
+      }
+      case 0x3C: {    // WAIT_REG_MEM -- the CPU<->GPU handshake
+        // ⚠ This packet is LOAD-BEARING for the swap protocol and skipping it
+        // is what kept the boot swap from ever retiring. The guest emits:
+        //     WAIT_REG_MEM (wait here) ... INTERRUPT (notify)
+        // and only writes the ISR's callback mailbox ([[device+11028]+16])
+        // while the CP is parked at the wait. Blow through the wait and the
+        // interrupt is delivered to a NULL mailbox -- one-shot, lost, and the
+        // present-wait spins forever. Measured, not theorised: under xenos
+        // the ISR logs callback=82233568; under a skip-the-wait drain it
+        // logged callback=00000000 and the mailbox never filled.
+        const uint32_t wait_info = reader->ReadAndSwap<uint32_t>();
+        const uint32_t poll_addr = reader->ReadAndSwap<uint32_t>();
+        const uint32_t ref = reader->ReadAndSwap<uint32_t>();
+        const uint32_t mask = reader->ReadAndSwap<uint32_t>();
+        const uint32_t wait = reader->ReadAndSwap<uint32_t>();
+        const bool is_memory = (wait_info & 0x10) != 0;
+        if (waits_ < 8) {
+          REXLOG_WARN("rexgpu-plume: WAIT_REG_MEM {} {:08X} op={} ref={:08X} mask={:08X}",
+                      is_memory ? "mem" : "reg", poll_addr, wait_info & 0x7, ref, mask);
+        }
+        ++waits_;
+        uint32_t spins = 0;
+        bool matched = false;
+        uint32_t value = 0;
+        do {
+          if (is_memory) {
+            value = rex::memory::load<uint32_t>(
+                memory_->TranslatePhysical(poll_addr & ~uint32_t(0x3)));
+            value = GpuSwap(value, poll_addr & 0x3);
+          } else {
+            const uint32_t r = poll_addr;
+            // Coherency polls wait for the HOST to acknowledge a cache-flush
+            // request by clearing the status. There is no cache here, so the
+            // honest acknowledgement is immediate.
+            if (r == kReg_COHER_STATUS_HOST) registers_[r] = 0;
+            value = r < kRegisterCount ? registers_[r] : 0;
+          }
+          switch (wait_info & 0x7) {
+            case 0x1: matched = (value & mask) < ref; break;
+            case 0x2: matched = (value & mask) <= ref; break;
+            case 0x3: matched = (value & mask) == ref; break;
+            case 0x4: matched = (value & mask) != ref; break;
+            case 0x5: matched = (value & mask) >= ref; break;
+            case 0x6: matched = (value & mask) > ref; break;
+            case 0x7: matched = true; break;
+            default: matched = false; break;
+          }
+          if (!matched) {
+            if (!workers_running_) return false;
+            if (++spins == 1000) {
+              REXLOG_WARN("rexgpu-plume: WAIT_REG_MEM parked 1000 spins -- {} {:08X} op={} "
+                          "ref={:08X} mask={:08X} current={:08X}",
+                          is_memory ? "mem" : "reg", poll_addr, wait_info & 0x7, ref, mask,
+                          value);
+            }
+            rex::thread::Sleep(std::chrono::milliseconds(wait >= 0x100 ? wait / 0x100 : 1));
+          }
+        } while (!matched);
         break;
       }
       case 0x3D: {    // MEM_WRITE -- N words to consecutive addresses
@@ -389,9 +501,16 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         const uint32_t address = reader->ReadAndSwap<uint32_t>();
         const uint32_t value = reader->ReadAndSwap<uint32_t>();
         // Bit 31 asks for the GPU's own counter instead of the given value.
-        // We have no packet-level work to count, so the vblank count is the
-        // honest answer: it is the thing that actually advances here.
-        StoreGuest(address, ((initiator >> 31) & 0x1) ? uint32_t(vblanks_) : value);
+        // rexglue writes its swap counter; ours is the count of XE_SWAP
+        // packets seen, which advances at the same moments.
+        const uint32_t written = ((initiator >> 31) & 0x1) ? uint32_t(swaps_) : value;
+        StoreGuest(address, written);
+        if (fences_ < 16) {
+          REXLOG_WARN("rexgpu-plume: EVENT_WRITE_SHD -> phys {:08X} = {:08X}{}",
+                      address & ~uint32_t(3), written,
+                      ((initiator >> 31) & 0x1) ? " (counter)" : "");
+        }
+        ++fences_;
         break;
       }
       case 0x5B: {    // EVENT_WRITE_ZPD -- z-pass done, i.e. an occlusion query
@@ -401,6 +520,10 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         // occlusion queries yet.
         break;
       }
+      case 0x64:      // XE_SWAP -- rexglue's VdSwap token; count it, the
+                      // EVENT_WRITE_SHD counter semantics depend on it
+        ++swaps_;
+        break;
       case 0x54: {    // INTERRUPT -- from the command stream
         // ⚠ NOT the same interrupt as the vblank one. Source 1 means "the
         // command stream reached here", and the guest's handler branches on
@@ -412,6 +535,20 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
           REXLOG_WARN("rexgpu-plume: command-stream INTERRUPT, cpu mask {:02X}", cpu_mask);
         }
         ++cs_interrupts_;
+        // Dispatched INLINE, in stream order -- deliberately, after trying it
+        // the other way. The ISR reads its callback from a SINGLE mailbox slot
+        // ([[device+11028]+16]) that each kick REWRITES via the scratch
+        // writeback earlier in the same stream. A deferred dispatch (added
+        // when the mailbox read as null -- which was really the missing
+        // scratch writeback, not a race) batches notifications, and by
+        // delivery time the mailbox holds only the LAST kick's callback:
+        // every earlier notification is delivered to the wrong target or
+        // lost, the D3D worker never sees its completion, it stops
+        // submitting, and the fence parks two behind the cursor for good.
+        //
+        // The stream itself guarantees the ordering this needs: the scratch
+        // writeback that fills the mailbox executes BEFORE this packet, in
+        // this same drain. rexglue dispatches inline for the same reason.
         for (uint32_t n = 0; n < 6; ++n) {
           if (cpu_mask & (1u << n)) DispatchInterrupt(1, n);
         }
@@ -447,7 +584,49 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         DispatchInterrupt();
         last += interval;
       }
+      DeliverPendingCsInterrupts();
       rex::thread::Sleep(std::chrono::milliseconds(1));
+    }
+  }
+
+  // Is the guest's command-stream interrupt callback registered yet? The ISR
+  // (sub_822346A0) reads it from [[user_data+11028]+16]; before D3D stores it,
+  // a source-1 dispatch is a notification delivered to nobody. Reading the
+  // same two loads the ISR performs is title-specific knowledge, which is
+  // acceptable in a plugin that exists for this one title.
+  bool GuestCsCallbackReady() const {
+    if (interrupt_callback_data_ == 0 || memory_ == nullptr) return false;
+    const uint8_t* p = memory_->TranslateVirtual<const uint8_t*>(interrupt_callback_data_ + 11028);
+    if (p == nullptr) return false;
+    const uint32_t block = rex::memory::load_and_swap<uint32_t>(p);
+    if (block == 0) return false;
+    const uint8_t* q = memory_->TranslateVirtual<const uint8_t*>(block + 16);
+    if (q == nullptr) return false;
+    return rex::memory::load_and_swap<uint32_t>(q) != 0;
+  }
+
+  // Deliver deferred command-stream interrupts. Called from the vsync thread
+  // each tick: once the callback slot is non-null (or the bound expires), every
+  // held interrupt is dispatched in submission order.
+  void DeliverPendingCsInterrupts() {
+    std::vector<uint32_t> masks;
+    {
+      std::lock_guard<std::mutex> lock(pending_cs_mutex_);
+      if (pending_cs_.empty()) return;
+      if (!GuestCsCallbackReady() && pending_cs_ticks_++ < 600) return;
+      masks.swap(pending_cs_);
+      pending_cs_ticks_ = 0;
+    }
+    for (uint32_t mask : masks) {
+      for (uint32_t n = 0; n < 6; ++n) {
+        if (mask & (1u << n)) DispatchInterrupt(1, n);
+      }
+    }
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_WARN("rexgpu-plume: first deferred command-stream interrupt delivered "
+                  "(callback ready={})", GuestCsCallbackReady());
     }
   }
 
@@ -489,6 +668,13 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t packets_ = 0;
   uint64_t indirect_buffers_ = 0;
   uint64_t cs_interrupts_ = 0;
+  uint64_t waits_ = 0;
+  uint64_t scratch_writebacks_ = 0;
+  uint64_t fences_ = 0;
+  uint32_t swaps_ = 0;
+  std::mutex pending_cs_mutex_;
+  std::vector<uint32_t> pending_cs_;
+  uint32_t pending_cs_ticks_ = 0;
   bool opcode_seen_[128] = {};
   std::vector<uint32_t> reg_reads_ = std::vector<uint32_t>(kRegisterCount, 0);
   uint64_t wptr_writes_ = 0;

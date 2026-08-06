@@ -14,6 +14,9 @@
 #include <rex/system/xtypes.h>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+
+#include <fmt/format.h>
 
 // Return a zero result from a stub (r3 = 0)
 #define DT_STUB_RETURN(name, val) \
@@ -214,7 +217,25 @@ const uint8_t* PatchTestResolve(uint32_t ea, void* ctx) {
     }
 
 // ── Graphics / GPU trace hooks ────────────────────────────────────────────────
-DT_TRACE_HOOK(sub_822346A0, daytona_debug::HookId::kD3DInterruptCallback)  // D3D_InterruptCallback (ring.obj)
+// D3D_InterruptCallback. The source-1 (command stream) path reads a callback
+// out of [[r4+11028]+16] and invokes it with [[r4+11028]+20]; that callback is
+// what enqueues a swap for retirement, and the boot hang is that it never
+// runs. Log exactly what the ISR sees at that decision, on the source-1 calls
+// only -- the 60/s source-0 vblanks would drown everything.
+REX_HOOK_RAW(sub_822346A0) {
+    daytona_debug::RecordHook(daytona_debug::HookId::kD3DInterruptCallback, ctx);
+    if (ctx.r3.u32 == 1) {
+        static uint32_t calls = 0;
+        if (++calls <= 8) {
+            const uint32_t block = REX_LOAD_U32(ctx.r4.u32 + 11028);
+            const uint32_t cb = block != 0 ? REX_LOAD_U32(block + 16) : 0;
+            const uint32_t cb_ctx = block != 0 ? REX_LOAD_U32(block + 20) : 0;
+            REXLOG_WARN("Daytona ISR source-1 #{}: device={:08X} block={:08X} callback={:08X} "
+                        "ctx={:08X}", calls, ctx.r4.u32, block, cb, cb_ctx);
+        }
+    }
+    __imp__sub_822346A0(ctx, base);
+}
 // sub_82234FA8 = GPU descriptor submit. The old DESC diagnostic hook dumped
 // guest memory at the raw register values (r3,r4,r8,r9,r10); when a register
 // held a non-pointer like 0x81000000 (>=0x70000000 so it passed the weak
@@ -292,7 +313,95 @@ REX_HOOK_RAW(sub_822337C0) {
                     submitted, diff, guest_vblanks, queue_head, queue_tail, device);
     }
 }
-DT_TRACE_HOOK(sub_82235B20, daytona_debug::HookId::kD3DKickOff)  // D3D_CDevice_KickOff (ring.obj)
+// The swap-notify path, i.e. the two functions that can ever RETIRE a swap.
+//
+// sub_82233568 is reached only indirectly -- it is the callback the ISR
+// (sub_822346A0) invokes through [device+11028]+16 on a SOURCE-1 interrupt.
+// It either retires the swap immediately (bumps device+16848) or enqueues it
+// at device+16980/16984 for sub_82233448 to retire at its target vblank.
+//
+// The boot hang is "submitted=1 outstanding=1, queue empty, forever", and
+// these two hooks split that into cases that need opposite fixes: if 3568
+// never logs, the source-1 interrupt is not reaching D3D's callback (a plugin
+// problem); if it logs and nothing retires, the enqueue's conditions are
+// being read wrong (a decode problem).
+REX_HOOK_RAW(sub_82233568) {
+    static uint32_t calls = 0;
+    if (++calls <= 8) {
+        REXLOG_WARN("Daytona swap-notify ENTER #{} r3={:08X} r4={:08X}", calls, ctx.r3.u32,
+                    ctx.r4.u32);
+    }
+    __imp__sub_82233568(ctx, base);
+    if (calls <= 8) {
+        REXLOG_WARN("Daytona swap-notify EXIT  #{}", calls);
+    }
+}
+// Ring-cursor telemetry, 1/s from the vblank-adjacent audio thread... actually
+// from wherever this hook runs; the POINT is it runs under BOTH GPU plugins so
+// the words the ring-space spin (loc_82234B28) compares can be diffed:
+//   [dev+11024] -> POINTER to the read-pointer writeback; its target value
+//   [dev+11036] monotonic write cursor, [dev+11040] (whatever sits next).
+// The spin is: space_needed = cursor - r30; in_flight = cursor - *writeback;
+// wait while space_needed < in_flight.
+void DumpRingCursors(const uint8_t* base, const char* tag) {
+    const uint32_t dev = 0xA5701980u;
+    const uint32_t wb_ptr = REX_LOAD_U32(dev + 11024);
+    const uint32_t wb = wb_ptr != 0 ? REX_LOAD_U32(wb_ptr) : 0xDEADDEAD;
+    REXLOG_WARN("Daytona ring-cursors[{}]: wb_ptr={:08X} *wb={:08X} cursor={:08X} +11040={:08X} "
+                "+11032={:08X}",
+                tag, wb_ptr, wb, REX_LOAD_U32(dev + 11036), REX_LOAD_U32(dev + 11040),
+                REX_LOAD_U32(dev + 11032));
+    // The whole fence-slot array. The pointer above moves through it (observed
+    // at ...920 under xenos and ...940 under plume at the same boot stage), so
+    // one slot's value answers nothing -- the array does.
+    std::string slots;
+    for (uint32_t i = 0; i < 16; ++i) {
+        slots += fmt::format("{:08X} ", REX_LOAD_U32(0xA5707920u + i * 4));
+    }
+    REXLOG_WARN("Daytona fence-slots @A5707920: {}", slots);
+}
+
+// The ring-space wait step. The allocator (sub_82234AC8) parks in a loop that
+// calls this each poll; its argument is the wait-iterator struct on the
+// caller's stack. Dumping that struct IS the parked comparison -- no more
+// guessing at which field means what from the disassembly.
+REX_HOOK_RAW(sub_82228FB0) {
+    static uint64_t calls = 0;
+    ++calls;
+    if (calls <= 4 || (calls % 1000000) == 0) {
+        const uint32_t it = ctx.r3.u32;
+        REXLOG_WARN("Daytona ring-wait poll #{}: it={:08X} [0]={:08X} [4]={:08X} [8]={:08X} "
+                    "[12]={:08X} [16]={:08X}",
+                    calls, it, REX_LOAD_U32(it), REX_LOAD_U32(it + 4), REX_LOAD_U32(it + 8),
+                    REX_LOAD_U32(it + 12), REX_LOAD_U32(it + 16));
+    }
+    __imp__sub_82228FB0(ctx, base);
+    if (calls <= 4) {
+        REXLOG_WARN("Daytona ring-wait poll #{} result={:08X}", calls, ctx.r3.u32);
+    }
+}
+
+// KickOff, with EXIT logging: under plume the main thread's last event was
+// entry #11 (lr=82234B28, r4=0x17) and nothing after -- but the trace macro
+// logs entries only, so "parked inside" and "returned and went quiet" look
+// identical. The exit line is what separates them.
+REX_HOOK_RAW(sub_82235B20) {
+    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DKickOff, ctx);
+    if (ShouldLog(n)) LogGuestCall("sub_82235B20", n, ctx);
+    const bool log_exit = n < 40;
+    // The kick fence. 05707920 (physical; A-alias here) is where the stream's
+    // EVENT_WRITE_SHD packets report GPU progress -- diagnosis hardcode, tied
+    // to this boot's allocation, fine for a one-question instrument.
+    if (log_exit) {
+        REXLOG_WARN("Daytona KickOff enter #{} r4={:02X} fence={:08X}", n, ctx.r4.u32,
+                    REX_LOAD_U32(0xA5707920u));
+    }
+    __imp__sub_82235B20(ctx, base);
+    if (log_exit) {
+        REXLOG_WARN("Daytona KickOff exit #{} fence={:08X}", n, REX_LOAD_U32(0xA5707920u));
+        DumpRingCursors(base, "kickoff");
+    }
+}
 DT_TRACE_HOOK(sub_82235D58, daytona_debug::HookId::kD3DBeginRingBig)  // D3D_CDevice_BeginRingBig (ring.obj)
 REX_HOOK_RAW(sub_82233C80) {
     // spike/d3d9-hook-trace phase 0: this is D3DDevice_Swap (confirmed against
@@ -630,6 +739,10 @@ REX_HOOK_RAW(AudioSubmitRenderFrame) {
     const bool log = n <= 8 || (n % 5000) == 0;
     if (log)
         LogGuestCall("AudioSubmitRenderFrame", n, ctx);
+    // Piggyback the ring-cursor telemetry on the audio pump (~180/s): it runs
+    // on its own thread, so it keeps reporting while the render thread is
+    // parked in the ring-space spin -- which is exactly when it is needed.
+    if ((n % 600) == 0) DumpRingCursors(base, "periodic");
     __imp__sub_8242E038(ctx, base);
 }
 
