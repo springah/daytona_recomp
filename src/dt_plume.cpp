@@ -324,6 +324,13 @@ bool g_statecensus = false;
 // DT_PLUME_DEPTHSTATE=0 reverts to the old behaviour (no depth test at all,
 // submission order decides), which is the A/B for anything this changes.
 bool g_depthstate = true;
+
+// How many bytes a TILED texture's source occupies. DT_PLUME_TEXEXTENT=0
+// restores the short pitch*height*bpp rectangle, which is the A/B for
+// everything this changes: with it the floodlight lamps and the guideway
+// columns come back cut in half. See TiledSourceBytes.
+bool g_texextent = true;
+
 struct StateSample {
     uint32_t depth = 0;      // RB_DEPTHCONTROL
     uint32_t color = 0;      // RB_COLORCONTROL
@@ -721,6 +728,13 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_SWAPPRESENT")) g_swap_present = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_STATECENSUS")) g_statecensus = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_DEPTHSTATE")) g_depthstate = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_TEXEXTENT")) g_texextent = std::atoi(p) != 0;
+    REXLOG_WARN("plume: a tiled texture's source extent is {} (DT_PLUME_TEXEXTENT={})",
+                g_texextent ? "rexglue's GetTiledAddressUpperBound2D -- the address range the "
+                              "tiler actually uses"
+                            : "OFF -- pitch*height*bpp, which drops rows 16..31 of every 32-wide "
+                              "2-byte texture",
+                g_texextent ? 1 : 0);
     if (const char* p = std::getenv("DT_PLUME_MESHDUMP")) {
         g_meshdump_dir = p;
         if (const char* v = std::getenv("DT_PLUME_MESHEVERY")) g_meshdump_every = std::atoi(v);
@@ -1571,6 +1585,44 @@ int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytes_per_b
            (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
 }
 
+// How many bytes a TILED surface actually occupies, in blocks.
+//
+// ⚠ It is NOT aligned_pitch * aligned_height * block_bytes, and believing that
+// it was is what cut the bottom half off every 32-wide k_8_8 texture in the
+// game. The Xenos tiled address is not a permutation of a rectangle: rows with
+// (y & 16) set carry a +0x800 term (see TiledOffset2D's `((y & 16) << 7)`), so
+// for a 2-byte element a 32x32 tile spans 0xC00 bytes, not 32*32*2 = 0x800.
+// The callers use this bound both to ask for guest memory and to reject a texel
+// whose address runs past it -- with the short bound every texel in rows 16..31
+// of a 32x32 k_8_8 tripped that rejection and was left as the ZERO the staging
+// buffer was resized to. Zero in a k_8_8 is alpha 0, and the pixel shader
+// alpha-tests (`discard` when tex.a * COLOR0.a < c0.w), so those texels were
+// not merely dark -- they were DISCARDED, and the sky showed through the lower
+// half of every lamp on a floodlight and the lower length of every guideway
+// column.
+//
+// Mirrored from rexglue's graphics/pipeline/texture/util.cpp
+// GetTiledAddressUpperBound2D, including its per-element-size extents (0xA00
+// for 1-byte, 0xC00 for 2-byte, 0x400 << log2 above that) -- the same reason
+// TiledOffset2D is copied here rather than linked.
+uint32_t TiledSourceBytes(uint32_t width_blocks, uint32_t height_blocks, uint32_t pitch_blocks,
+                          uint32_t block_log2) {
+    if (width_blocks == 0 || height_blocks == 0) return 0;
+    const uint32_t tile = 32u;
+    if (!g_texextent) {
+        return ((pitch_blocks + 31u) & ~31u) * ((height_blocks + 31u) & ~31u) * (1u << block_log2);
+    }
+    uint32_t bound = uint32_t(TiledOffset2D(int32_t((width_blocks - 1u) & ~(tile - 1u)),
+                                            int32_t((height_blocks - 1u) & ~(tile - 1u)),
+                                            pitch_blocks, block_log2));
+    switch (block_log2) {
+        case 0:  bound += 0xA00u; break;   // 1-byte blocks: 128x128 independent
+        case 1:  bound += 0xC00u; break;   // 2-byte blocks: 64x64 independent
+        default: bound += 0x400u << block_log2; break;
+    }
+    return bound;
+}
+
 // One texture ready to upload: rows packed tightly, in a format plume takes.
 //
 // Rows are rows of BLOCKS, not of texels, so the compressed and uncompressed
@@ -1690,7 +1742,7 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
         // that this is the block interpretation and not a second algorithm.
         const uint32_t block_log2 = (block_bytes == 8u) ? 3u : 4u;
         const uint32_t needed =
-            t.tiled ? (((src_blocks + 31u) & ~31u) * ((out.rows + 31u) & ~31u) * block_bytes)
+            t.tiled ? TiledSourceBytes(src_blocks, out.rows, src_blocks, block_log2)
                     : (src_blocks * block_bytes * out.rows);
         out.source_bytes = needed;
         const uint8_t* src = ResolveTextureMemory(t, base, needed, &out.source_alias);
@@ -1742,7 +1794,7 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
         constexpr uint32_t kTexelBytes = 2u;
         constexpr uint32_t kTexelLog2 = 1u;
         const uint32_t needed =
-            t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * kTexelBytes)
+            t.tiled ? TiledSourceBytes(src_pitch, t.height, src_pitch, kTexelLog2)
                     : (src_pitch * t.height * kTexelBytes);
         out.source_bytes = needed;
         const uint8_t* src = ResolveTextureMemory(t, base, needed, &out.source_alias);
@@ -1803,7 +1855,7 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
 
     const uint32_t pitch_texels = t.pitch * 32u;
     const uint32_t src_pitch = std::max(pitch_texels, t.width);
-    const uint32_t needed = t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * 4u)
+    const uint32_t needed = t.tiled ? TiledSourceBytes(src_pitch, t.height, src_pitch, 2u)
                                     : (src_pitch * t.height * 4u);
     out.source_bytes = needed;
     const uint8_t* src = ResolveTextureMemory(t, base, needed, &out.source_alias);
