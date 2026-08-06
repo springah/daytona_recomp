@@ -55,6 +55,7 @@ std::unique_ptr<plume::RenderPipelineLayout> g_pipeline_layout;
 enum class IndexState { kNone, kReady, kFailed };
 constexpr uint32_t kMaxExpandVerts = 4096;
 constexpr uint32_t kSnapshotsPerShader = 2;
+constexpr uint32_t kMaxLayoutVersionsLogged = 8;
 IndexState g_index_state = IndexState::kNone;
 std::unique_ptr<plume::RenderBuffer> g_quad_indices;
 std::unique_ptr<plume::RenderBuffer> g_fan_indices;
@@ -87,6 +88,16 @@ struct FetchedAttribute {
     // instead collapses a de-interleaved layout: every attribute sits at
     // offset 0 with the same stride, so they would all alias slot 0.
     uint32_t fetch_const = 0;
+
+    // "Is this the same layout the runtime patched last time?" -- asked once
+    // per draw, so it must not be a string compare or a re-decode.
+    bool operator==(const FetchedAttribute& o) const {
+        return usage == o.usage && usage_index == o.usage_index &&
+               instruction == o.instruction && format == o.format && stride == o.stride &&
+               offset == o.offset && normalized == o.normalized && is_signed == o.is_signed &&
+               fetch_const == o.fetch_const;
+    }
+    bool operator!=(const FetchedAttribute& o) const { return !(*this == o); }
 };
 
 struct Created {
@@ -101,6 +112,11 @@ struct Created {
     bool diagnosed_stored = false;      // DeriveVertexLayouts' unpatched dump
     bool diagnosed_incremental = false; // OnIncrementalPatch's anchor dump
     bool logged_placeholder = false;    // ucode still holds placeholder operands
+    // How many DISTINCT layouts the runtime has patched into this shader. More
+    // than one is normal and is the whole reason a combination latches its own
+    // copy; it is logged (bounded) because a shader that flips layouts is worth
+    // knowing about when a combination renders wrong.
+    uint32_t layout_versions = 0;
     std::vector<FetchedAttribute> attributes;
     uint32_t snapshots = 0;
     bool snapshot_overflow = false;
@@ -166,6 +182,16 @@ struct Combo {
     // cannot be recomputed from the shader alone.
     std::vector<plume::RenderInputSlot> slots;
     std::vector<uint32_t> slot_consts;   // slot -> fetch constant (i.e. stream)
+    // THE LAYOUT IS PER COMBINATION, NOT PER SHADER. D3D9 re-patches a shader's
+    // vfetch every time the declaration or the stream strides change, so a
+    // shader has as many layouts as it has uses: vs_bbb7 draws both from one
+    // interleaved 24-byte buffer (offsets 0/12/16 on fetch constant 95) and
+    // from three de-interleaved streams (offset 0 on constants 95/92/87).
+    // Keeping one layout per SHADER means whichever use patched first wins and
+    // the others read garbage. Latched on this combination's first recorded
+    // draw -- the patch that ran for that draw is by definition its own.
+    std::vector<FetchedAttribute> attributes;
+    bool layout_latched = false;
     // Draws this combination has actually recorded into a frame -- distinct
     // from `draws` above, which counts every draw the GAME made whether or not
     // the renderer could reproduce it. Used only to bound logging now that
@@ -213,10 +239,6 @@ uint32_t g_decl_count = 0;
 uint32_t g_decl_overflow = 0;
 uint64_t g_incremental_calls = 0;
 uint64_t g_vfetch_patches = 0;
-// sub_82231BF8 runs ~300 times a second and takes the mutex, so it needs a
-// lock-free way to say "nothing left to learn". Set whenever every created
-// vertex shader has a layout, cleared when a new vertex shader appears.
-std::atomic<bool> g_vfetch_watch_idle{false};
 
 unsigned long g_render_thread = 0;
 bool g_thread_warned = false;
@@ -428,17 +450,6 @@ const char* UsageName(uint8_t usage) {
     }
 }
 
-// Called with g_mutex held after anything that could complete a layout. Once
-// every created vertex shader has one, the sub_82231BF8 watcher can early-out
-// without taking the lock at all.
-void RefreshVfetchWatch() {
-    bool idle = true;
-    for (const auto& [hash, s] : g_shaders) {
-        if (s.entry != nullptr && s.entry->is_vertex && !s.layout_done) { idle = false; break; }
-    }
-    g_vfetch_watch_idle.store(idle, std::memory_order_relaxed);
-}
-
 // Decode one vfetch instruction (3 big-endian dwords) into an attribute. The
 // field polarities are the ones ucode.h:716-718 documents; see FetchedAttribute.
 FetchedAttribute DecodeVfetch(uint32_t w0, uint32_t w1, uint32_t w2) {
@@ -584,7 +595,6 @@ void OnShaderCreated(uint64_t container_hash, bool is_vertex) {
     }
 
     g_shaders.emplace(container_hash, std::move(created));
-    RefreshVfetchWatch();   // a new vertex shader re-arms the patch watcher
 }
 
 void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash,
@@ -724,7 +734,6 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
             REXLOG_WARN("      ^^ UNMAPPED GPUVERTEXFORMAT {}", a.format);
         }
     }
-    RefreshVfetchWatch();
 }
 
 // sub_82231BF8 -- the leaf that actually rewrites the vfetch operands. See the
@@ -740,9 +749,6 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
 void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
                    uint32_t variant, GuestResolve resolve, void* ctx) {
     if (!Enabled() || ucode_ea == 0 || resolve == nullptr) return;
-    // ~300 calls/second once the race is running; every one of them would
-    // otherwise contend for the same mutex the draw path uses.
-    if (g_vfetch_watch_idle.load(std::memory_order_relaxed)) return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
     ++g_vfetch_patches;
@@ -752,7 +758,11 @@ void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
     auto sit = g_shaders.find(oit->second);
     if (sit == g_shaders.end() || sit->second.entry == nullptr) return;
     Created& s = sit->second;
-    if (!s.entry->is_vertex || s.layout_done || s.entry->element_count == 0) return;
+    if (!s.entry->is_vertex || s.entry->element_count == 0) return;
+    // Deliberately NOT gated on layout_done: this runs on every re-patch, and a
+    // re-patch is how a shader's SECOND use announces its different layout.
+    // Measured ~300 calls a second against ~10k draws, so tracking all of them
+    // costs a mutex the draw path was taking anyway.
 
     // Instructions are addressed from ucode_ea by instruction NUMBER, so the
     // read span is fixed by the highest element the container declares.
@@ -811,13 +821,16 @@ void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
         }
         attrs.push_back(a);
     }
-    if (attrs.empty()) return;
+    if (attrs.empty() || attrs == s.attributes) return;   // unchanged: nothing to say
 
     s.attributes = std::move(attrs);
     s.layout_done = true;
-    REXLOG_WARN("plume: vertex layout for {} via the VFETCH PATCHER sub_82231BF8 "
+    // Bounded: a shader with two uses re-patches thousands of times as the game
+    // alternates between them, and logging every flip would bury the log.
+    if (++s.layout_versions > kMaxLayoutVersionsLogged) return;
+    REXLOG_WARN("plume: vertex layout {} for {} via the VFETCH PATCHER sub_82231BF8 "
                 "(ucode {:08X}, variant {}, decl {:08X} -- decl=0 is the 83%-of-draws case)",
-                s.entry->name, ucode_ea, variant, decl_ea);
+                s.layout_versions, s.entry->name, ucode_ea, variant, decl_ea);
     for (const auto& a : s.attributes) {
         const auto rf = ToRenderFormat(a.format, a.normalized, a.is_signed);
         REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {:<4} "
@@ -829,7 +842,6 @@ void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
             REXLOG_WARN("      ^^ UNMAPPED GPUVERTEXFORMAT {}", a.format);
         }
     }
-    RefreshVfetchWatch();
 }
 
 bool BuildIndexBuffers() {
@@ -917,7 +929,20 @@ void SnapshotDrawVertices(const uint8_t* base) {
     // The real work: upload this draw's vertex data and record it into the
     // frame. Kept ahead of the logging below because it is now the point.
     if (g_draw_combo < g_combo_count) {
-        DrawIntoFrame(g_combos[g_draw_combo], s, start_vertex, vertex_count, base);
+        Combo& c = g_combos[g_draw_combo];
+        // Latch this combination's layout. THIS is the moment it is correct:
+        // the draw's own state flush (inside __imp__, which has already run)
+        // is what re-patched the vfetch, so the shader's current attributes
+        // describe THIS draw and no other. Re-latched while the pipeline is
+        // still pending -- a combination seen before its shader was ever
+        // patched would otherwise be stuck with nothing forever -- and frozen
+        // once built, since the pipeline's input layout cannot change.
+        if (c.pipeline_state == PipelineState::kPending && !s.attributes.empty() &&
+            (!c.layout_latched || c.attributes != s.attributes)) {
+            c.attributes = s.attributes;
+            c.layout_latched = true;
+        }
+        DrawIntoFrame(c, s, start_vertex, vertex_count, base);
     }
 
     if (s.snapshots >= kSnapshotsPerShader) return;
@@ -1747,7 +1772,8 @@ bool EnsureOffscreen() {
 // undoes that. Bytes not covered by any attribute are copied through untouched
 // rather than zeroed -- padding we have not identified is not the same thing as
 // padding we know to be unused.
-bool BuildSlotBytes(const Created& s, uint32_t fetch_const, uint32_t stride,
+bool BuildSlotBytes(const std::vector<FetchedAttribute>& attributes,
+                    uint32_t fetch_const, uint32_t stride,
                     uint32_t start_vertex, uint32_t vertex_count, const uint8_t* base,
                     std::vector<uint8_t>& out, uint32_t& out_src_ea) {
     out_src_ea = 0;
@@ -1770,7 +1796,7 @@ bool BuildSlotBytes(const Created& s, uint32_t fetch_const, uint32_t stride,
     out.assign(src, src + bytes);
     out_src_ea = src_ea;
 
-    for (const auto& a : s.attributes) {
+    for (const auto& a : attributes) {
         if (a.fetch_const != fetch_const) continue;
         const uint32_t comp = ComponentBytes(a.format);
         const uint32_t width = AttributeBytes(a.format);
@@ -1898,8 +1924,8 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     for (uint32_t sl = 0; sl < c.slots.size(); ++sl) {
         std::vector<uint8_t> bytes;
         uint32_t src_ea = 0;
-        if (!BuildSlotBytes(s, c.slot_consts[sl], c.slots[sl].stride, start_vertex, vertex_count,
-                            base, bytes, src_ea)) {
+        if (!BuildSlotBytes(c.attributes, c.slot_consts[sl], c.slots[sl].stride, start_vertex,
+                            vertex_count, base, bytes, src_ea)) {
             // Once per combination: this runs on every draw now, and a stream
             // that is unreadable once is unreadable every frame.
             if (!c.warned_unreadable) {
@@ -2413,7 +2439,7 @@ void BuildPipelines(const char* reason) {
         auto ps = g_shaders.find(c.ps);
         if (vs == g_shaders.end() || ps == g_shaders.end() ||
             vs->second.shader == nullptr || ps->second.shader == nullptr ||
-            !vs->second.layout_done) {
+            !c.layout_latched || c.attributes.empty()) {
             ++waiting;
             continue;
         }
@@ -2426,7 +2452,7 @@ void BuildPipelines(const char* reason) {
         std::vector<uint32_t> slot_consts;
         std::vector<plume::RenderInputElement> elements;
         bool usable = true;
-        for (const auto& a : vs->second.attributes) {
+        for (const auto& a : c.attributes) {
             const auto fmt = ToRenderFormat(a.format, a.normalized, a.is_signed);
             if (fmt == plume::RenderFormat::UNKNOWN) {
                 REXLOG_WARN("plume: combo {} unusable -- {}{} has unmapped GPUVERTEXFORMAT {}",
@@ -2700,7 +2726,6 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
                     "(pending = shader not bound yet, so not patched yet)",
                     reason, derived, pending);
     }
-    RefreshVfetchWatch();
 }
 
 void OnSetVertexShader(uint32_t shader_ea) {
