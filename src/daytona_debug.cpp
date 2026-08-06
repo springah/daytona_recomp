@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 namespace daytona_debug {
@@ -244,12 +245,30 @@ void LogCensus(const char* reason) {
     // storage gate and not even polling input" -- and the futari
     // XMsgInProcessCall history says the second failure mode is real.
     const Snapshot s = GetSnapshot();
+    size_t fired = 0;
+    for (const auto& h : s.hooks) fired += (h.count != 0);
+
+    // The full table is ~85 lines and it prints every 1800 frames plus at
+    // shutdown, which is most of a default log. It is a boot-diagnosis
+    // instrument, so it prints under DT_TRACE_D3D9=1 -- the same switch as the
+    // D3D9 call-trace census, because they answer the same kind of question.
+    // What survives the gate is the stage and the fired count, which is what
+    // says "parked on a menu" versus "not even polling input".
+    static const bool verbose = [] {
+        const char* p = std::getenv("DT_TRACE_D3D9");
+        return p != nullptr && std::atoi(p) != 0;
+    }();
+    if (!verbose) {
+        REXLOG_WARN("Daytona hook census ({}): stage={} uptime={:.1f}s, {} of {} hooks fired "
+                    "(set DT_TRACE_D3D9=1 for the full table)",
+                    reason, StageName(s.stage), s.uptime_seconds, fired, s.hooks.size());
+        return;
+    }
+
     REXLOG_WARN("===== DAYTONA HOOK CENSUS ({}) stage={} uptime={:.1f}s =====",
                 reason, StageName(s.stage), s.uptime_seconds);
-    size_t fired = 0;
     for (const auto& h : s.hooks) {
         if (h.count == 0) continue;
-        ++fired;
         REXLOG_WARN("  {:>9}  {:<44} last={:.1f}s r3={:08X} r4={:08X}",
                     h.count, h.name, h.last_seen_seconds, h.r3, h.r4);
     }
