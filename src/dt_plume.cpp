@@ -1996,6 +1996,9 @@ struct TexCache {
     uint32_t source_bytes = 0;
     uint32_t source_alias = 0;
     uint64_t probe = 0;        // sampled hash of the source at upload time
+    // g_frame_index + 1 of the last frame the probe ran for this entry, so that
+    // 0 does not match frame 0. See ProbeDue.
+    uint32_t probe_frame = 0;
     uint32_t resolve_stamp = 0;   // g_resolve_written value the upload saw
     uint32_t reuploads = 0;
     // Set by OnGpuCacheInvalidate when the guest says it rewrote memory this
@@ -2194,6 +2197,24 @@ uint64_t ProbeSource(const DecodedTexture& t, uint32_t alias, uint32_t source_by
     return h;
 }
 
+// Should this cache entry's source be probed on this bind?
+//
+// The probe answers "is this still the same art", and art changes BETWEEN
+// frames, not between two draws of the same frame. It used to run on every bind
+// of every sampler slot of every draw: MEASURED at 214,139 calls per 300 frames
+// in a race, i.e. ~714 a frame for the few hundred distinct textures a frame
+// actually binds. Once per entry per frame asks the same question of the same
+// bytes and gets the same answer, and it costs detection nothing: a rewrite is
+// still caught on the first bind of the following frame.
+//
+// Deliberately NOT a longer backoff (probe every Nth frame once an address has
+// been still for a while). It was measured at 125ms of a 2,689ms `record`, so
+// the extra saving would be a fraction of a fraction, and it would buy that with
+// frames of latency on exactly the guest UI rewrites this probe exists to catch.
+bool ProbeDue(const TexCache& c) {
+    return c.probe_frame != g_frame_index + 1u;
+}
+
 // The component mapping that makes sampling the mirror identical to sampling
 // what the scatter + unpack round trip would have produced. See the resolve
 // mirror block above for the derivation; this is that derivation, spelled.
@@ -2257,9 +2278,13 @@ uint32_t EnsureMirrorSlot(uint64_t key, const DecodedTexture& t) {
 //
 // A cache HIT still has to ask whether the bytes are the ones that were
 // uploaded. See TexCache for what happened when it did not.
-uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
+//
+// The decoded fetch constant comes back out through `t`: the caller needs it
+// too, for EnsureSampler, and decoding it twice per slot per draw was 16 reads
+// of guest memory a draw for an answer we already had.
+uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t) {
+    t = ReadTextureFetchConstant(sampler, base);
     if (g_control_texture_only) return 0;   // every slot is the checker
-    const DecodedTexture t = ReadTextureFetchConstant(sampler, base);
     if (!t.valid) return UINT32_MAX;
     const uint64_t key = TextureCacheKey(t);
 
@@ -2301,9 +2326,11 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
             // The guest's own signal, so it is exact -- and it is checked
             // BEFORE the probe because it is also the cheaper question.
             why = "InvalidateGpuCache";
-        } else if (g_texprobe &&
-                   ProbeSource(t, c.source_alias, c.source_bytes, base) != c.probe) {
-            why = "contents changed";
+        } else if (g_texprobe && ProbeDue(c)) {
+            c.probe_frame = g_frame_index + 1u;
+            if (ProbeSource(t, c.source_alias, c.source_bytes, base) != c.probe) {
+                why = "contents changed";
+            }
         }
         if (why == nullptr) return c.slot;
 
@@ -3057,7 +3084,8 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     {
     ProfMs prof_tex(g_ms_p_tex);
     for (uint32_t s_i = 0; s_i < 8; ++s_i) {
-        const uint32_t slot = EnsureTexture(s_i, base);
+        DecodedTexture t;
+        const uint32_t slot = EnsureTexture(s_i, base, t);
         if (slot == UINT32_MAX) {
             // ⚠ Leaving the index at 0 is not "no texture" -- 0 is the control
             // CHECKER, and a shader that adds its sampler instead of modulating
@@ -3071,7 +3099,7 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
             continue;
         }
         shared[s_i / 4][s_i % 4] = slot;
-        shared[12 + s_i / 4][s_i % 4] = EnsureSampler(ReadTextureFetchConstant(s_i, base));
+        shared[12 + s_i / 4][s_i % 4] = EnsureSampler(t);
     }
     }
     // Once per combination: this runs on every draw and the answer is a
