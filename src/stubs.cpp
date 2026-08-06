@@ -295,6 +295,60 @@ REX_HOOK_RAW(sub_82131088) {
     }
 }
 DT_TRACE_HOOK(sub_8223CF68, daytona_debug::HookId::kD3DWorkerThread)  // D3D_WorkerThread (xps.obj)
+// The XPS command-buffer PLAYER (worker-side). Decoded from the disassembly:
+// r31=[r30+0] is the player-state block; the walk executes tokens where
+// 0x8C.. sets the segment callback [r31+16], 0x8D.. sets flags [r31+360],
+// CONDITIONAL segments are SKIPPED when ([r31+360] & [r31+356]) == 0, and the
+// 0xC0000000 END token calls sub_8223BFE0 which returns 0 (done) only while
+// the end word has no continuation chained after it.
+//
+// Under xenos this player runs ~6 times at boot and stops; under plume it
+// replays at 65kHz forever. These dumps exist to DIFF those two runs: the
+// word that differs by round 6 is the completion the guest is waiting for.
+REX_HOOK_RAW(sub_8223CCA8) {
+    static uint64_t calls = 0;
+    ++calls;
+    const bool log = calls <= 24 || (calls % 100000) == 0;
+    const uint32_t wrk = ctx.r3.u32;
+    const uint32_t ply = REX_LOAD_U32(wrk + 0);
+    auto dump = [&](const char* tag) {
+        REXLOG_WARN("Daytona xps-play {} #{}: wrk={:08X} cpu={} prod={} cons={} slots "
+                    "{:08X} {:08X} {:08X} {:08X} | ply={:08X} kick[+56]={:08X} "
+                    "plays[+60]={} [+64]={:08X} [+72]={:08X} nest[+100]={} mask[+356]={:08X} "
+                    "flags[+360]={:08X} cb[+16]={:08X} resume[+36]={:08X}",
+                    tag, calls, wrk, REX_LOAD_U32(wrk + 4), REX_LOAD_U32(wrk + 84),
+                    REX_LOAD_U32(wrk + 88), REX_LOAD_U32(wrk + 92), REX_LOAD_U32(wrk + 96),
+                    REX_LOAD_U32(wrk + 100), REX_LOAD_U32(wrk + 104), ply,
+                    REX_LOAD_U32(ply + 56), REX_LOAD_U32(ply + 60), REX_LOAD_U32(ply + 64),
+                    REX_LOAD_U32(ply + 72), REX_LOAD_U32(ply + 100), REX_LOAD_U32(ply + 356),
+                    REX_LOAD_U32(ply + 360), REX_LOAD_U32(ply + 16), REX_LOAD_U32(ply + 36));
+    };
+    if (log) dump("enter");
+    __imp__sub_8223CCA8(ctx, base);
+    if (log) dump("exit ");
+}
+// The END-token handler. Returns 0 = playback complete, else the address to
+// continue at (a continuation was appended while we played). r5 points at the
+// end word itself; its value AFTER the call says whether the chain grew.
+REX_HOOK_RAW(sub_8223BFE0) {
+    static uint64_t calls = 0;
+    ++calls;
+    const bool log = calls <= 24 || (calls % 100000) == 0;
+    const uint32_t ply = ctx.r3.u32;
+    const uint32_t end_ea = ctx.r5.u32;
+    const uint32_t word_before = REX_LOAD_U32(end_ea + 0);
+    if (log) {
+        REXLOG_WARN("Daytona xps-end enter #{}: ply={:08X} end@{:08X}={:08X} plays[+60]={} "
+                    "kick[+56]={:08X} [+64]={:08X} [+72]={:08X}",
+                    calls, ply, end_ea, word_before, REX_LOAD_U32(ply + 60),
+                    REX_LOAD_U32(ply + 56), REX_LOAD_U32(ply + 64), REX_LOAD_U32(ply + 72));
+    }
+    __imp__sub_8223BFE0(ctx, base);
+    if (log) {
+        REXLOG_WARN("Daytona xps-end exit  #{}: result={:08X} end-word now {:08X} plays[+60]={}",
+                    calls, ctx.r3.u32, REX_LOAD_U32(end_ea + 0), REX_LOAD_U32(ply + 60));
+    }
+}
 DT_TRACE_HOOK(sub_82233C78, daytona_debug::HookId::kD3DSyncToPresentation)      // D3DDevice_SynchronizeToPresentationInterval (swap.obj)
 // The boot present's wait loop. sub_82130D68 calls this repeatedly and spins
 // until the third dword it writes reaches zero:

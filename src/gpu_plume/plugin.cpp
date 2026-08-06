@@ -378,6 +378,29 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
     // Type 3.
     if (reader->read_count() < count * sizeof(uint32_t)) return false;
     const uint32_t opcode = (packet >> 8) & 0x7F;
+    // ── PREDICATION (packet bit 0 + BIN_SELECT/BIN_MASK) ──────────────────────
+    // Reference: command_processor.cpp:861-871. Every type-3 packet whose low
+    // bit is set executes only if (bin_select_ & bin_mask_) != 0; predicated
+    // swaps never execute. THIS is what ends the XPS replay storm: the played
+    // command buffer predicates its re-kick block, the real CP skips it once
+    // the bins stop intersecting, and a drain without this check fires the
+    // ghost kick every round -- measured as prod racing cons 6:1 on the SAME
+    // buffer and the player's [+64] counter decrementing past zero, where
+    // xenos holds prod=cons+1 with a fresh buffer per frame.
+    static const bool no_bin = std::getenv("DT_PLUME_NOBIN") != nullptr;
+    if (!no_bin && (packet & 1)) {
+      const bool any_pass = (bin_select_ & bin_mask_) != 0;
+      if (!any_pass || opcode == 0x64 /* XE_SWAP */) {
+        if (predicated_skips_ < 8) {
+          REXLOG_WARN("rexgpu-plume: predicated SKIP opcode {:02X} ({} words) "
+                      "select={:016X} mask={:016X}",
+                      opcode, count, bin_select_, bin_mask_);
+        }
+        ++predicated_skips_;
+        reader->set_read_offset(reader->read_offset() + count * sizeof(uint32_t));
+        return true;
+      }
+    }
     // DT_PLUME_NOSWEEP=1 reverts the one-sweep side-effect port (bd8f87b) to
     // skip-by-length, because boot progress regressed from FrameRender-and-
     // resolves to a park at KickOff #12 in the same change window. The gate
@@ -595,6 +618,43 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
       case 0x4F: {    // MEM_WRITE_CNTR -- CP_PROG_COUNTER to memory
         const uint32_t mem_addr = reader->ReadAndSwap<uint32_t>();
         StoreGuest(mem_addr, 0);   // we have no microcode counter; 0, like idle
+        break;
+      }
+      // ── BIN registers: the state the predicate check reads ────────────────
+      case 0x60: {    // SET_BIN_MASK_LO
+        bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | reader->ReadAndSwap<uint32_t>();
+        LogBinChange("MASK_LO");
+        break;
+      }
+      case 0x61: {    // SET_BIN_MASK_HI
+        bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) |
+                    (static_cast<uint64_t>(reader->ReadAndSwap<uint32_t>()) << 32);
+        LogBinChange("MASK_HI");
+        break;
+      }
+      case 0x62: {    // SET_BIN_SELECT_LO
+        bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | reader->ReadAndSwap<uint32_t>();
+        LogBinChange("SELECT_LO");
+        break;
+      }
+      case 0x63: {    // SET_BIN_SELECT_HI
+        bin_select_ = (bin_select_ & 0xFFFFFFFFull) |
+                      (static_cast<uint64_t>(reader->ReadAndSwap<uint32_t>()) << 32);
+        LogBinChange("SELECT_HI");
+        break;
+      }
+      case 0x50: {    // SET_BIN_MASK (64-bit, hi then lo)
+        const uint64_t hi = reader->ReadAndSwap<uint32_t>();
+        const uint64_t lo = reader->ReadAndSwap<uint32_t>();
+        bin_mask_ = (hi << 32) | lo;
+        LogBinChange("MASK64");
+        break;
+      }
+      case 0x51: {    // SET_BIN_SELECT (64-bit, hi then lo)
+        const uint64_t hi = reader->ReadAndSwap<uint32_t>();
+        const uint64_t lo = reader->ReadAndSwap<uint32_t>();
+        bin_select_ = (hi << 32) | lo;
+        LogBinChange("SELECT64");
         break;
       }
       case 0x23: {    // VIZ_QUERY -- fake every query visible (reference does)
@@ -899,6 +959,21 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
   bool opcode_seen_[128] = {};
   std::vector<uint32_t> reg_reads_ = std::vector<uint32_t>(kRegisterCount, 0);
   uint64_t wptr_writes_ = 0;
+  // PFP predication state (reference init: command_processor.h:289-290).
+  // Only the drain thread touches these; a predicated packet whose bins do
+  // not intersect is skipped whole, which is what stops the XPS replay storm.
+  uint64_t bin_select_ = 0xFFFFFFFFull;
+  uint64_t bin_mask_ = 0xFFFFFFFFull;
+  uint64_t predicated_skips_ = 0;
+  uint64_t bin_changes_ = 0;
+
+  void LogBinChange(const char* which) {
+    if (bin_changes_ < 16) {
+      REXLOG_WARN("rexgpu-plume: SET_BIN_{} -> select={:016X} mask={:016X}", which, bin_select_,
+                  bin_mask_);
+    }
+    ++bin_changes_;
+  }
 
   uint64_t vblanks_ = 0;
   std::atomic<bool> workers_running_{false};
