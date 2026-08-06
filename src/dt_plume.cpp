@@ -3396,21 +3396,92 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
     // backwards: the byte lane L selects has to receive shader channel L.
     ScopedMs scatter_timer(g_ms_scatter);
     ++g_scatter_count;
-    std::vector<uint32_t> sx_map(t.width);
-    for (uint32_t x = 0; x < t.width; ++x) sx_map[x] = x * kFrameW / t.width;
+
+    // Everything this loop used to recompute two million times a frame that
+    // does not vary from texel to texel:
+    //
+    //   * the horizontal sample map (x -> source column),
+    //   * the destination byte offset, which for a tiled surface is a
+    //     TiledOffset2D call per texel,
+    //   * which source byte each destination byte takes -- four SwizzleLane
+    //     calls per texel, for a permutation that is fixed for the surface.
+    //
+    // All three depend only on the surface's geometry and swizzle, so they are
+    // built once and cached. Measured before: the scatter was 4031ms of the
+    // 5618ms it took to run 300 boot frames (72%, two 1080p destinations per
+    // frame) and 2042ms of 4969ms in a race (41%).
+    //
+    // 1080p costs 8.3 MB of offset table. The table is keyed on GEOMETRY ONLY.
+    // Keying it on the swizzle as well looked tidier and was wrong: the game's
+    // two 1080p destinations are identical in geometry but differ in swizzle
+    // (zyx1 and zyxw), so the cache alternated and rebuilt 61 times a second
+    // -- slower than the loop it replaced. The rebuild counter in the log line
+    // is what caught that, so it stays.
+    struct ScatterMap {
+        uint32_t pitch = 0, w = 0, h = 0, needed = 0;
+        bool tiled = false;
+        std::vector<uint32_t> off;   // (y*w + x) -> destination byte offset
+        std::vector<uint32_t> sx;    // x -> source column
+    };
+    static ScatterMap map;
+    if (map.pitch != pitch_texels || map.w != t.width || map.h != t.height ||
+        map.needed != needed || map.tiled != t.tiled) {
+        static uint32_t rebuilds = 0;
+        ++rebuilds;
+        map.pitch = pitch_texels;
+        map.w = t.width;
+        map.h = t.height;
+        map.needed = needed;
+        map.tiled = t.tiled;
+        map.sx.resize(t.width);
+        for (uint32_t x = 0; x < t.width; ++x) map.sx[x] = x * kFrameW / t.width;
+        map.off.assign(size_t(t.width) * t.height, UINT32_MAX);
+        for (uint32_t y = 0; y < t.height; ++y) {
+            uint32_t* orow = map.off.data() + size_t(y) * t.width;
+            for (uint32_t x = 0; x < t.width; ++x) {
+                const uint32_t off = t.tiled
+                    ? uint32_t(TiledOffset2D(int32_t(x), int32_t(y), pitch_texels, 2))
+                    : ((y * pitch_texels + x) * 4u);
+                orow[x] = (off + 4 > needed) ? UINT32_MAX : off;   // same guard as before
+            }
+        }
+        REXLOG_WARN("plume: scatter map #{} built -- {}x{} pitch {} {} ({:.1f} MB); a map "
+                    "rebuilt every frame would cost more than it saves",
+                    rebuilds, t.width, t.height, pitch_texels, t.tiled ? "tiled" : "linear",
+                    double(map.off.size() * 4) / (1024.0 * 1024.0));
+    }
+
+    // Destination byte `sel` receives shader channel `lane`, and channel
+    // `lane` lives at byte kBgra[lane] of the captured B8G8R8A8 pixel. Lanes
+    // the swizzle does not select stay 0xFF and are not written -- exactly
+    // what the per-texel `if (sel < 4)` did. Four calls per surface, not four
+    // per texel, so this is per-scatter rather than cached.
+    static const uint8_t kBgra[4] = {2, 1, 0, 3};
+    uint8_t take[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+        const uint32_t sel = SwizzleLane(t.swizzle, lane);
+        if (sel < 4) take[sel] = kBgra[lane];
+    }
+
+    const bool full_permutation = take[0] != 0xFF && take[1] != 0xFF &&
+                                  take[2] != 0xFF && take[3] != 0xFF;
     for (uint32_t y = 0; y < t.height; ++y) {
         const uint32_t sy = y * kFrameH / t.height;
         const uint8_t* srow = g_resolve_pixels.data() + size_t(sy) * kFrameW * 4;
+        const uint32_t* orow = map.off.data() + size_t(y) * t.width;
+        const uint32_t* sxr = map.sx.data();
         for (uint32_t x = 0; x < t.width; ++x) {
-            const uint8_t* sp = srow + sx_map[x] * 4;   // B8G8R8A8 as stored
-            const uint32_t off = t.tiled
-                ? uint32_t(TiledOffset2D(int32_t(x), int32_t(y), pitch_texels, 2))
-                : ((y * pitch_texels + x) * 4u);
-            if (off + 4 > needed) continue;
-            const uint8_t rgba[4] = {sp[2], sp[1], sp[0], sp[3]};   // sp is BGRA
-            for (uint32_t lane = 0; lane < 4; ++lane) {
-                const uint32_t sel = SwizzleLane(t.swizzle, lane);
-                if (sel < 4) dst[off + sel] = rgba[lane];
+            const uint32_t off = orow[x];
+            if (off == UINT32_MAX) continue;
+            const uint8_t* sp = srow + sxr[x] * 4;   // B8G8R8A8 as stored
+            uint8_t* dp = dst + off;
+            if (full_permutation) {
+                const uint8_t out[4] = {sp[take[0]], sp[take[1]], sp[take[2]], sp[take[3]]};
+                std::memcpy(dp, out, 4);
+            } else {
+                for (uint32_t b = 0; b < 4; ++b) {
+                    if (take[b] != 0xFF) dp[b] = sp[take[b]];
+                }
             }
         }
     }
