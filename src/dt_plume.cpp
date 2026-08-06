@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -1263,6 +1264,9 @@ void FlushConstants(const uint8_t* base) {
 // same array the vertex fetch constants come from, since a slot is either one
 // texture constant (6 dwords) or three vertex constants (2 dwords each). That
 // is why vertex constant N is at +N*8 and sampler S is at +S*24.
+// XE_GPU_MAKE_TEXTURE_SWIZZLE(X,Y,Z,W) -- the identity.
+constexpr uint32_t XE_GPU_TEXTURE_SWIZZLE_XYZW = 0u | (1u << 3) | (2u << 6) | (3u << 9);
+
 struct DecodedTexture {
     uint32_t base_address = 0;   // physical
     uint32_t width = 0;
@@ -1274,8 +1278,23 @@ struct DecodedTexture {
     // assumed -- the swap width is a property of the binding, and picking it by
     // convention is how a texture comes out plausible but wrong.
     uint32_t endianness = 0;
+    // dword_3 +1, 12 bits, four 3-bit lanes x,y,z,w (XE_GPU_TEXTURE_SWIZZLE).
+    // Per lane: 0-3 name a component of the DECODED format, 4 = constant 0,
+    // 5 = constant 1. This is the destination selection -- it decides which of
+    // a k_8_8 texture's two memory channels reaches shader .x, and there is no
+    // convention to fall back on, so it is read rather than assumed. Default is
+    // the identity so an undecoded constant behaves as XYZW.
+    uint32_t swizzle = XE_GPU_TEXTURE_SWIZZLE_XYZW;
     bool valid = false;
 };
+
+// The texture fetch swizzle uses the SAME 3-bit lane encoding as the vfetch
+// destination swizzle above, so SwizzleLane/SwizzleText serve both. This is
+// just the std::string wrapper the log calls want.
+std::string SwizzleName(uint32_t swizzle) {
+    char buf[8];
+    return std::string(SwizzleText(swizzle, buf));
+}
 
 // Decode a texture fetch constant at an arbitrary guest address. Split out of
 // the sampler-slot reader because the RESOLVE path hands us a D3DBaseTexture
@@ -1297,6 +1316,7 @@ DecodedTexture DecodeFetchConstantAt(uint32_t ea, const uint8_t* base) {
     out.base_address = ((d[1] >> 12) & 0xFFFFF) << 12;
     out.width = ((d[2] >> 0) & 0x1FFF) + 1;
     out.height = ((d[2] >> 13) & 0x1FFF) + 1;
+    out.swizzle = (d[3] >> 1) & 0xFFF;                  // dword_3 +1, after num_format
     out.valid = (type == 2) && out.base_address != 0 && out.width > 0 && out.height > 0;
     return out;
 }
@@ -1322,6 +1342,7 @@ DecodedTexture ReadTextureFetchConstant(uint32_t sampler, const uint8_t* base) {
     out.base_address = ((d[1] >> 12) & 0xFFFFF) << 12;  // dword_1 +12, >>12
     out.width = ((d[2] >> 0) & 0x1FFF) + 1;             // size_2d, stored -1
     out.height = ((d[2] >> 13) & 0x1FFF) + 1;
+    out.swizzle = (d[3] >> 1) & 0xFFF;                  // dword_3 +1, num_format is +0
     // type 2 == kTexture; anything else is not a texture binding.
     out.valid = (type == 2) && out.base_address != 0 && out.width > 0 && out.height > 0;
     return out;
@@ -1417,6 +1438,7 @@ void ApplyEndianSwap(uint8_t* p, size_t bytes, uint32_t endianness) {
 // Anything else is reported and skipped rather than uploaded as garbage.
 bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& out) {
     constexpr uint32_t kFormat_8_8_8_8 = 6;
+    constexpr uint32_t kFormat_8_8 = 10;
     constexpr uint32_t kFormat_DXT1 = 18, kFormat_DXT2_3 = 19, kFormat_DXT4_5 = 20;
 
     if (t.format == kFormat_DXT1 || t.format == kFormat_DXT2_3 || t.format == kFormat_DXT4_5) {
@@ -1461,6 +1483,74 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
             }
         }
         ApplyEndianSwap(out.data.data(), out.data.size(), t.endianness);
+        return true;
+    }
+
+    if (t.format == kFormat_8_8) {
+        // k_8_8 is Daytona's whole 3D scene: two 8-bit channels, sampled as a
+        // COLOUR INDEX -- the pixel shader takes .x as a coordinate into
+        // texture_color_ram (sampler 1) and looks the real colour up there. So
+        // getting the channel assignment wrong does not tint the picture, it
+        // indexes the wrong palette entry, and the road comes out any colour at
+        // all. Which of the two memory bytes reaches .x is the fetch
+        // constant's SWIZZLE, decoded above.
+        //
+        // Expanded to RGBA8 on the CPU rather than uploaded as R8G8 with a view
+        // swizzle. Two reasons: the guest lanes can be the constants 0 and 1,
+        // which a component mapping cannot always express, and the descriptor
+        // heap here is filled with setTexture(slot, texture) -- one default view
+        // per texture -- so a per-binding view swizzle has nowhere to live.
+        // 128x128 is 16K texels; the expansion costs nothing.
+        out.format = plume::RenderFormat::R8G8B8A8_UNORM;
+        out.block = 1;
+        out.row_bytes = t.width * 4u;
+        out.rows = t.height;
+
+        const uint32_t pitch_texels = t.pitch * 32u;
+        const uint32_t src_pitch = std::max(pitch_texels, t.width);
+        // 2 bytes a texel, so the tiled address is the log2(2) = 1 variant --
+        // the same untiler the 4-byte path calls with 2 and the DXT path calls
+        // with 3 or 4.
+        constexpr uint32_t kTexelBytes = 2u;
+        constexpr uint32_t kTexelLog2 = 1u;
+        const uint32_t needed =
+            t.tiled ? (((src_pitch + 31u) & ~31u) * ((t.height + 31u) & ~31u) * kTexelBytes)
+                    : (src_pitch * t.height * kTexelBytes);
+        const uint8_t* src = ResolveTextureMemory(t, base, needed);
+        if (src == nullptr) return false;
+
+        out.data.resize(size_t(t.width) * t.height * 4);
+        for (uint32_t y = 0; y < t.height; ++y) {
+            for (uint32_t x = 0; x < t.width; ++x) {
+                const uint32_t src_off =
+                    t.tiled ? uint32_t(TiledOffset2D(int32_t(x), int32_t(y), src_pitch, kTexelLog2))
+                            : ((y * src_pitch + x) * kTexelBytes);
+                if (src_off + kTexelBytes > needed) continue;
+                const uint8_t b0 = src[src_off], b1 = src[src_off + 1];
+                // The endian swap the fetch constant asks for, applied to the
+                // 2-byte texel, then the low byte is component X and the high
+                // byte is component Y -- which is what rexglue's 16bpb load
+                // shader does (XeEndianSwap16 into an R8G8_UNORM host texture,
+                // R = low byte). For k8in16 that means X is the SECOND byte in
+                // memory. Cross-checked against the k_8_8_8_8 path below, whose
+                // hand-rolled ARGB unpack is exactly the same rule composed
+                // with the standard zyxw swizzle of D3DFMT_A8R8G8B8.
+                const uint8_t cx = (t.endianness == 1) ? b1 : b0;
+                const uint8_t cy = (t.endianness == 1) ? b0 : b1;
+                // Two-component formats replicate the LAST component into the
+                // ones they do not have, before the swizzle (xenos.h, k_8_A) --
+                // which is why rexglue gives k_8_8 the host swizzle RGGG.
+                const uint8_t comp[4] = {cx, cy, cy, cy};
+                uint8_t* d = out.data.data() + (size_t(y) * t.width + x) * 4;
+                for (uint32_t lane = 0; lane < 4; ++lane) {
+                    const uint32_t sel = SwizzleLane(t.swizzle, lane);
+                    d[lane] = (sel < 4)    ? comp[sel]
+                              : (sel == 4) ? uint8_t(0)     // constant 0
+                              : (sel == 5) ? uint8_t(255)   // constant 1
+                                           : comp[lane & 3];
+                }
+            }
+        }
         return true;
     }
 
@@ -1582,7 +1672,17 @@ std::unique_ptr<plume::RenderDescriptorSet> g_texture_set;
 std::unique_ptr<plume::RenderDescriptorSet> g_sampler_set;
 std::unique_ptr<plume::RenderSampler> g_sampler;
 std::vector<std::unique_ptr<plume::RenderTexture>> g_textures;
-std::unordered_map<uint32_t, uint32_t> g_texture_index;   // guest base address -> heap slot
+// Cache key -> heap slot. Keyed on the base address AND on the format and
+// swizzle, not on the address alone: the upload bakes the swizzle in (k_8_8 is
+// expanded channel by channel on the CPU), so two bindings of the same memory
+// with different destination selection are two different host textures. Keying
+// on the address alone would hand the second one the first one's picture, and
+// the symptom -- one surface wearing another's palette index -- looks like a
+// decode bug rather than a cache bug.
+std::unordered_map<uint64_t, uint32_t> g_texture_index;
+uint64_t TextureCacheKey(const DecodedTexture& t) {
+    return uint64_t(t.base_address) | (uint64_t(t.format) << 32) | (uint64_t(t.swizzle) << 40);
+}
 // DT_PLUME_TEXCONTROL: the whole heap is the control checker, so guest textures
 // must not be uploaded over it.
 bool g_control_texture_only = false;
@@ -1594,8 +1694,23 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     if (g_control_texture_only) return 0;   // every slot is the checker
     const DecodedTexture t = ReadTextureFetchConstant(sampler, base);
     if (!t.valid) return UINT32_MAX;
-    auto it = g_texture_index.find(t.base_address);
+    const uint64_t key = TextureCacheKey(t);
+    auto it = g_texture_index.find(key);
     if (it != g_texture_index.end()) return it->second;
+
+    // Say it out loud when one address is bound two ways -- that is the case
+    // the key above exists for, and if it never happens the extra key bits are
+    // free rather than load-bearing.
+    {
+        static std::map<uint32_t, uint32_t> first_swizzle;
+        auto ins = first_swizzle.emplace(t.base_address, t.swizzle);
+        if (!ins.second && ins.first->second != t.swizzle) {
+            REXLOG_WARN("plume: texture {:08X} bound with swizzle {} after {} -- uploading a "
+                        "second copy rather than aliasing",
+                        t.base_address, SwizzleName(t.swizzle),
+                        SwizzleName(ins.first->second));
+        }
+    }
 
     TextureUpload up;
     if (!ReadTexture(t, base, up)) {
@@ -1663,11 +1778,12 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     const uint32_t slot = uint32_t(g_textures.size());
     g_texture_set->setTexture(slot, texture.get(), plume::RenderTextureLayout::SHADER_READ);
     g_textures.push_back(std::move(texture));
-    g_texture_index[t.base_address] = slot;
+    g_texture_index[key] = slot;
     REXLOG_WARN("plume: uploaded texture {}x{} guest format {} as plume format {} {} base {:08X} "
-                "-> heap slot {}",
+                "swizzle {} ({:03X}) endian {} -> heap slot {}",
                 t.width, t.height, t.format, static_cast<uint32_t>(up.format),
-                t.tiled ? "tiled" : "linear", t.base_address, slot);
+                t.tiled ? "tiled" : "linear", t.base_address, SwizzleName(t.swizzle), t.swizzle,
+                t.endianness, slot);
     return slot;
 }
 
@@ -2128,9 +2244,11 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         for (uint32_t sampler = 0; sampler < 8; ++sampler) {
             const DecodedTexture t = ReadTextureFetchConstant(sampler, base);
             if (!t.valid) continue;
-            REXLOG_WARN("plume: sampler {} -> texture {}x{} format {} {} base {:08X} pitch {}",
+            REXLOG_WARN("plume: sampler {} -> texture {}x{} format {} {} base {:08X} pitch {} "
+                        "swizzle {}",
                         sampler, t.width, t.height, t.format,
-                        t.tiled ? "TILED" : "linear", t.base_address, t.pitch * 32);
+                        t.tiled ? "TILED" : "linear", t.base_address, t.pitch * 32,
+                        SwizzleName(t.swizzle));
         }
         // Positive control against REX_DUMP_ALUCONST's ground truth for c72..c75:
         // {2,0,0,0 / 0,2,0,0 / 0,0,-1,0 / -1,-1,0,1}.
