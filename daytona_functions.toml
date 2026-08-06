@@ -122,17 +122,14 @@ data_region_threshold = 16
 0x8242A968 = {}
 0x8242A978 = {}
 0x8242DB18 = {}
-0x82459164 = {}
 0x82459198 = {}
 0x824591A0 = {}
-0x82459218 = {}
 0x8245922C = {}
 0x82459444 = {}
 0x8245956C = {}
 0x824595CC = {}
 0x824595D8 = {}
 0x8245A958 = {}
-0x8245B9B8 = {}
 0x8249628C = {}
 0x82496294 = {}
 0x824962A4 = {}
@@ -262,11 +259,20 @@ data_region_threshold = 16
 0x824EBED4 = {}
 0x824EBF08 = {}
 0x823789D8 = {}
+# The last four "Unresolved branch" REX_FATAL sites (all in the 0x8245xxxx Xbox
+# LIVE session region) were CAUSED by seeding, not cured by it. Seeding a
+# branch target that lives mid-function splits the loop it belongs to: codegen
+# then sees a conditional branch from one function into another function's
+# entry with no call edge recorded, and the only thing it can emit is the
+# fatal. Removed the mid-loop seeds 0x82459164 / 0x82459218 / 0x8245B81C /
+# 0x8245B8F8 / 0x8245B900 / 0x8245B9B8 so each loop is one function again, and
+# gave the 0x8245B690 body an explicit end so it keeps its own tail. Result:
+# zero REX_FATAL anywhere in generated/ (was 4). The six addresses dropped are
+# interior labels, and two of them (0x8245B8F8, 0x8245B900) were fragments that
+# contained the fatal itself -- entering them could only ever have crashed.
 0x82459148 = {}
 0x8245920C = {}
-0x8245B8F8 = {}
-0x8245B81C = {}
-0x8245B900 = {}
+0x8245B690 = { end = 0x8245BA30 }
 0x824DD074 = {}
 0x824DD4B0 = {}
 0x82134B6C = {}
