@@ -190,6 +190,14 @@ Combo g_combos[kMaxCombos];
 uint32_t g_combo_count = 0;
 uint64_t g_draws = 0;
 uint64_t g_draws_unresolved = 0;     // a draw whose VS or PS we have no blob for
+// A draw thrown away because nothing can render it: its vertex shader's layout
+// is not derived yet, or its combination's pipeline is missing. These were
+// INVISIBLE -- both drop sites returned early without touching a counter, so a
+// frame that dropped every piece of 3D geometry still reported "0 skipped",
+// which reads as "nothing is missing" and is the opposite of the truth.
+// Cumulative, not per-frame: the earlier of the two drop sites runs before
+// BeginFrame, so there is no open frame to attribute it to.
+uint64_t g_draws_nopipe = 0;
 uint32_t g_combo_overflow = 0;
 bool g_bisected = false;   // the pipeline-failure bisect runs once, not per combo
 uint32_t g_decl_changes = 0;
@@ -754,7 +762,13 @@ void SnapshotDrawVertices(const uint8_t* base) {
     // Find the combination this draw belongs to; it carries the layout and the
     // bindings. Only the current one is needed, and only a few times.
     auto sit = g_shaders.find(g_draw_vs);
-    if (sit == g_shaders.end() || !sit->second.layout_done) return;
+    if (sit == g_shaders.end() || !sit->second.layout_done) {
+        // THE drop site that matters: it is ahead of DrawIntoFrame, so a draw
+        // whose shader never patched its vfetch never even reaches the pipeline
+        // check below.
+        ++g_draws_nopipe;
+        return;
+    }
     Created& s = sit->second;
 
     // Constants arrive ~9 times a frame and the pending list is 64 deep, so it
@@ -1695,7 +1709,10 @@ struct ScopedMs {
 void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
                    const uint8_t* base) {
     ScopedMs timer(g_ms_record);
-    if (c.pipeline_state != PipelineState::kBuilt || c.pipeline == nullptr) return;
+    if (c.pipeline_state != PipelineState::kBuilt || c.pipeline == nullptr) {
+        ++g_draws_nopipe;
+        return;
+    }
     if (g_index_state != IndexState::kReady) return;
     if (!BeginFrame()) return;
     if (g_frame_draws >= kMaxDrawsPerFrame) { ++g_frame_skipped; return; }
@@ -2094,9 +2111,10 @@ void EndFrame() {
     }
     g_readback->unmap();
 
-    REXLOG_WARN("plume: FRAME {} -- {} draws recorded ({} skipped), {} buffers; "
+    REXLOG_WARN("plume: FRAME {} -- {} draws recorded ({} skipped, {} dropped for want of a "
+                "pipeline so far), {} buffers; "
                 "{} of {} pixels touched, {} with colour, first {:08X}{}",
-                g_frame_index, g_frame_draws, g_frame_skipped, buffers,
+                g_frame_index, g_frame_draws, g_frame_skipped, g_draws_nopipe, buffers,
                 touched, kFrameW * kFrameH, coloured, sample,
                 g_swapchain != nullptr ? ", presented" : "");
 
