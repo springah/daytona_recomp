@@ -378,6 +378,23 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
     // Type 3.
     if (reader->read_count() < count * sizeof(uint32_t)) return false;
     const uint32_t opcode = (packet >> 8) & 0x7F;
+    // DT_PLUME_NOSWEEP=1 reverts the one-sweep side-effect port (bd8f87b) to
+    // skip-by-length, because boot progress regressed from FrameRender-and-
+    // resolves to a park at KickOff #12 in the same change window. The gate
+    // covers the whole blast radius so the A/B is one env var, not a rebuild.
+    static const bool no_sweep = std::getenv("DT_PLUME_NOSWEEP") != nullptr;
+    if (no_sweep) {
+      switch (opcode) {
+        case 0x21: case 0x3E: case 0x45: case 0x46: case 0x5A: case 0x4F:
+        case 0x23: case 0x2D: case 0x55: case 0x56: case 0x2F: {
+          const size_t skip_end = reader->read_offset() + count * sizeof(uint32_t);
+          reader->set_read_offset(skip_end);
+          return true;
+        }
+        default:
+          break;
+      }
+    }
     // What the guest actually submits is the whole question when it waits for
     // work it believes is outstanding. Log the opcodes once each.
     if (opcode < 128 && !opcode_seen_[opcode]) {
@@ -747,15 +764,11 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
         // writeback that fills the mailbox executes BEFORE this packet, in
         // this same drain. rexglue dispatches inline for the same reason.
         //
-        // PACED, and the pacing is a hypothesis under test. Measured: the XPS
-        // worker re-queues its buffer 65000 times a second against our
-        // near-zero interrupt latency (13.8M INTERRUPT packets in 80s), where
-        // real-hardware execution latency would pace the same loop at frame
-        // rate. A short inline sleep BEFORE the dispatch preserves stream
-        // order and mailbox coherence -- unlike the batching deferral that
-        // lost callbacks -- and models the one thing a discard-the-draws GPU
-        // lacks: time passing between submission and completion.
-        rex::thread::Sleep(std::chrono::milliseconds(1));
+        // NOT paced. A 1ms sleep here was tried as a latency-model hypothesis:
+        // it proved our zero latency sets the descriptor loop's RATE (65kHz ->
+        // 1kHz) but not its EXIT -- and it throttled the loop's legitimate
+        // pre-boot churn from a tenth of a second into minutes, so boot never
+        // reached FrameRender at all. The loop's exit is content, not time.
         for (uint32_t n = 0; n < 6; ++n) {
           if (cpu_mask & (1u << n)) DispatchInterrupt(1, n);
         }

@@ -548,7 +548,19 @@ DT_TRACE_HOOK_AFTER(sub_8221E950, daytona_debug::HookId::kSetRenderStateB)    //
 DT_TRACE_HOOK_AFTER(sub_8221E658, daytona_debug::HookId::kD3DSetRSHalfPixelOffset)    // SetRenderState (C)
 DT_TRACE_HOOK_AFTER(sub_822337E8, daytona_debug::HookId::kBackbufferSetup)    // BackbufferSetup
 DT_TRACE_HOOK_AFTER(sub_8222C4C8, daytona_debug::HookId::kSceneSetup)         // SceneSetup
-DT_TRACE_HOOK_AFTER(sub_8222EBC0, daytona_debug::HookId::kD3DResolve)  // D3DDevice_Resolve
+// D3DDevice_Resolve(device, Flags, pSourceRect, pDestTexture, pDestPoint,
+// DestLevel, ...) -- r6 is pDestTexture per the XDK 20500 prototype, LATCHED
+// before __imp__ (volatile). This is where the native renderer hands its
+// rendered frame back to the guest: the plugin discards draws, so EDRAM is
+// empty and the guest's resolve would produce nothing -- and the guest
+// re-submits its rendering forever waiting for it (measured, bd8f87b).
+REX_HOOK_RAW(sub_8222EBC0) {
+    uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DResolve, ctx);
+    const uint32_t dest_texture = ctx.r6.u32;
+    __imp__sub_8222EBC0(ctx, base);
+    if (ShouldLog(n)) LogGuestCall("sub_8222EBC0", n, ctx);
+    dt_plume::OnResolve(dest_texture, base);
+}
 DT_TRACE_HOOK_AFTER(sub_8212F028, daytona_debug::HookId::kBeginSceneLike)     // BeginScene
 DT_TRACE_HOOK_AFTER(sub_82223F28, daytona_debug::HookId::kD3DSetShaderGPRAlloc)          // Clear
 DT_TRACE_HOOK(sub_824DC8A8, daytona_debug::HookId::kMemcpyLikeDc8)            // Memcpy-like (DC8)

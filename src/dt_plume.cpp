@@ -962,6 +962,30 @@ struct DecodedTexture {
     bool valid = false;
 };
 
+// Decode a texture fetch constant at an arbitrary guest address. Split out of
+// the sampler-slot reader because the RESOLVE path hands us a D3DBaseTexture
+// OBJECT, whose fetch constant is embedded in the header rather than bound to
+// a sampler slot.
+DecodedTexture DecodeFetchConstantAt(uint32_t ea, const uint8_t* base) {
+    DecodedTexture out;
+    const uint8_t* p = dt_guest_mem::Resolve(base, ea, 24);
+    if (p == nullptr) return out;
+
+    uint32_t d[6];
+    for (uint32_t i = 0; i < 6; ++i) d[i] = LoadBE32(p + i * 4);
+
+    const uint32_t type = d[0] & 0x3;
+    out.pitch = (d[0] >> 22) & 0x1FF;
+    out.tiled = ((d[0] >> 31) & 0x1) != 0;
+    out.format = d[1] & 0x3F;
+    out.endianness = (d[1] >> 6) & 0x3;
+    out.base_address = ((d[1] >> 12) & 0xFFFFF) << 12;
+    out.width = ((d[2] >> 0) & 0x1FFF) + 1;
+    out.height = ((d[2] >> 13) & 0x1FFF) + 1;
+    out.valid = (type == 2) && out.base_address != 0 && out.width > 0 && out.height > 0;
+    return out;
+}
+
 DecodedTexture ReadTextureFetchConstant(uint32_t sampler, const uint8_t* base) {
     DecodedTexture out;
     if (g_device_ea == 0 || sampler >= 8) return out;
@@ -1230,6 +1254,10 @@ bool g_window_tried = false;
 // frame's fence signals -- a vertex buffer freed while the GPU is still reading
 // it is a use-after-free that usually does not crash, which is worse.
 bool g_frame_open = false;
+// Set by OnResolve around its EndFrame call: forces the readback and captures
+// the frame's pixels into g_resolve_pixels for the write-back to guest memory.
+bool g_capture_resolve = false;
+std::vector<uint8_t> g_resolve_pixels;
 uint32_t g_frame_index = 0;
 uint32_t g_frame_draws = 0;
 uint32_t g_frame_skipped = 0;
@@ -1861,7 +1889,7 @@ void EndFrame() {
     g_frame_open = false;
     ++g_frame_index;
 
-    const bool report =
+    const bool report = g_capture_resolve ||
         g_frame_index <= kReportedFrames || (g_frame_index % kReportInterval) == 0;
 
     uint32_t swap_index = 0;
@@ -1919,6 +1947,12 @@ void EndFrame() {
     if (pixels == nullptr) {
         REXLOG_WARN("plume: frame readback map failed");
         return;
+    }
+
+    // The resolve path wants this frame's pixels CPU-side, to hand back to the
+    // guest. Grabbed here because the readback is already mapped.
+    if (g_capture_resolve) {
+        g_resolve_pixels.assign(pixels, pixels + size_t(kFrameW) * kFrameH * 4);
     }
 
     // DT_PLUME_DUMP=<frame> writes that reported frame out as a BMP. A pixel
@@ -2470,6 +2504,91 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
 
     // Bounded: a couple of draws per shader, purely to validate the endian swap
     // against plausible values before it becomes load-bearing.
+}
+
+void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
+    if (!Enabled() || !g_init_ok || dest_texture_ea == 0 || base == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    // Submit whatever this frame has recorded, capturing the pixels. A resolve
+    // with nothing recorded still writes the LAST captured frame: the guest is
+    // asking for output, and stale output unblocks it where none never will.
+    if (g_frame_open) {
+        g_capture_resolve = true;
+        EndFrame();
+        g_capture_resolve = false;
+    }
+    if (g_resolve_pixels.empty()) return;
+
+    // The destination's fetch constant is embedded in the D3DBaseTexture
+    // header. XDK 20500's layout puts it after seven bookkeeping dwords
+    // (Common..MipFlush) at +0x1C, but that is a header-derived belief, not a
+    // measured one -- so probe a few nearby offsets and take the first that
+    // decodes as a valid k_8_8_8_8 texture. A wrong pick fails validation and
+    // logs; it cannot write anywhere, because the write range is guarded.
+    DecodedTexture t;
+    uint32_t used_off = 0;
+    for (uint32_t off : {0x1Cu, 0x10u, 0x18u, 0x20u, 0x24u}) {
+        DecodedTexture c = DecodeFetchConstantAt(dest_texture_ea + off, base);
+        if (c.valid && c.format == 6 && c.width >= 64 && c.height >= 64 &&
+            c.width <= 4096 && c.height <= 4096) {
+            t = c;
+            used_off = off;
+            break;
+        }
+    }
+    static uint32_t resolves = 0;
+    ++resolves;
+    if (!t.valid) {
+        if (resolves <= 4) {
+            REXLOG_WARN("plume: RESOLVE #{} -- no fetch constant found in texture {:08X}",
+                        resolves, dest_texture_ea);
+        }
+        return;
+    }
+
+    const uint32_t pitch_texels = std::max(t.pitch * 32u, t.width);
+    const uint32_t aligned_pitch = (pitch_texels + 31u) & ~31u;
+    const uint32_t needed = t.tiled
+        ? (aligned_pitch * ((t.height + 31u) & ~31u) * 4u)
+        : (pitch_texels * t.height * 4u);
+    const uint32_t va = dt_guest_mem::PhysicalToVirtual(t.base_address, needed);
+    uint8_t* dst = va != 0
+        ? const_cast<uint8_t*>(dt_guest_mem::Resolve(base, va, needed))
+        : nullptr;
+    if (dst == nullptr) {
+        if (resolves <= 4) {
+            REXLOG_WARN("plume: RESOLVE #{} -- dest {:08X} ({}x{}) not writable",
+                        resolves, t.base_address, t.width, t.height);
+        }
+        return;
+    }
+
+    // Nearest-scale our frame into the destination, packing guest-order ARGB
+    // big-endian -- the exact inverse of ReadTexture's k_8_8_8_8 unpack, which
+    // round-tripped correctly (the logos' colours were verified by eye).
+    std::vector<uint32_t> sx_map(t.width);
+    for (uint32_t x = 0; x < t.width; ++x) sx_map[x] = x * kFrameW / t.width;
+    for (uint32_t y = 0; y < t.height; ++y) {
+        const uint32_t sy = y * kFrameH / t.height;
+        const uint8_t* srow = g_resolve_pixels.data() + size_t(sy) * kFrameW * 4;
+        for (uint32_t x = 0; x < t.width; ++x) {
+            const uint8_t* sp = srow + sx_map[x] * 4;   // B8G8R8A8 as stored
+            const uint32_t off = t.tiled
+                ? uint32_t(TiledOffset2D(int32_t(x), int32_t(y), pitch_texels, 2))
+                : ((y * pitch_texels + x) * 4u);
+            if (off + 4 > needed) continue;
+            dst[off + 0] = sp[3];   // A
+            dst[off + 1] = sp[2];   // R
+            dst[off + 2] = sp[1];   // G
+            dst[off + 3] = sp[0];   // B
+        }
+    }
+    if (resolves <= 8 || (resolves % 600) == 0) {
+        REXLOG_WARN("plume: RESOLVE #{} -- frame -> guest {:08X} {}x{} {} (fetch at +{:#x})",
+                    resolves, t.base_address, t.width, t.height,
+                    t.tiled ? "tiled" : "linear", used_off);
+    }
 }
 
 void OnFrameEnd() {

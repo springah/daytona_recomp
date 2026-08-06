@@ -110,6 +110,19 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
 void OnGpuBeginShaderConstantF4(bool pixel_shader, uint32_t start_register, uint32_t count,
                                 uint32_t dest_ea, const uint8_t* base);
 
+// D3DDevice_Resolve -- the handshake that closes the architecture. The GPU
+// plugin discards draws, so EDRAM is empty, so the guest's resolve would write
+// nothing -- and the guest re-submits its rendering forever waiting for output
+// that never lands (measured: two descriptor stacks churning at loop rate;
+// xenos converges in six rounds). But THIS renderer has the frame: so at
+// resolve time, submit whatever has been recorded and write those pixels into
+// the destination texture in guest memory, tiled and byte-ordered the way the
+// guest expects to read them.
+//
+// `dest_texture_ea` is the guest D3DBaseTexture object (its GPU fetch constant
+// is embedded in the header); resolution and scaling are derived from it.
+void OnResolve(uint32_t dest_texture_ea, const uint8_t* base);
+
 // D3DDevice_Swap -- the game's frame boundary, and so ours.
 //
 // Every draw between two Swaps is recorded into ONE command list against ONE
