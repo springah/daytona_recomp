@@ -335,6 +335,13 @@ StateSample g_state_samples[kMaxStateSamples];
 uint32_t g_state_sample_count = 0;
 uint32_t g_state_sample_overflow = 0;
 
+// A combination appeared that has no pipeline yet. The periodic build runs
+// every 600 guest frames, which is ~10 seconds, and every draw of that
+// combination in the meantime is dropped for want of a pipeline -- measured
+// at 279,234 of 875,565 draws in a run, i.e. the first seconds of a race
+// render with geometry missing. Set here, consumed by EndFrame.
+bool g_pipelines_dirty = false;
+
 bool g_bisected = false;   // the pipeline-failure bisect runs once, not per combo
 uint32_t g_decl_changes = 0;
 
@@ -1143,6 +1150,10 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
                    const uint8_t* base);
 void EndFrame(bool present);
 void FlushConstants(const uint8_t* base);
+// The body of BuildPipelines without the lock, so a caller that already holds
+// g_mutex (EndFrame, via OnResolve/OnFrameEnd) can build a pipeline the
+// current frame just discovered it needs.
+void BuildPipelinesLocked(const char* reason);
 
 void SnapshotDrawVertices(const uint8_t* base) {
     const uint32_t start_vertex = g_draw_start;
@@ -3400,6 +3411,15 @@ void EndFrame(bool present) {
     // Textures a re-upload replaced. The fence above is what makes this safe.
     g_texture_graveyard.clear();
 
+    // A combination this frame discovered gets its pipeline NOW, not at the
+    // next 600-frame periodic build. The draws that wanted it are already
+    // lost, but only this frame's -- not ten seconds of them. Here rather
+    // than at the discovery site because pipeline creation is not something
+    // to do in the middle of recording, and the fence above has just been
+    // waited on, so nothing is in flight. Every caller of EndFrame holds
+    // g_mutex, which is why this takes the lock-free body.
+    if (g_pipelines_dirty) BuildPipelinesLocked("new combination");
+
     if (!report) return;
 
     const uint8_t* pixels = static_cast<const uint8_t*>(g_readback->map());
@@ -3677,6 +3697,12 @@ void ApplyDepthControl(plume::RenderGraphicsPipelineDesc& desc, uint32_t depth_c
 void BuildPipelines(const char* reason) {
     if (!Enabled() || !g_init_ok) return;
     std::lock_guard<std::mutex> lock(g_mutex);
+    BuildPipelinesLocked(reason);
+}
+
+void BuildPipelinesLocked(const char* reason) {
+    if (!Enabled() || !g_init_ok) return;
+    g_pipelines_dirty = false;
 
     if (g_pipeline_layout == nullptr) {
         // ⚠ An "allowInputLayout only" layout produces a root signature with
@@ -4202,6 +4228,7 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
         found->write_mask = write_mask;
         found->depth = depth_key;
         found->decl_ea = g_cur_decl_ea;
+        g_pipelines_dirty = true;
         REXLOG_WARN("plume: new combo {} -- blend {:08X} write-mask {:X} depth {:08X} "
                     "(z {} write {} func {})", g_combo_count - 1, blend, write_mask, depth_key,
                     (depth_key >> 1) & 1, (depth_key >> 2) & 1, (depth_key >> 4) & 7);
