@@ -51,6 +51,9 @@ bool g_init_ok = false;
 bool g_persist = true;
 // Likewise: the texture cache's content check, declared early for Init().
 bool g_texprobe = true;
+// Likewise: the GPU-side close of the resolve loop. See the resolve mirror
+// beside the frame target for what it does and why it is exact.
+bool g_gpuloop = true;
 
 std::unique_ptr<plume::RenderInterface> g_interface;
 std::unique_ptr<plume::RenderDevice> g_device;
@@ -602,9 +605,14 @@ bool Init() {
     // clearing at the top of every frame, which is the A/B for this.
     if (const char* p = std::getenv("DT_PLUME_PERSIST")) g_persist = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_TEXPROBE")) g_texprobe = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_GPULOOP")) g_gpuloop = std::atoi(p) != 0;
     REXLOG_WARN("plume: frame target {} across Swaps (DT_PLUME_PERSIST={})",
                 g_persist ? "PERSISTS -- only the guest clear clears it" : "is cleared every frame",
                 g_persist ? 1 : 0);
+    REXLOG_WARN("plume: the resolve loop closes {} (DT_PLUME_GPULOOP={})",
+                g_gpuloop ? "ON THE GPU -- a bind of a resolve destination samples the mirror"
+                          : "through guest memory -- every bind re-uploads 1080p from the CPU",
+                g_gpuloop ? 1 : 0);
 
 #ifdef _WIN32
     g_interface = plume::CreateD3D12Interface();
@@ -1824,6 +1832,69 @@ std::unordered_map<uint64_t, TexCache> g_texture_index;
 // moment this moves; it is exact, unlike the byte probe, because we are the
 // ones who wrote it.
 std::unordered_map<uint32_t, uint32_t> g_resolve_written;
+
+// ── The resolve mirror: closing the loop on the GPU ──────────────────────────
+// The stamp above made the compositing pass CORRECT, and it made it slow. What
+// the guest does every frame is:
+//
+//   render the 3D scene -> D3DDevice_Resolve into a 1920x1080 surface ->
+//   bind that surface as a texture -> draw it full-screen with the HUD on top
+//
+// and what we did to serve it was a full round trip: read our 1280x720 frame
+// target back to the CPU, nearest-scale and re-tile it into guest memory
+// (OnResolve's scatter), then have EnsureTexture read those 8 MB straight back
+// out, un-tile them and upload them to the GPU again -- every frame, because
+// the stamp correctly says the memory changed. Measured at 1920x1080: it is
+// most of the difference between 42fps in a race and the 60 the game wants.
+//
+// The pixels never needed to make that trip. They start on the GPU, in
+// g_color_target, and they end up on the GPU, in a texture sampled by a
+// full-screen quad. So the mirror is a GPU-side copy of the frame target taken
+// at the moment OnResolve captures, and a bind of a resolve destination is
+// served by it instead of by an upload.
+//
+// The guest-memory scatter is NOT removed. Game logic may read those pixels,
+// and the boot handshake depends on resolve output landing in guest memory;
+// this only stops us reading BACK what we already have.
+//
+// Three things make the substitution exact rather than approximate:
+//
+//  * CHANNELS. Compose the scatter with the unpack that used to undo it:
+//        scatter: dest_byte[sel(lane)] = frame_channel[lane]   (last lane wins)
+//        unpack:  shader_lane[lane]    = dest_byte[sel(lane)]
+//    so shader_lane[lane] = frame_channel[last lane' with sel(lane') == sel],
+//    and a sel of 4 or 5 is the unpack's constant 0 or 1. The two are inverses,
+//    so for every swizzle Daytona actually uses (zyxw and zyx1 on the two 1080p
+//    destinations) the composition is the IDENTITY, except that zyx1's alpha is
+//    the constant 1. That is a component mapping and nothing more, which is why
+//    the mirror needs no blit and no shader: it is B8G8R8A8_UNORM like the
+//    frame target, and a texture VIEW carries the mapping. MirrorComponentMap
+//    derives it from the fetch constant rather than hard-coding those two.
+//
+//  * SIZE. The mirror is 1280x720 and the destination is 1920x1080, and that is
+//    fine because the CPU path was a NEAREST SCALE of the same 1280x720 pixels:
+//    normalized texcoord u addresses the same content in both. The guest samples
+//    it with normalized coordinates (nothing here hands a shader a texture
+//    dimension), so the sampler does the scale the scatter used to do, better.
+//
+//  * FRESHNESS. g_resolve_gen records which mirror generation was scattered to
+//    an address; a bind is served from the mirror only while the mirror still
+//    holds that generation or the one after it.
+std::unique_ptr<plume::RenderTexture> g_resolve_mirror;
+// Views of the mirror live as long as the heap slot that points at them.
+std::vector<std::unique_ptr<plume::RenderTextureView>> g_mirror_views;
+// Texture cache key (address + format + swizzle) -> heap slot showing the
+// mirror through that key's component mapping. Deliberately NOT g_texture_index:
+// a mirror slot owns no texture of its own, and the upload path must never find
+// one of these and try to overwrite its pixels.
+std::unordered_map<uint64_t, uint32_t> g_mirror_slots;
+// Bumped every time the mirror is refreshed from the frame target.
+uint32_t g_mirror_gen = 0;
+// Destination physical address -> the mirror generation scattered there.
+std::unordered_map<uint32_t, uint32_t> g_resolve_gen;
+uint32_t g_mirror_hits = 0;      // binds served from the mirror
+uint32_t g_mirror_stale = 0;     // ... of those, from the generation after
+
 // DT_PLUME_TEXPROBE=0 turns off the sampled-content check (g_texprobe, declared
 // at the top of this namespace because Init() reads its environment variable);
 // the resolve stamp still invalidates, which is the A/B for "is this texture
@@ -1930,6 +2001,63 @@ uint64_t ProbeSource(const DecodedTexture& t, uint32_t alias, uint32_t source_by
     return h;
 }
 
+// The component mapping that makes sampling the mirror identical to sampling
+// what the scatter + unpack round trip would have produced. See the resolve
+// mirror block above for the derivation; this is that derivation, spelled.
+plume::RenderComponentMapping MirrorComponentMap(uint32_t swizzle) {
+    static const plume::RenderSwizzle kChannel[4] = {
+        plume::RenderSwizzle::R, plume::RenderSwizzle::G,
+        plume::RenderSwizzle::B, plume::RenderSwizzle::A,
+    };
+    plume::RenderSwizzle out[4];
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+        uint32_t sel = SwizzleLane(swizzle, lane);
+        if (sel == 4) { out[lane] = plume::RenderSwizzle::ZERO; continue; }   // constant 0
+        if (sel == 5) { out[lane] = plume::RenderSwizzle::ONE; continue; }    // constant 1
+        // 6/7 are "untouched", which the unpack reads as byte `lane` -- the
+        // same arithmetic with sel = lane.
+        if (sel > 5) sel = lane;
+        // The scatter writes each destination byte once per lane that selects
+        // it, so a swizzle that selects one byte twice leaves the LAST such
+        // lane's channel there, and every lane reading that byte sees it.
+        uint32_t from = lane;
+        for (uint32_t later = lane + 1; later < 4; ++later) {
+            if (SwizzleLane(swizzle, later) == sel) from = later;
+        }
+        out[lane] = kChannel[from];
+    }
+    return plume::RenderComponentMapping(out[0], out[1], out[2], out[3]);
+}
+
+// A heap slot showing the mirror as this binding's texture, created on first
+// use. One slot per cache key, so the two swizzles the game's two 1080p
+// destinations carry get two views of the SAME texture rather than two copies.
+uint32_t EnsureMirrorSlot(uint64_t key, const DecodedTexture& t) {
+    auto it = g_mirror_slots.find(key);
+    if (it != g_mirror_slots.end()) return it->second;
+    if (g_textures.size() + 1 >= kTextureDescriptorSize) return UINT32_MAX;
+
+    auto view = g_resolve_mirror->createTextureView(
+        [&] {
+            plume::RenderTextureViewDesc desc =
+                plume::RenderTextureViewDesc::Texture2D(kRenderTargetFormat);
+            desc.componentMapping = MirrorComponentMap(t.swizzle);
+            return desc;
+        }());
+    if (view == nullptr) return UINT32_MAX;
+
+    const uint32_t slot = uint32_t(g_textures.size());
+    g_textures.push_back(nullptr);   // the slot owns no texture; the mirror does
+    g_texture_set->setTexture(slot, g_resolve_mirror.get(),
+                              plume::RenderTextureLayout::SHADER_READ, view.get());
+    g_mirror_views.push_back(std::move(view));
+    g_mirror_slots[key] = slot;
+    REXLOG_WARN("plume: resolve destination {:08X} {}x{} swizzle {} -> mirror heap slot {} "
+                "({}x{} frame target, sampled instead of re-uploaded)",
+                t.base_address, t.width, t.height, SwizzleName(t.swizzle), slot, kFrameW, kFrameH);
+    return slot;
+}
+
 // Upload the texture bound to `sampler` and return its slot in the bindless
 // heap, or UINT32_MAX. Cached by guest base address: the menu rebinds the same
 // 1920x1080 surface every draw, and untiling it each time would be absurd.
@@ -1941,6 +2069,28 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     const DecodedTexture t = ReadTextureFetchConstant(sampler, base);
     if (!t.valid) return UINT32_MAX;
     const uint64_t key = TextureCacheKey(t);
+
+    // Is this a surface we resolved into, whose pixels the mirror still holds?
+    // Then they are already on the GPU and the whole upload is dead work. Only
+    // k_8_8_8_8 -- that is what a resolve destination is, and it is the format
+    // the channel derivation above is written against.
+    //
+    // "Still holds" is one generation of slack: the mirror only ever moves
+    // FORWARD, so a bind served one generation late shows the newer frame
+    // rather than a stale one. Anything older falls through to the upload,
+    // which reads guest memory and is correct by construction.
+    if (g_gpuloop && g_resolve_mirror != nullptr && t.format == 6) {
+        auto gen = g_resolve_gen.find(t.base_address & 0x1FFFFFFFu);
+        if (gen != g_resolve_gen.end() && g_mirror_gen - gen->second <= 1) {
+            const uint32_t slot = EnsureMirrorSlot(key, t);
+            if (slot != UINT32_MAX) {
+                ++g_mirror_hits;
+                if (g_mirror_gen != gen->second) ++g_mirror_stale;
+                return slot;
+            }
+        }
+    }
+
     auto it = g_texture_index.find(key);
     uint32_t reuse_slot = UINT32_MAX;
     if (it != g_texture_index.end()) {
@@ -2208,6 +2358,18 @@ bool EnsureOffscreen() {
         REXLOG_WARN("plume: offscreen targets failed -- color={} depth={}",
                     g_color_target != nullptr, g_depth_target != nullptr);
         return false;
+    }
+
+    // The resolve mirror: same size and same format as the frame target, so the
+    // refresh is a straight copyTexture and the channel order needs no argument.
+    // Failing to create it is not fatal -- the CPU round trip is still there and
+    // still correct, only slower.
+    if (g_gpuloop) {
+        g_resolve_mirror = g_device->createTexture(
+            plume::RenderTextureDesc::Texture2D(kFrameW, kFrameH, 1, kRenderTargetFormat));
+        if (g_resolve_mirror == nullptr) {
+            REXLOG_WARN("plume: resolve mirror failed -- resolve destinations will re-upload");
+        }
     }
 
     const plume::RenderTexture* color = g_color_target.get();
@@ -2801,13 +2963,15 @@ void EndFrame() {
             ? std::chrono::duration<double, std::milli>(now - g_last_endframe).count() : 0.0;
         REXLOG_WARN("plume: timing over 300 frames -- wall {:.0f}ms ({:.1f}fps), endframe "
                     "{:.0f}ms, scatter {:.0f}ms ({} scatters), record {:.0f}ms, guest+rest "
-                    "{:.0f}ms",
+                    "{:.0f}ms; {} binds served from the mirror ({} a generation late)",
                     wall, wall > 0 ? 300000.0 / wall : 0.0, g_ms_endframe, g_ms_scatter,
                     g_scatter_count, g_ms_record,
-                    wall - g_ms_endframe - g_ms_scatter - g_ms_record);
+                    wall - g_ms_endframe - g_ms_scatter - g_ms_record,
+                    g_mirror_hits, g_mirror_stale);
         g_last_endframe = now;
         g_ms_endframe = g_ms_scatter = g_ms_record = 0.0;
         g_scatter_count = 0;
+        g_mirror_hits = g_mirror_stale = 0;
     }
 
     const bool report = g_capture_resolve ||
@@ -2822,13 +2986,30 @@ void EndFrame() {
 
     // One barrier batch: the frame target stops being a render target, and the
     // backbuffer becomes a copy destination.
+    // The mirror joins that batch on a capturing frame. Ordering inside one
+    // command list is what makes this safe: the draws that SAMPLE the mirror
+    // were recorded above, the copy that overwrites it is recorded here, and
+    // the SHADER_READ -> COPY_DEST transition is the barrier between them.
+    const bool refresh_mirror = g_capture_resolve && g_resolve_mirror != nullptr;
     std::vector<plume::RenderTextureBarrier> to_copy;
     to_copy.emplace_back(g_color_target.get(), plume::RenderTextureLayout::COPY_SOURCE);
     if (backbuffer != nullptr) {
         to_copy.emplace_back(backbuffer, plume::RenderTextureLayout::COPY_DEST);
     }
+    if (refresh_mirror) {
+        to_copy.emplace_back(g_resolve_mirror.get(), plume::RenderTextureLayout::COPY_DEST);
+    }
     g_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, to_copy.data(),
                     uint32_t(to_copy.size()));
+
+    if (refresh_mirror) {
+        // Same dimensions, same format: no scale, no conversion, no shader.
+        g_cmd->copyTexture(g_resolve_mirror.get(), g_color_target.get());
+        const plume::RenderTextureBarrier to_read(g_resolve_mirror.get(),
+                                                  plume::RenderTextureLayout::SHADER_READ);
+        g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
+        ++g_mirror_gen;
+    }
 
     if (backbuffer != nullptr) {
         // 1:1 -- the window was created at exactly the frame size and the
@@ -3670,6 +3851,10 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
     // texture bound at an address we have just scattered into is stale, and
     // this stamp is the exact signal for that (see TexCache).
     auto& stamp = g_resolve_written[phys];
+    // Which mirror generation these pixels are. Recorded before the dedup
+    // early-out below, so it is the answer to "does the mirror still hold what
+    // this address holds" whether or not this call is the one that scatters.
+    g_resolve_gen[phys] = g_mirror_gen;
     if (stamp == g_frame_index + 1u) return;   // +1: 0 must not match a fresh entry
     stamp = g_frame_index + 1u;
 
@@ -3862,6 +4047,11 @@ void Shutdown() {
     g_index_state = IndexState::kNone;
     g_textures.clear();
     g_texture_index.clear();
+    // The views go before the texture they view, and both before the heap they
+    // are written into.
+    g_mirror_views.clear();
+    g_mirror_slots.clear();
+    g_resolve_mirror.reset();
     g_texture_set.reset();
     g_sampler_set.reset();
     g_sampler.reset();
