@@ -381,6 +381,42 @@ REX_HOOK_RAW(sub_82228FB0) {
     }
 }
 
+// The class-1 ring wait itself. Decoded: wait iff range_start < reader <=
+// range_end (reader = [[dev+11024]+60], range = [r4, (r4+r5) & ringmask]).
+// The parked reader sits at the ring's write position, so the ONLY way to
+// park forever is a range that CONTAINS that position -- a stale caller-side
+// cursor, or a wrapping request. r4/r5 name which.
+REX_HOOK_RAW(sub_82234418) {
+    // Log only calls that will actually WAIT (the guest's own condition,
+    // computed here): satisfied calls are routine and drowned the parked one.
+    const uint32_t dev = ctx.r3.u32;
+    const uint32_t start = ctx.r4.u32;
+    const uint32_t size = ctx.r5.u32;
+    const uint32_t blk = REX_LOAD_U32(dev + 11024);
+    const uint32_t reader = blk != 0 ? REX_LOAD_U32(blk + 60) : 0xDEADDEAD;
+    const uint32_t mask = REX_LOAD_U32(dev + 15176);
+    const uint32_t end = (start + size) & mask;
+    bool waits;
+    if (start < end) {
+        waits = (start < reader) && (reader <= end);
+    } else {
+        // Wrapped range: [start..mask] U [0..end].
+        waits = (reader > start) || (reader <= end);
+    }
+    static uint32_t logged = 0;
+    if (waits && logged < 24) {
+        ++logged;
+        REXLOG_WARN("Daytona ring-range WAITING #{}: start={:08X} size={:08X} end={:08X} "
+                    "reader={:08X}{}",
+                    logged, start, size, end, reader, start >= end ? " (WRAPPED)" : "");
+    }
+    __imp__sub_82234418(ctx, base);
+    if (waits && logged <= 24) {
+        REXLOG_WARN("Daytona ring-range WAITING #{} satisfied, reader now {:08X}", logged,
+                    blk != 0 ? REX_LOAD_U32(blk + 60) : 0xDEADDEADu);
+    }
+}
+
 // KickOff, with EXIT logging: under plume the main thread's last event was
 // entry #11 (lr=82234B28, r4=0x17) and nothing after -- but the trace macro
 // logs entries only, so "parked inside" and "returned and went quiet" look
@@ -389,6 +425,10 @@ REX_HOOK_RAW(sub_82235B20) {
     uint32_t n = daytona_debug::RecordHook(daytona_debug::HookId::kD3DKickOff, ctx);
     if (ShouldLog(n)) LogGuestCall("sub_82235B20", n, ctx);
     const bool log_exit = n < 40;
+    // ⚠ Latched BEFORE __imp__: argument registers are volatile, and reading
+    // r3 after the call dumps whatever the callee left there (measured:
+    // CDCDCDCD -- uninitialised stack, not a device).
+    const uint32_t dev = ctx.r3.u32;
     // The kick fence. 05707920 (physical; A-alias here) is where the stream's
     // EVENT_WRITE_SHD packets report GPU progress -- diagnosis hardcode, tied
     // to this boot's allocation, fine for a one-question instrument.
@@ -400,6 +440,19 @@ REX_HOOK_RAW(sub_82235B20) {
     if (log_exit) {
         REXLOG_WARN("Daytona KickOff exit #{} fence={:08X}", n, REX_LOAD_U32(0xA5707920u));
         DumpRingCursors(base, "kickoff");
+        // The stage-matched probe. The class-1 ring wait polls the block that
+        // [device+11024] POINTS AT, and a fixed-address dump already showed
+        // that block holding a richer structure under xenos than under plume
+        // at "the same time" -- but wall-clock is not a stage. KickOff number
+        // IS a stage, so dump the pointer AND its target here, per kick, under
+        // both plugins, and diff at equal N. The kick where the layouts
+        // diverge names the init step plume is missing.
+        const uint32_t blk = REX_LOAD_U32(dev + 11024);
+        std::string words;
+        for (uint32_t i = 0; i < 16; ++i) {
+            words += fmt::format("{:08X} ", REX_LOAD_U32(blk + i * 4));
+        }
+        REXLOG_WARN("Daytona kick-block #{}: [dev+11024]={:08X} -> {}", n, blk, words);
     }
 }
 DT_TRACE_HOOK(sub_82235D58, daytona_debug::HookId::kD3DBeginRingBig)  // D3D_CDevice_BeginRingBig (ring.obj)
