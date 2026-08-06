@@ -19,6 +19,20 @@ if(NOT REXSDK_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/rexglue-sdk
         CACHE PATH "Path to rexglue-sdk source tree" FORCE)
 endif()
 
+# generated/ is derived and gitignored, so a fresh clone configures against a
+# tree that does not have it yet. Without this, the failure is CMake's own
+# "include could not find requested file: generated/rexglue.cmake", which says
+# nothing about what to run. Name the command instead.
+# (adopted from the sibling repo's cmake/require_codegen.cmake, moved from a
+# build-time `cmake -P` to configure time because that is where ours breaks.)
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/rexglue.cmake")
+    message(FATAL_ERROR
+        "generated/rexglue.cmake not found -- the recompiled sources have not "
+        "been generated yet.\n"
+        "  Run:  scripts/regen.sh\n"
+        "(it needs the rexglue CLI built from thirdparty/rexglue-sdk; see README step 2)")
+endif()
+
 include(generated/rexglue.cmake)
 
 # Hand-written host sources (the SDK app main + recompiled guest code are added
