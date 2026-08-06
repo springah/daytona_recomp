@@ -1617,13 +1617,33 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
                 t.tiled ? uint32_t(TiledOffset2D(int32_t(x), int32_t(y), src_pitch, 2))
                         : ((y * src_pitch + x) * 4u);
             if (src_off + 4 > needed) continue;
-            // Guest is big-endian ARGB; DXGI R8G8B8A8_UNORM wants R,G,B,A.
-            const uint32_t px = LoadBE32(src + src_off);
+            // Data component N is the Nth BYTE, and the fetch constant's
+            // swizzle says which one reaches each shader lane -- the same rule
+            // the k_8_8 path above was forced to by experiment, applied here
+            // too. It was not, and that was the palette defect:
+            //
+            // The old code read the four bytes as a big-endian ARGB word and
+            // hard-coded R,G,B,A out of it, which is component x = the LOW byte
+            // -- the theory k_8_8 had already disproved. For the zyxw swizzle
+            // every k_8_8_8_8 texture in the game carries, it lands one channel
+            // out: the shader's BLUE gets the guest's ALPHA. The palette at
+            // 148C2000 is 64x1024 of shading ramps stored opaque, so its blue
+            // came back 0xFF in all 65536 texels, the pixel shader adds half
+            // the palette to half the index, and every palette-lookup surface
+            // got a >= 0.5 blue floor: grey road to pale lavender, green grass
+            // to dark blue-green. The 640x1028 device-notice art decodes to a
+            // blue/yellow negative the old way and to a white Xbox 360
+            // controller with correct button colours this way; the palette
+            // decodes to blue stripes the old way and to varied ramps this way.
             uint8_t* d = out.data.data() + (size_t(y) * t.width + x) * 4;
-            d[0] = uint8_t((px >> 16) & 0xFF);   // R
-            d[1] = uint8_t((px >> 8) & 0xFF);    // G
-            d[2] = uint8_t((px >> 0) & 0xFF);    // B
-            d[3] = uint8_t((px >> 24) & 0xFF);   // A
+            const uint8_t* px = src + src_off;
+            for (uint32_t lane = 0; lane < 4; ++lane) {
+                const uint32_t sel = SwizzleLane(t.swizzle, lane);
+                d[lane] = (sel < 4)    ? px[sel]
+                          : (sel == 4) ? uint8_t(0)     // constant 0
+                          : (sel == 5) ? uint8_t(255)   // constant 1
+                                       : px[lane];      // untouched
+            }
         }
     }
     return true;
@@ -3369,9 +3389,11 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
     if (stamp == g_frame_index + 1u) return;   // +1: 0 must not match a fresh entry
     stamp = g_frame_index + 1u;
 
-    // Nearest-scale our frame into the destination, packing guest-order ARGB
-    // big-endian -- the exact inverse of ReadTexture's k_8_8_8_8 unpack, which
-    // round-tripped correctly (the logos' colours were verified by eye).
+    // Nearest-scale our frame into the destination, packed as the exact
+    // inverse of ReadTexture's k_8_8_8_8 unpack -- so it moves with it. The
+    // unpack is now "data component N is byte N, the fetch constant's swizzle
+    // says which reaches each shader lane", so the pack asks the same question
+    // backwards: the byte lane L selects has to receive shader channel L.
     ScopedMs scatter_timer(g_ms_scatter);
     ++g_scatter_count;
     std::vector<uint32_t> sx_map(t.width);
@@ -3385,10 +3407,11 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
                 ? uint32_t(TiledOffset2D(int32_t(x), int32_t(y), pitch_texels, 2))
                 : ((y * pitch_texels + x) * 4u);
             if (off + 4 > needed) continue;
-            dst[off + 0] = sp[3];   // A
-            dst[off + 1] = sp[2];   // R
-            dst[off + 2] = sp[1];   // G
-            dst[off + 3] = sp[0];   // B
+            const uint8_t rgba[4] = {sp[2], sp[1], sp[0], sp[3]};   // sp is BGRA
+            for (uint32_t lane = 0; lane < 4; ++lane) {
+                const uint32_t sel = SwizzleLane(t.swizzle, lane);
+                if (sel < 4) dst[off + sel] = rgba[lane];
+            }
         }
     }
     if (resolves <= 8 || (resolves % 600) == 0) {
