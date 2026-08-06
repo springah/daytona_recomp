@@ -58,6 +58,41 @@ bool g_gpuloop = true;
 // resolve's Flags actually clear our frame target. MEASURED first: Daytona
 // sets 0x0300 on three resolves in four. See OnResolveFlags.
 bool g_resolveclear = true;
+// Likewise: whether the per-draw uploads are suballocated out of one per-frame
+// buffer or each get a buffer of their own. See the upload arena.
+bool g_arena = true;
+
+// ── Sub-buckets inside `record` ──────────────────────────────────────────────
+// The 300-frame timing line names three buckets; `record` is the biggest of
+// them in a race and it is one number covering five different jobs. This splits
+// it, and it is OFF by default (DT_PLUME_PROF=1) because it is two clock reads
+// per bucket per draw at ~885 draws a frame -- affordable to measure with, not
+// something to leave in the hot path when nobody is reading it.
+bool g_prof = false;
+double g_ms_p_vtx = 0.0;      // guest vertex copy + attribute permutation
+double g_ms_p_vbuf = 0.0;     // vertex buffer createBuffer/map/memcpy
+double g_ms_p_tex = 0.0;      // the 8-sampler EnsureTexture/EnsureSampler loop
+double g_ms_p_probe = 0.0;    // ... of which, ProbeSource (nested in p_tex)
+double g_ms_p_cb = 0.0;       // the three constant-buffer uploads
+double g_ms_p_cmd = 0.0;      // the plume recording calls themselves
+uint32_t g_probe_calls = 0;   // ProbeSource entries per 300 frames
+
+// Reads no clock at all when the profile is off, so the buckets can be spelled
+// into the hot path and cost nothing in a normal run.
+struct ProfMs {
+    double* acc = nullptr;
+    std::chrono::steady_clock::time_point t0;
+    explicit ProfMs(double& a) {
+        if (!g_prof) return;
+        acc = &a;
+        t0 = std::chrono::steady_clock::now();
+    }
+    ~ProfMs() {
+        if (acc == nullptr) return;
+        *acc += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+    }
+};
 
 std::unique_ptr<plume::RenderInterface> g_interface;
 std::unique_ptr<plume::RenderDevice> g_device;
@@ -611,6 +646,12 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_TEXPROBE")) g_texprobe = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_GPULOOP")) g_gpuloop = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_RESOLVECLEAR")) g_resolveclear = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_PROF")) g_prof = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_ARENA")) g_arena = std::atoi(p) != 0;
+    REXLOG_WARN("plume: per-draw uploads come from {} (DT_PLUME_ARENA={})",
+                g_arena ? "ONE per-frame arena, bump-allocated"
+                        : "a buffer of their own, one createBuffer each",
+                g_arena ? 1 : 0);
     REXLOG_WARN("plume: frame target {} across Swaps (DT_PLUME_PERSIST={})",
                 g_persist ? "PERSISTS -- only the guest clear clears it" : "is cleared every frame",
                 g_persist ? 1 : 0);
@@ -1223,6 +1264,9 @@ uint32_t g_pending_const_dropped = 0;
 float g_vs_constants[kConstRegisters][4] = {};
 float g_ps_constants[kConstRegisters][4] = {};
 bool g_constants_seen = false;
+// Bumped whenever the two files above change. A draw uploads them only when
+// this has moved since the last upload of the frame -- see the upload arena.
+uint32_t g_const_gen = 0;
 
 void OnGpuBeginShaderConstantF4(bool pixel_shader, uint32_t start_register, uint32_t count,
                                 uint32_t dest_ea, const uint8_t* base) {
@@ -1276,6 +1320,9 @@ void FlushConstants(const uint8_t* base) {
             }
         }
         g_constants_seen = true;
+        // The constant files moved, so the copy the arena is handing to draws is
+        // no longer the current one. See g_const_gen.
+        ++g_const_gen;
     }
     g_pending_const_count = 0;
 }
@@ -1804,6 +1851,124 @@ uint32_t g_frame_draws = 0;
 uint32_t g_frame_skipped = 0;
 std::vector<std::unique_ptr<plume::RenderBuffer>> g_frame_buffers;
 
+// ── The per-frame upload arena ───────────────────────────────────────────────
+// Every draw used to create four UPLOAD buffers of its own: one per vertex slot
+// and three for the constant registers (b0 vertex, b1 pixel, b2 shared). At the
+// ~900 draws a race frame records that is ~3,500 createBuffer calls a frame,
+// each one a committed D3D12 resource with a heap and a GPU virtual address
+// behind it.
+//
+// MEASURED, with DT_PLUME_PROF=1, in the 300-frame window right after the green
+// flag (51.2fps, `record` 2,689ms of a 5,862ms wall):
+//
+//     cb 1761ms | vbuf 504ms | tex 186ms (probe 125ms) | vtx 111ms | cmd 79ms
+//
+// So 84% of `record` was creating and mapping buffers, and only 4% was the
+// sampled texture probe that this work started out suspecting. The BYTES were
+// never the problem -- 9 KB per draw is nothing -- the ALLOCATIONS were.
+//
+// So allocate once and hand out offsets. Chunks are UPLOAD buffers mapped for
+// their whole life, bump-allocated within a frame and rewound at the top of the
+// next one. Rewinding is safe for exactly the reason clearing g_frame_buffers
+// is: EndFrame waits on the frame's fence before it returns, so no GPU work can
+// still be reading last frame's bytes.
+//
+// DT_PLUME_ARENA=0 goes back to a buffer per allocation, which is the A/B.
+constexpr uint64_t kArenaChunkBytes = 4ull << 20;
+struct ArenaChunk {
+    std::unique_ptr<plume::RenderBuffer> buffer;
+    uint8_t* mapped = nullptr;
+    uint64_t size = 0;
+};
+std::vector<ArenaChunk> g_arena_chunks;
+size_t g_arena_chunk = 0;      // the chunk being filled
+uint64_t g_arena_used = 0;     // how far into it
+uint64_t g_arena_peak = 0;     // high-water mark over a frame, for the log
+
+// Somewhere the GPU can read this frame: which buffer, at what offset, and
+// where to write the bytes on the CPU.
+struct UploadSpan {
+    plume::RenderBuffer* buffer = nullptr;
+    uint64_t offset = 0;
+    uint8_t* cpu = nullptr;
+    explicit operator bool() const { return cpu != nullptr; }
+};
+
+UploadSpan ArenaTake(uint64_t bytes, uint64_t align) {
+    UploadSpan out;
+    if (bytes == 0) return out;
+    for (;;) {
+        if (g_arena_chunk < g_arena_chunks.size()) {
+            ArenaChunk& c = g_arena_chunks[g_arena_chunk];
+            const uint64_t at = (g_arena_used + align - 1) & ~(align - 1);
+            if (at + bytes <= c.size) {
+                g_arena_used = at + bytes;
+                g_arena_peak = std::max(g_arena_peak, at + bytes);
+                out.buffer = c.buffer.get();
+                out.offset = at;
+                out.cpu = c.mapped + at;
+                return out;
+            }
+            // Full. The remainder is abandoned for this frame; the next rewind
+            // reclaims it.
+            ++g_arena_chunk;
+            g_arena_used = 0;
+            continue;
+        }
+        ArenaChunk fresh;
+        const uint64_t size = std::max<uint64_t>(kArenaChunkBytes, bytes + align);
+        // VERTEX and CONSTANT because one chunk serves both, and Vulkan turns
+        // these flags into usage bits a buffer cannot be bound without.
+        fresh.buffer = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(
+            size, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::CONSTANT));
+        if (fresh.buffer == nullptr) return out;
+        // Mapped once and never unmapped: an UPLOAD heap is host-visible for its
+        // whole life on both backends, and unmapping per draw was part of what
+        // this replaces.
+        fresh.mapped = static_cast<uint8_t*>(fresh.buffer->map());
+        if (fresh.mapped == nullptr) return out;
+        fresh.size = size;
+        g_arena_chunks.push_back(std::move(fresh));
+        REXLOG_WARN("plume: upload arena grew to {} chunks of {} KB", g_arena_chunks.size(),
+                    size / 1024);
+    }
+}
+
+// Per-frame scratch the GPU will read: out of the arena when it is on, out of a
+// buffer of its own (owned by the frame, freed at its fence) when it is not.
+UploadSpan TakeUpload(uint64_t bytes, uint64_t align, plume::RenderBufferFlags flags) {
+    if (g_arena) return ArenaTake(bytes, align);
+    UploadSpan out;
+    auto buf = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(bytes, flags));
+    if (buf == nullptr) return out;
+    out.cpu = static_cast<uint8_t*>(buf->map());
+    if (out.cpu == nullptr) return out;
+    out.buffer = buf.get();
+    g_frame_buffers.push_back(std::move(buf));
+    return out;
+}
+
+// The vertex and pixel constant files are 4 KB each and they change ~9 times a
+// frame, not ~900: the guest sets them and then draws several times with the
+// same values. So they are uploaded once per (frame, generation) and every draw
+// in between points its root descriptor at the same bytes. g_const_gen is
+// bumped by FlushConstants whenever it actually writes (declared beside the
+// constant files themselves, since that is where it is written).
+UploadSpan g_cb_vs, g_cb_ps;
+uint32_t g_cb_gen = UINT32_MAX;
+
+// Called at the top of each frame, once the previous frame's fence has been
+// waited on. Also drops the constant-file spans, because they point into arena
+// bytes that are about to be handed out again.
+void ArenaRewind() {
+    g_arena_chunk = 0;
+    g_arena_used = 0;
+    g_arena_peak = 0;
+    g_cb_vs = UploadSpan();
+    g_cb_ps = UploadSpan();
+    g_cb_gen = UINT32_MAX;
+}
+
 std::unique_ptr<plume::RenderDescriptorSet> g_texture_set;
 std::unique_ptr<plume::RenderDescriptorSet> g_sampler_set;
 std::unique_ptr<plume::RenderSampler> g_sampler;
@@ -2006,6 +2171,8 @@ uint32_t EnsureSampler(const DecodedTexture& t) {
 // know exactly when they changed, because we changed them.
 uint64_t ProbeSource(const DecodedTexture& t, uint32_t alias, uint32_t source_bytes,
                      const uint8_t* base) {
+    ProfMs prof(g_ms_p_probe);
+    ++g_probe_calls;
     if (source_bytes == 0) return 0;
     const uint8_t* p = dt_guest_mem::Resolve(base, alias | t.base_address, source_bytes);
     if (p == nullptr) return 0;
@@ -2647,6 +2814,9 @@ bool BeginFrame() {
     if (g_frame_open) return true;
     if (!EnsureOffscreen()) return false;
 
+    // The previous frame's fence was waited on inside its EndFrame, so nothing
+    // is still reading the arena's bytes.
+    ArenaRewind();
     g_cmd->begin();
     const plume::RenderTextureBarrier to_write[] = {
         plume::RenderTextureBarrier(g_color_target.get(), plume::RenderTextureLayout::COLOR_WRITE),
@@ -2743,8 +2913,13 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     for (uint32_t sl = 0; sl < c.slots.size(); ++sl) {
         std::vector<uint8_t> bytes;
         uint32_t src_ea = 0;
-        if (!BuildSlotBytes(c.attributes, c.slot_consts[sl], c.slots[sl].stride, start_vertex,
-                            vertex_count, base, bytes, src_ea)) {
+        bool built = false;
+        {
+            ProfMs prof(g_ms_p_vtx);
+            built = BuildSlotBytes(c.attributes, c.slot_consts[sl], c.slots[sl].stride,
+                                   start_vertex, vertex_count, base, bytes, src_ea);
+        }
+        if (!built) {
             // Once per combination: this runs on every draw now, and a stream
             // that is unreadable once is unreadable every frame.
             if (!c.warned_unreadable) {
@@ -2798,17 +2973,14 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
             }
         }
         Step("createBuffer(vertex)");
-        auto vb = g_device->createBuffer(
-            plume::RenderBufferDesc::VertexBuffer(bytes.size(), plume::RenderHeapType::UPLOAD));
-        if (vb == nullptr) return;
-        void* p = vb->map();
-        if (p == nullptr) return;
-        std::memcpy(p, bytes.data(), bytes.size());
-        vb->unmap();
-        views.emplace_back(vb->at(0), uint32_t(bytes.size()));
-        // The GPU reads this buffer when the frame is submitted, not now, so it
-        // has to outlive this function -- ownership moves to the frame.
-        g_frame_buffers.push_back(std::move(vb));
+        ProfMs prof_vbuf(g_ms_p_vbuf);
+        // The GPU reads these bytes when the frame is submitted, not now, so
+        // they have to outlive this function: the arena owns them until the
+        // next rewind, or the frame owns the buffer until its fence.
+        const UploadSpan vb = TakeUpload(bytes.size(), 16, plume::RenderBufferFlag::VERTEX);
+        if (!vb) return;
+        std::memcpy(vb.cpu, bytes.data(), bytes.size());
+        views.emplace_back(vb.buffer->at(vb.offset), uint32_t(bytes.size()));
     }
     if (views.empty()) return;
 
@@ -2848,18 +3020,16 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
                         g_vs_constants[r][2], g_vs_constants[r][3]);
         }
     }
-    auto upload_constants = [&](const void* src, uint64_t bytes,
-                                std::unique_ptr<plume::RenderBuffer>& out) -> bool {
-        out = g_device->createBuffer(
-            plume::RenderBufferDesc::UploadBuffer(bytes));
-        if (out == nullptr) return false;
-        void* p = out->map();
-        if (p == nullptr) return false;
-        std::memcpy(p, src, size_t(bytes));
-        out->unmap();
+    // A root CBV's address must be 256-byte aligned on D3D12, so that is the
+    // alignment the arena is asked for regardless of backend.
+    auto upload_constants = [&](const void* src, uint64_t bytes, UploadSpan& out) -> bool {
+        out = TakeUpload(bytes, 256, plume::RenderBufferFlag::CONSTANT);
+        if (!out) return false;
+        std::memcpy(out.cpu, src, size_t(bytes));
         return true;
     };
-    std::unique_ptr<plume::RenderBuffer> vs_cb, ps_cb, shared_cb;
+    UploadSpan shared_cb;
+    bool cb_ok = false;
     // SharedConstants holds the alpha threshold and sampler descriptor indices.
     // Nothing this stage draws samples a texture and the shaders are built with
     // alpha test off, so zeros are correct here -- but the buffer must exist,
@@ -2884,6 +3054,8 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     // c0.y/c12.y; filling only s0 left it reading heap slot 0.
     uint32_t shared[64][4] = {};
     uint32_t unresolved = 0;
+    {
+    ProfMs prof_tex(g_ms_p_tex);
     for (uint32_t s_i = 0; s_i < 8; ++s_i) {
         const uint32_t slot = EnsureTexture(s_i, base);
         if (slot == UINT32_MAX) {
@@ -2901,6 +3073,7 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         shared[s_i / 4][s_i % 4] = slot;
         shared[12 + s_i / 4][s_i % 4] = EnsureSampler(ReadTextureFetchConstant(s_i, base));
     }
+    }
     // Once per combination: this runs on every draw and the answer is a
     // property of the combination, not of the draw.
     if (!c.logged_samplers) {
@@ -2913,9 +3086,20 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
                                       "the control checker", unresolved)
                         : "");
     }
-    if (!upload_constants(g_vs_constants, sizeof(g_vs_constants), vs_cb) ||
-        !upload_constants(g_ps_constants, sizeof(g_ps_constants), ps_cb) ||
-        !upload_constants(shared, sizeof(shared), shared_cb)) {
+    {
+        ProfMs prof_cb(g_ms_p_cb);
+        // The two constant FILES are re-uploaded only when the guest has changed
+        // them since this frame's last upload; the SHARED block carries this
+        // draw's own bindless indices, so it is per draw.
+        cb_ok = true;
+        if (g_cb_gen != g_const_gen || !g_cb_vs || !g_cb_ps) {
+            cb_ok = upload_constants(g_vs_constants, sizeof(g_vs_constants), g_cb_vs) &&
+                    upload_constants(g_ps_constants, sizeof(g_ps_constants), g_cb_ps);
+            g_cb_gen = cb_ok ? g_const_gen : UINT32_MAX;
+        }
+        cb_ok = cb_ok && upload_constants(shared, sizeof(shared), shared_cb);
+    }
+    if (!cb_ok) {
         REXLOG_WARN("plume: could not upload the shader constant buffers");
         return;
     }
@@ -2927,15 +3111,17 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     // clear: the frame was cleared once in BeginFrame, and clearing per draw is
     // exactly what stopped the previous stage from ever producing a picture.
     ++g_frame_draws;
+    {
+    ProfMs prof_cmd(g_ms_p_cmd);
     Step("setPipeline");
     g_cmd->setPipeline(c.pipeline.get());
     Step("setGraphicsPipelineLayout");
     g_cmd->setGraphicsPipelineLayout(g_pipeline_layout.get());
     // Root descriptor order matches how the layout was built: b0, b1, b2.
     Step("setGraphicsRootDescriptor x3");
-    g_cmd->setGraphicsRootDescriptor(vs_cb->at(0), 0);
-    g_cmd->setGraphicsRootDescriptor(ps_cb->at(0), 1);
-    g_cmd->setGraphicsRootDescriptor(shared_cb->at(0), 2);
+    g_cmd->setGraphicsRootDescriptor(g_cb_vs.buffer->at(g_cb_vs.offset), 0);
+    g_cmd->setGraphicsRootDescriptor(g_cb_ps.buffer->at(g_cb_ps.offset), 1);
+    g_cmd->setGraphicsRootDescriptor(shared_cb.buffer->at(shared_cb.offset), 2);
     Step("setGraphicsDescriptorSet x2");
     g_cmd->setGraphicsDescriptorSet(g_texture_set.get(), 0);   // space0 Texture2D
     g_cmd->setGraphicsDescriptorSet(g_sampler_set.get(), 3);   // space3 SamplerState
@@ -2955,12 +3141,10 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         Step("drawIndexedInstanced");
         g_cmd->drawIndexedInstanced(index_count, 1, 0, 0, 0);
     }
+    }
 
-    // The constant buffers are read at submit time like the vertex data, so
-    // they belong to the frame too.
-    g_frame_buffers.push_back(std::move(vs_cb));
-    g_frame_buffers.push_back(std::move(ps_cb));
-    g_frame_buffers.push_back(std::move(shared_cb));
+    // The constant buffers are read at submit time like the vertex data, and
+    // TakeUpload has already put them where they will outlive this call.
 
     // The sequence survived once; do not narrate it for every later draw.
     g_offscreen_verbose = false;
@@ -3009,8 +3193,20 @@ void EndFrame() {
                     g_scatter_count, g_ms_record,
                     wall - g_ms_endframe - g_ms_scatter - g_ms_record,
                     g_mirror_hits, g_mirror_stale);
+        if (g_prof) {
+            REXLOG_WARN("plume: record breakdown over 300 frames -- vtx {:.0f}ms, vbuf {:.0f}ms, "
+                        "tex {:.0f}ms (probe {:.0f}ms in {} calls), cb {:.0f}ms, cmd {:.0f}ms, "
+                        "rest {:.0f}ms; arena {} chunks, {} KB used at this frame's peak",
+                        g_ms_p_vtx, g_ms_p_vbuf, g_ms_p_tex, g_ms_p_probe, g_probe_calls,
+                        g_ms_p_cb, g_ms_p_cmd,
+                        g_ms_record - g_ms_p_vtx - g_ms_p_vbuf - g_ms_p_tex - g_ms_p_cb -
+                            g_ms_p_cmd,
+                        g_arena_chunks.size(), g_arena_peak / 1024);
+        }
         g_last_endframe = now;
         g_ms_endframe = g_ms_scatter = g_ms_record = 0.0;
+        g_ms_p_vtx = g_ms_p_vbuf = g_ms_p_tex = g_ms_p_probe = g_ms_p_cb = g_ms_p_cmd = 0.0;
+        g_probe_calls = 0;
         g_scatter_count = 0;
         g_mirror_hits = g_mirror_stale = 0;
     }
@@ -4332,6 +4528,10 @@ void Shutdown() {
         g_queue->waitForCommandFence(g_fence.get());
     }
     g_frame_buffers.clear();
+    // The arena's chunks are mapped for their whole life; the drain above is
+    // what makes destroying them here safe.
+    ArenaRewind();
+    g_arena_chunks.clear();
     g_shaders.clear();
     for (uint32_t i = 0; i < g_combo_count; ++i) g_combos[i].pipeline.reset();
     g_pipeline_layout.reset();
