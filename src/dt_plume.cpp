@@ -205,7 +205,11 @@ uint32_t g_failed = 0;
 // calls/frame a mutex per call would be a real cost. That assumption is CHECKED
 // below rather than trusted: if a second thread ever touches it, we shout.
 constexpr uint32_t kMaxStreams = 16;
-constexpr uint32_t kMaxCombos = 64;
+// Raised from 64 when depth state joined blend state in the combination key:
+// the key is now (vs, ps, topology, blend, write mask, depth), and a run that
+// measured 10 combinations on blend alone can multiply by the four depth
+// states the game uses.
+constexpr uint32_t kMaxCombos = 128;
 
 struct StreamBinding {
     uint32_t buffer_ea = 0;
@@ -236,6 +240,12 @@ struct Combo {
     // Default = src ONE, op ADD, dst ZERO both halves = blending off.
     uint32_t blend = 0x00010001u;
     uint8_t write_mask = 0xFu;
+    // Packed RB_DEPTHCONTROL, read from the device shadow (+10548, written by
+    // SetRenderState_ZEnable/ZWriteEnable/ZFunc) at draw time. Also part of
+    // the KEY: depth test/write/func are pipeline state in D3D12, so a draw
+    // that tests depth and one that does not are two pipelines.
+    // Default 0 = z_enable 0 = the old always-pass behaviour.
+    uint32_t depth = 0;
     uint64_t draws = 0;
     uint64_t vertices = 0;
     uint32_t min_count = 0xFFFFFFFFu;
@@ -309,6 +319,11 @@ uint32_t g_combo_overflow = 0;
 // what moves. Kept as an opt-in rather than deleted: the question comes back
 // every time a new scene renders wrong.
 bool g_statecensus = false;
+
+// Per-draw depth test/write/func from the guest's RB_DEPTHCONTROL shadow.
+// DT_PLUME_DEPTHSTATE=0 reverts to the old behaviour (no depth test at all,
+// submission order decides), which is the A/B for anything this changes.
+bool g_depthstate = true;
 struct StateSample {
     uint32_t depth = 0;      // RB_DEPTHCONTROL
     uint32_t color = 0;      // RB_COLORCONTROL
@@ -674,6 +689,11 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_ARENA")) g_arena = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_SWAPPRESENT")) g_swap_present = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_STATECENSUS")) g_statecensus = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_DEPTHSTATE")) g_depthstate = std::atoi(p) != 0;
+    REXLOG_WARN("plume: per-draw depth state is {} (DT_PLUME_DEPTHSTATE={})",
+                g_depthstate ? "ON -- RB_DEPTHCONTROL keys the pipeline"
+                             : "OFF -- every pipeline draws with the depth test disabled",
+                g_depthstate ? 1 : 0);
     REXLOG_WARN("plume: the swapchain is presented {} (DT_PLUME_SWAPPRESENT={})",
                 g_swap_present ? "at the guest's Swap ONLY -- a mid-frame resolve closes and "
                                  "captures the frame but does not put it on the screen"
@@ -3606,6 +3626,54 @@ void PresentTarget() {
 #endif
 }
 
+// Xenos CompareFunction (xenos.h:677 -- 0 never .. 7 always, bit 0 less, bit 1
+// equal, bit 2 greater) -> plume. The two enumerations agree on ORDER, and
+// plume's is D3D12's with an UNKNOWN in front, which is exactly why rexglue's
+// D3D12 backend can write `D3D12_COMPARISON_FUNC_NEVER + zfunc`
+// (pipeline_cache.cpp:2934). Spelled out anyway: an off-by-one here is a
+// silent wrong-occlusion bug, not a compile error.
+plume::RenderComparisonFunction ToComparisonFunc(uint32_t f) {
+    using C = plume::RenderComparisonFunction;
+    switch (f & 7u) {
+        case 0: return C::NEVER;
+        case 1: return C::LESS;
+        case 2: return C::EQUAL;
+        case 3: return C::LESS_EQUAL;
+        case 4: return C::GREATER;
+        case 5: return C::NOT_EQUAL;
+        case 6: return C::GREATER_EQUAL;
+        default: return C::ALWAYS;
+    }
+}
+
+// Depth state from the guest's RB_DEPTHCONTROL shadow, applied to a pipeline
+// desc. The normalisation is rexglue's, not invented here:
+//
+//   draw.cpp:99 GetNormalizedDepthControl / pipeline_cache.cpp:1436-1442
+//     z_enable == 0  =>  the test ALWAYS passes and NOTHING is written, even
+//                        if z_write_enable is set. Daytona relies on this: its
+//                        2D pass runs with z=0 zw=1 (178k draws measured), and
+//                        honouring that write bit would have the HUD stamping
+//                        depth over the scene.
+//   pipeline_cache.cpp:2928
+//     the host depth test is enabled when the func is not ALWAYS or something
+//     is written -- otherwise the state is a no-op and D3D12 is told so.
+//
+// Until this was wired every pipeline took plume's defaults (depthEnabled =
+// depthWriteEnabled = false, types.h:1283), so the 698k draws/run of 3D scene
+// that ask for z=1 zw=1 LESS_EQUAL were composited in submission order: cars
+// and trackside geometry drew through each other, which is what "transparent
+// models" looks like.
+void ApplyDepthControl(plume::RenderGraphicsPipelineDesc& desc, uint32_t depth_control) {
+    if (!g_depthstate) return;
+    const bool z_enable = ((depth_control >> 1) & 1) != 0;
+    const bool z_write = z_enable && ((depth_control >> 2) & 1) != 0;
+    const uint32_t zfunc = z_enable ? ((depth_control >> 4) & 7) : 7u;   // 7 = always
+    desc.depthFunction = ToComparisonFunc(zfunc);
+    desc.depthWriteEnabled = z_write;
+    desc.depthEnabled = (zfunc != 7u) || z_write;
+}
+
 void BuildPipelines(const char* reason) {
     if (!Enabled() || !g_init_ok) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -3752,6 +3820,7 @@ void BuildPipelines(const char* reason) {
         desc.renderTargetBlend[0] = BlendDescFromControl(c.blend, c.write_mask);
         desc.renderTargetCount = 1;
         desc.depthTargetFormat = kDepthTargetFormat;
+        ApplyDepthControl(desc, c.depth);
         // QUADLIST and TRIANGLEFAN both become an indexed TRIANGLE_LIST: neither
         // exists in D3D12/Vulkan, and both expand with a static index pattern
         // (0,1,2, 0,2,3 per quad; 0,i,i+1 for a fan). TRIANGLELIST draws as
@@ -4046,6 +4115,41 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
     const uint32_t depthctl = depth_ptr != nullptr ? LoadBE32(depth_ptr) : 0u;
     const uint32_t colorctl = color_ptr != nullptr ? LoadBE32(color_ptr) : 0u;
     const uint32_t cullctl = cull_ptr != nullptr ? LoadBE32(cull_ptr) : 0u;
+    // Only the bits the pipeline honours go in the key: z_enable (1),
+    // z_write_enable (2) and zfunc (4..6). The rest of RB_DEPTHCONTROL is
+    // stencil, which is not wired and which Daytona leaves at a constant
+    // 0x00700700 -- keying on the whole word would mint a pipeline for a
+    // field nothing reads.
+    const uint32_t depth_key = g_depthstate ? (depthctl & 0x76u) : 0u;
+
+    // The other two shadow words the census measured are NOT wired, because
+    // across a full attract + race Daytona never varies them:
+    //   RB_COLORCONTROL   87000007  alpha_test_enable 0, alpha func ALWAYS
+    //   PA_SU_SC_MODE_CNTL 00018000 cull_front 0, cull_back 0
+    // So the pipelines' alpha-test-OFF shader specialisation and cullMode NONE
+    // are correct rather than merely provisional -- for every scene measured.
+    // These two one-shot warnings are what makes that claim falsifiable: a
+    // scene that does enable either one says so instead of rendering wrong.
+    if (((colorctl >> 3) & 1) != 0) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            REXLOG_WARN("plume: ALPHA TEST ENABLED by the guest (RB_COLORCONTROL {:08X}, func {}) "
+                        "-- the pipelines use the ALPHA_TEST-off shader specialisation, so this "
+                        "geometry will render translucent instead of cut out", colorctl,
+                        colorctl & 7);
+        }
+    }
+    if ((cullctl & 3u) != 0) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            REXLOG_WARN("plume: FACE CULLING ENABLED by the guest (PA_SU_SC_MODE_CNTL {:08X}, "
+                        "front {} back {} face {}) -- the pipelines use cullMode NONE, so back "
+                        "faces will show", cullctl, cullctl & 1, (cullctl >> 1) & 1,
+                        (cullctl >> 2) & 1);
+        }
+    }
 
     if (g_statecensus) {
         StateSample* s = nullptr;
@@ -4080,7 +4184,7 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
     for (uint32_t i = 0; i < g_combo_count; ++i) {
         Combo& c = g_combos[i];
         if (c.vs == vs && c.ps == ps && c.topology == primitive_type && c.blend == blend &&
-            c.write_mask == write_mask) {
+            c.write_mask == write_mask && c.depth == depth_key) {
             found = &c;
             break;
         }
@@ -4096,9 +4200,11 @@ void OnDrawVertices(uint32_t device_ea, uint32_t primitive_type, uint32_t start_
         found->topology = primitive_type;
         found->blend = blend;
         found->write_mask = write_mask;
+        found->depth = depth_key;
         found->decl_ea = g_cur_decl_ea;
-        REXLOG_WARN("plume: new combo {} -- blend {:08X} write-mask {:X}", g_combo_count - 1,
-                    blend, write_mask);
+        REXLOG_WARN("plume: new combo {} -- blend {:08X} write-mask {:X} depth {:08X} "
+                    "(z {} write {} func {})", g_combo_count - 1, blend, write_mask, depth_key,
+                    (depth_key >> 1) & 1, (depth_key >> 2) & 1, (depth_key >> 4) & 7);
     }
     ++found->draws;
     found->vertices += vertex_count;
@@ -4680,12 +4786,15 @@ void Dump(const char* reason) {
                        "/" + std::to_string(c.streams[k].stride) + " ";
         }
         if (c.stream_overflow) streams += "(+more) ";
-        REXLOG_WARN("   [{:2}] {:>13} vs={:<20} ps={:<20} draws={:<9} verts {}..{} decl={:08X}{} streams: {}",
+        REXLOG_WARN("   [{:2}] {:>13} vs={:<20} ps={:<20} draws={:<9} verts {}..{} decl={:08X}{} "
+                    "blend={:08X}/{:X} z={} zw={} zfunc={} streams: {}",
                     i, TopologyName(c.topology),
                     ve ? ve->name : (c.vs == 0 ? "(none)" : "(UNKNOWN)"),
                     pe ? pe->name : (c.ps == 0 ? "(none)" : "(UNKNOWN)"),
                     c.draws, c.min_count == 0xFFFFFFFFu ? 0 : c.min_count, c.max_count,
                     c.decl_ea, c.decl_mismatch ? "(VARIES!)" : "",
+                    c.blend, c.write_mask, (c.depth >> 1) & 1, (c.depth >> 2) & 1,
+                    (c.depth >> 4) & 7,
                     streams.empty() ? "(none bound)" : streams);
     }
     // The two guest-side dirty/clear signals, measured rather than assumed.
