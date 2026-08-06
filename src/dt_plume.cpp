@@ -1285,6 +1285,15 @@ struct DecodedTexture {
     // convention to fall back on, so it is read rather than assumed. Default is
     // the identity so an undecoded constant behaves as XYZW.
     uint32_t swizzle = XE_GPU_TEXTURE_SWIZZLE_XYZW;
+    // Sampler state also lives in the fetch constant, and for a colour-INDEX
+    // texture the filter is not a quality knob: interpolating between two
+    // palette INDICES produces an index that means nothing, and the colour that
+    // comes back is unrelated to either neighbour. So it is decoded and honoured
+    // per binding rather than left at plume's LINEAR default.
+    uint32_t mag_filter = 1;   // dword_3 +19, TextureFilter: 0 point, 1 linear
+    uint32_t min_filter = 1;   // dword_3 +21
+    uint32_t clamp_x = 0;      // dword_0 +10, ClampMode
+    uint32_t clamp_y = 0;      // dword_0 +13
     bool valid = false;
 };
 
@@ -1317,6 +1326,10 @@ DecodedTexture DecodeFetchConstantAt(uint32_t ea, const uint8_t* base) {
     out.width = ((d[2] >> 0) & 0x1FFF) + 1;
     out.height = ((d[2] >> 13) & 0x1FFF) + 1;
     out.swizzle = (d[3] >> 1) & 0xFFF;                  // dword_3 +1, after num_format
+    out.mag_filter = (d[3] >> 19) & 0x3;
+    out.min_filter = (d[3] >> 21) & 0x3;
+    out.clamp_x = (d[0] >> 10) & 0x7;
+    out.clamp_y = (d[0] >> 13) & 0x7;
     out.valid = (type == 2) && out.base_address != 0 && out.width > 0 && out.height > 0;
     return out;
 }
@@ -1343,6 +1356,10 @@ DecodedTexture ReadTextureFetchConstant(uint32_t sampler, const uint8_t* base) {
     out.width = ((d[2] >> 0) & 0x1FFF) + 1;             // size_2d, stored -1
     out.height = ((d[2] >> 13) & 0x1FFF) + 1;
     out.swizzle = (d[3] >> 1) & 0xFFF;                  // dword_3 +1, num_format is +0
+    out.mag_filter = (d[3] >> 19) & 0x3;                // dword_3 +19
+    out.min_filter = (d[3] >> 21) & 0x3;                // dword_3 +21
+    out.clamp_x = (d[0] >> 10) & 0x7;                   // dword_0 +10
+    out.clamp_y = (d[0] >> 13) & 0x7;                   // dword_0 +13
     // type 2 == kTexture; anything else is not a texture binding.
     out.valid = (type == 2) && out.base_address != 0 && out.width > 0 && out.height > 0;
     return out;
@@ -1527,16 +1544,27 @@ bool ReadTexture(const DecodedTexture& t, const uint8_t* base, TextureUpload& ou
                             : ((y * src_pitch + x) * kTexelBytes);
                 if (src_off + kTexelBytes > needed) continue;
                 const uint8_t b0 = src[src_off], b1 = src[src_off + 1];
-                // The endian swap the fetch constant asks for, applied to the
-                // 2-byte texel, then the low byte is component X and the high
-                // byte is component Y -- which is what rexglue's 16bpb load
-                // shader does (XeEndianSwap16 into an R8G8_UNORM host texture,
-                // R = low byte). For k8in16 that means X is the SECOND byte in
-                // memory. Cross-checked against the k_8_8_8_8 path below, whose
-                // hand-rolled ARGB unpack is exactly the same rule composed
-                // with the standard zyxw swizzle of D3DFMT_A8R8G8B8.
-                const uint8_t cx = (t.endianness == 1) ? b1 : b0;
-                const uint8_t cy = (t.endianness == 1) ? b0 : b1;
+                // Component X is the FIRST byte, Y the second, and the fetch
+                // constant's endianness (kNone for every k_8_8 Daytona binds)
+                // swaps that pair.
+                //
+                // ⚠ This was settled by experiment, not by argument, because
+                // the argument gave the wrong answer. Reading the k_8_8_8_8
+                // path below as "the raw value is the big-endian word, X in the
+                // low bits" is self-consistent -- LoadBE32 of 0xAARRGGBB with
+                // the decoded zyxw swizzle does land on R,G,B,A -- and it
+                // predicts X = the SECOND byte here. Built that way, the scene
+                // bleaches: every surface goes near-white, which is what a
+                // palette lookup does when it is fed the mostly-opaque ALPHA
+                // channel and lands on the top entry every time. The A/B is
+                // banked as k88_fix2/fix4/fix5.png against k88_a/v3.png.
+                //
+                // So k_8_8 stores X then Y in address order. Component X is the
+                // luminance the palette is indexed by; Y is alpha, and the
+                // xxxy swizzle puts it exactly where the shader expects.
+                const bool swapped = (t.endianness == 1);   // k8in16
+                const uint8_t cx = swapped ? b1 : b0;
+                const uint8_t cy = swapped ? b0 : b1;
                 // Two-component formats replicate the LAST component into the
                 // ones they do not have, before the swizzle (xenos.h, k_8_A) --
                 // which is why rexglue gives k_8_8 the host swizzle RGGG.
@@ -1686,6 +1714,68 @@ uint64_t TextureCacheKey(const DecodedTexture& t) {
 // DT_PLUME_TEXCONTROL: the whole heap is the control checker, so guest textures
 // must not be uploaded over it.
 bool g_control_texture_only = false;
+
+// ── Samplers ─────────────────────────────────────────────────────────────────
+// One LINEAR sampler used to serve every binding. That is wrong for the format
+// this stage just taught the renderer: a k_8_8 colour-index texture's .x is a
+// COORDINATE into the palette, and bilinear filtering averages two indices into
+// a third that names an unrelated palette entry. The fetch constant says which
+// filter the guest asked for, so the samplers are built from it.
+//
+// The shaders already index a bindless SAMPLER heap -- SharedConstants carries
+// sN_SamplerDescriptorIndex at c12 -- so this needs no pipeline change, only
+// distinct entries in the heap and the right index written per binding.
+std::vector<std::unique_ptr<plume::RenderSampler>> g_samplers;
+std::unordered_map<uint32_t, uint32_t> g_sampler_index;   // packed state -> heap slot
+
+plume::RenderTextureAddressMode AddressModeFromClamp(uint32_t clamp) {
+    switch (clamp) {
+        case 0: return plume::RenderTextureAddressMode::WRAP;           // kRepeat
+        case 1: return plume::RenderTextureAddressMode::MIRROR;         // kMirroredRepeat
+        case 2:                                                          // kClampToEdge
+        case 4: return plume::RenderTextureAddressMode::CLAMP;          // kClampToHalfway
+        case 3:                                                          // kMirrorClampToEdge
+        case 5: return plume::RenderTextureAddressMode::MIRROR_ONCE;    // kMirrorClampToHalfway
+        case 6:
+        case 7: return plume::RenderTextureAddressMode::BORDER;
+        default: return plume::RenderTextureAddressMode::WRAP;
+    }
+}
+
+// The sampler heap slot for a binding's state, creating it on first use.
+// Falls back to slot 0 (the original LINEAR/WRAP sampler) if anything fails,
+// which is exactly the behaviour this replaces.
+uint32_t EnsureSampler(const DecodedTexture& t) {
+    // kUseFetchConst (3) and kBaseMap (2) are not selections a 2D fetch makes;
+    // treat anything that is not kPoint as linear.
+    const uint32_t mag_point = (t.mag_filter == 0) ? 1u : 0u;
+    const uint32_t min_point = (t.min_filter == 0) ? 1u : 0u;
+    const uint32_t key = mag_point | (min_point << 1) | (t.clamp_x << 2) | (t.clamp_y << 5);
+    auto it = g_sampler_index.find(key);
+    if (it != g_sampler_index.end()) return it->second;
+    if (g_samplers.size() + 1 >= kSamplerDescriptorSize) return 0;
+
+    plume::RenderSamplerDesc desc;
+    desc.magFilter = mag_point ? plume::RenderFilter::NEAREST : plume::RenderFilter::LINEAR;
+    desc.minFilter = min_point ? plume::RenderFilter::NEAREST : plume::RenderFilter::LINEAR;
+    // Nothing here uploads mips, so the mip mode only decides how a single
+    // level is sampled; NEAREST keeps it off the fence.
+    desc.mipmapMode = plume::RenderMipmapMode::NEAREST;
+    desc.addressU = AddressModeFromClamp(t.clamp_x);
+    desc.addressV = AddressModeFromClamp(t.clamp_y);
+    desc.addressW = desc.addressU;
+    auto sampler = g_device->createSampler(desc);
+    if (sampler == nullptr) return 0;
+
+    const uint32_t slot = uint32_t(g_samplers.size()) + 1;   // slot 0 is the default
+    g_sampler_set->setSampler(slot, sampler.get());
+    g_samplers.push_back(std::move(sampler));
+    g_sampler_index[key] = slot;
+    REXLOG_WARN("plume: sampler state mag {} min {} clampU {} clampV {} -> heap slot {}",
+                mag_point ? "POINT" : "linear", min_point ? "POINT" : "linear",
+                t.clamp_x, t.clamp_y, slot);
+    return slot;
+}
 
 // Upload the texture bound to `sampler` and return its slot in the bindless
 // heap, or UINT32_MAX. Cached by guest base address: the menu rebinds the same
@@ -2309,7 +2399,7 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
             continue;
         }
         shared[s_i / 4][s_i % 4] = slot;
-        shared[12 + s_i / 4][s_i % 4] = 0;   // the one sampler serves them all
+        shared[12 + s_i / 4][s_i % 4] = EnsureSampler(ReadTextureFetchConstant(s_i, base));
     }
     // Once per combination: this runs on every draw and the answer is a
     // property of the combination, not of the draw.
@@ -3345,6 +3435,8 @@ void Shutdown() {
     g_texture_set.reset();
     g_sampler_set.reset();
     g_sampler.reset();
+    g_samplers.clear();
+    g_sampler_index.clear();
     g_readback.reset();
     g_framebuffer.reset();
     g_color_target.reset();
