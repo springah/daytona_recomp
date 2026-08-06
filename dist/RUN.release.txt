@@ -1,0 +1,54 @@
+Daytona USA (recompiled) - public build
+=======================================
+
+A statically recompiled PC build of the Xbox 360 XBLA release of Daytona USA.
+No game files are included. You must own the game and supply your own copy.
+
+
+ADD YOUR GAME
+-------------
+
+This is an XBLA title, so there is no disc image. What you need is the LIVE /
+STFS content package for Daytona USA, copied off your own Xbox 360 (the file
+usually has no extension and a long hexadecimal name; its first four bytes are
+the letters LIVE).
+
+With Python 3 installed, from this folder:
+
+    python extract_game.py "<path to your STFS package>" --assets assets --out extracted
+
+That writes assets\default.xex, which is the only file the game needs to start.
+The extracted\ folder it also creates is just the unpacked contents of the
+package; you can delete it afterwards.
+
+If the extractor reports "is not an Xbox 360 LIVE/STFS package", you have
+pointed it at the wrong file - most likely an already-extracted default.xex
+rather than the package that contains it.
+
+
+TO PLAY
+-------
+
+Once assets\default.xex exists, double-click daytona.exe. It loads the .\assets
+folder next to it, so there is no launcher and no configuration to do first.
+
+
+REQUIREMENTS
+------------
+
+Windows 10/11 x64, a Direct3D 12 capable GPU, and the Microsoft Visual C++
+Redistributable (x64):  https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+
+SETTINGS AND LOGS
+-----------------
+
+Edit daytona.ini next to the exe, then restart - the settings are read at
+startup, not live. It covers window size, fullscreen, monitor, vsync, letterbox
+and safe area under [Display]; filtering and upscaler under [Graphics]; and log
+level under [Diagnostics]. Leave game_resolution at 1280x720 for authentic
+output - it is the guest render resolution, not the window size.
+
+Logs are written to logs\daytona_NNN.log next to the exe. If the game fails to
+start, that file is the first thing to look at - and the most useful thing to
+attach to a bug report.
