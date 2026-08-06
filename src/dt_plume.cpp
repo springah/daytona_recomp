@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -1672,8 +1673,28 @@ bool BeginFrame() {
     return true;
 }
 
+// Where does the frame time go? Accumulated per bucket, reported every 300
+// frames by EndFrame. Wall-clock between EndFrames is the frame time; the
+// buckets name our share of it, and the remainder is the guest's.
+double g_ms_endframe = 0.0;
+double g_ms_scatter = 0.0;
+double g_ms_record = 0.0;
+uint32_t g_scatter_count = 0;
+std::chrono::steady_clock::time_point g_last_endframe{};
+
+struct ScopedMs {
+    double& acc;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    explicit ScopedMs(double& a) : acc(a) {}
+    ~ScopedMs() {
+        acc += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
 void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t vertex_count,
                    const uint8_t* base) {
+    ScopedMs timer(g_ms_record);
     if (c.pipeline_state != PipelineState::kBuilt || c.pipeline == nullptr) return;
     if (g_index_state != IndexState::kReady) return;
     if (!BeginFrame()) return;
@@ -1926,8 +1947,23 @@ void PumpWindow() {
 // renderer reporting success while drawing nothing.
 void EndFrame() {
     if (!g_frame_open) return;
+    ScopedMs timer(g_ms_endframe);
     g_frame_open = false;
     ++g_frame_index;
+    if ((g_frame_index % 300) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        const double wall = g_last_endframe.time_since_epoch().count() != 0
+            ? std::chrono::duration<double, std::milli>(now - g_last_endframe).count() : 0.0;
+        REXLOG_WARN("plume: timing over 300 frames -- wall {:.0f}ms ({:.1f}fps), endframe "
+                    "{:.0f}ms, scatter {:.0f}ms ({} scatters), record {:.0f}ms, guest+rest "
+                    "{:.0f}ms",
+                    wall, wall > 0 ? 300000.0 / wall : 0.0, g_ms_endframe, g_ms_scatter,
+                    g_scatter_count, g_ms_record,
+                    wall - g_ms_endframe - g_ms_scatter - g_ms_record);
+        g_last_endframe = now;
+        g_ms_endframe = g_ms_scatter = g_ms_record = 0.0;
+        g_scatter_count = 0;
+    }
 
     const bool report = g_capture_resolve ||
         g_frame_index <= kReportedFrames || (g_frame_index % kReportInterval) == 0;
@@ -2026,6 +2062,16 @@ void EndFrame() {
                 REXLOG_WARN("plume: wrote frame {} to {}", g_frame_index, path);
             }
         }
+    }
+    // The pixel census and the FRAME log below are diagnostics: skip them on
+    // frames that only reached this path because the resolve wanted the pixels
+    // (g_capture_resolve is true on essentially EVERY frame now), or a 921600-
+    // pixel scan plus a log line runs 60 times a second for nobody.
+    const bool periodic = g_frame_index <= kReportedFrames ||
+        (g_frame_index % kReportInterval) == 0;
+    if (!periodic) {
+        g_readback->unmap();
+        return;
     }
     // "Differs from the clear", not "is not black": a shader that outputs black
     // is drawing, and counting non-black pixels once reported NOTHING DREW for
@@ -2713,9 +2759,20 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
         return;
     }
 
+    // One scatter per (destination, captured frame). The guest resolves ~120
+    // times a second but the pixels only change when a frame is captured, and
+    // a full 1080p tiled write is ~2M TiledOffset2D computations -- repeating
+    // it for identical pixels was a large slice of the 18fps-instead-of-60.
+    static std::unordered_map<uint32_t, uint32_t> written;   // dest phys -> frame
+    auto& stamp = written[phys];
+    if (stamp == g_frame_index + 1u) return;   // +1: 0 must not match a fresh entry
+    stamp = g_frame_index + 1u;
+
     // Nearest-scale our frame into the destination, packing guest-order ARGB
     // big-endian -- the exact inverse of ReadTexture's k_8_8_8_8 unpack, which
     // round-tripped correctly (the logos' colours were verified by eye).
+    ScopedMs scatter_timer(g_ms_scatter);
+    ++g_scatter_count;
     std::vector<uint32_t> sx_map(t.width);
     for (uint32_t x = 0; x < t.width; ++x) sx_map[x] = x * kFrameW / t.width;
     for (uint32_t y = 0; y < t.height; ++y) {
