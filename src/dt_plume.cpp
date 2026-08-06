@@ -54,6 +54,10 @@ bool g_texprobe = true;
 // Likewise: the GPU-side close of the resolve loop. See the resolve mirror
 // beside the frame target for what it does and why it is exact.
 bool g_gpuloop = true;
+// Likewise: whether D3DRESOLVE_CLEARRENDERTARGET / CLEARDEPTHSTENCIL in a
+// resolve's Flags actually clear our frame target. MEASURED first: Daytona
+// sets 0x0300 on three resolves in four. See OnResolveFlags.
+bool g_resolveclear = true;
 
 std::unique_ptr<plume::RenderInterface> g_interface;
 std::unique_ptr<plume::RenderDevice> g_device;
@@ -606,6 +610,7 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_PERSIST")) g_persist = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_TEXPROBE")) g_texprobe = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_GPULOOP")) g_gpuloop = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_RESOLVECLEAR")) g_resolveclear = std::atoi(p) != 0;
     REXLOG_WARN("plume: frame target {} across Swaps (DT_PLUME_PERSIST={})",
                 g_persist ? "PERSISTS -- only the guest clear clears it" : "is cleared every frame",
                 g_persist ? 1 : 0);
@@ -1444,20 +1449,30 @@ const uint8_t* ResolveTextureMemory(const DecodedTexture& t, const uint8_t* base
                                     uint32_t needed, uint32_t* out_alias = nullptr) {
     static constexpr uint32_t kAliases[] = {0xA0000000u, 0xC0000000u, 0xE0000000u, 0x80000000u};
     const uint8_t* src = nullptr;
+    bool all_zero = false;
     for (uint32_t alias : kAliases) {
         const uint8_t* p = dt_guest_mem::Resolve(base, alias | t.base_address, needed);
         if (p == nullptr) continue;
         size_t nonzero = 0;
         for (uint32_t i = 0; i < needed && i < 0x40000u; ++i) nonzero += (p[i] != 0);
-        static std::set<uint32_t> reported;
-        if (reported.insert(alias | t.base_address).second) {
-            REXLOG_WARN("plume: texture {:08X} via {:08X} alias -- {} non-zero bytes in the first "
-                        "256 KB", t.base_address, alias, nonzero);
-        }
+        // The per-alias line this used to print was one of three the upload path
+        // emitted per texture, and at ~200 textures that is 600 lines of a log
+        // whose signal lives elsewhere. The alias it CHOSE is now folded into
+        // the single upload line; only the case where nothing has content is
+        // still worth its own line, because that is the failure this function
+        // exists to catch.
         if (src == nullptr || nonzero != 0) {
             src = p;
             if (out_alias != nullptr) *out_alias = alias;
             if (nonzero != 0) break;
+            all_zero = true;
+        }
+    }
+    if (src != nullptr && all_zero) {
+        static std::set<uint32_t> reported;
+        if (reported.insert(t.base_address).second) {
+            REXLOG_WARN("plume: texture {:08X} reads as ALL ZERO through every alias -- either the "
+                        "art is not there yet or the address is wrong", t.base_address);
         }
     }
     return src;
@@ -1818,6 +1833,11 @@ struct TexCache {
     uint64_t probe = 0;        // sampled hash of the source at upload time
     uint32_t resolve_stamp = 0;   // g_resolve_written value the upload saw
     uint32_t reuploads = 0;
+    // Set by OnGpuCacheInvalidate when the guest says it rewrote memory this
+    // entry reads. Exact where the sampled probe is only probabilistic, and it
+    // costs nothing to check: one bool on the cache-hit path.
+    bool dirty = false;
+    uint32_t phys = 0;         // base_address & 0x1FFFFFFF, for range compares
 };
 // Cache key -> entry. Keyed on the base address AND on the format and
 // swizzle, not on the address alone: the upload bakes the swizzle in (k_8_8 is
@@ -1827,6 +1847,12 @@ struct TexCache {
 // the symptom -- one surface wearing another's palette index -- looks like a
 // decode bug rather than a cache bug.
 std::unordered_map<uint64_t, TexCache> g_texture_index;
+// The physical span every cached texture's source lies inside, maintained on
+// upload. D3DDevice_InvalidateGpuCache fires ~8 times a frame and the cache
+// holds hundreds of entries; this turns the common "nowhere near a texture"
+// call into one pair of comparisons instead of a walk of the whole index.
+uint32_t g_tex_phys_lo = UINT32_MAX;
+uint32_t g_tex_phys_hi = 0;
 // Destination physical address -> the frame index whose pixels were last
 // scattered there by OnResolve. A texture bound at that address is stale the
 // moment this moves; it is exact, unlike the byte probe, because we are the
@@ -2104,6 +2130,10 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
         const char* why = nullptr;
         if (stamp != c.resolve_stamp) {
             why = "resolved into";
+        } else if (c.dirty) {
+            // The guest's own signal, so it is exact -- and it is checked
+            // BEFORE the probe because it is also the cheaper question.
+            why = "InvalidateGpuCache";
         } else if (g_texprobe &&
                    ProbeSource(t, c.source_alias, c.source_bytes, base) != c.probe) {
             why = "contents changed";
@@ -2112,7 +2142,13 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
 
         ++c.reuploads;
         ++g_texture_reuploads;
-        if (c.reuploads <= 2 || (g_texture_reuploads % 2048) == 0) {
+        // One line the first time an entry re-uploads for a NEW reason, plus
+        // one every 100th overall. The old rule (first two per entry) printed
+        // three lines for every texture the game ever streams, which at a few
+        // hundred textures was most of a default run's log.
+        static std::set<std::pair<uint32_t, const char*>> reasons;
+        const bool novel = reasons.emplace(t.base_address, why).second;
+        if (novel || (g_texture_reuploads % 100) == 0) {
             REXLOG_WARN("plume: texture {:08X} {}x{} {} -- re-uploading (this one {} times, {} "
                         "re-uploads overall)",
                         t.base_address, t.width, t.height, why, c.reuploads,
@@ -2152,14 +2188,11 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     //
     // Only on the FIRST upload of an address: re-uploads now happen every frame
     // for the resolve destinations, and an 8 MB byte count plus a log line at
-    // 60 Hz is a measurement that pays for nothing.
+    // 60 Hz is a measurement that pays for nothing. It no longer gets a line of
+    // its own either -- it is folded into the one line the upload prints.
+    size_t nonzero = 0;
     if (reuse_slot == UINT32_MAX) {
-        size_t nonzero = 0;
         for (uint8_t byte : up.data) nonzero += (byte != 0);
-        REXLOG_WARN("plume: texture {:08X} {}x{} read as {} rows x {} B: {} of {} bytes non-zero "
-                    "(endian {})",
-                    t.base_address, t.width, t.height, up.rows, up.row_bytes, nonzero,
-                    up.data.size(), t.endianness);
     }
 
     // A re-upload keeps its heap slot and, when the geometry has not changed,
@@ -2241,17 +2274,25 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base) {
     c.source_bytes = up.source_bytes;
     c.source_alias = up.source_alias;
     c.probe = ProbeSource(t, up.source_alias, up.source_bytes, base);
+    c.dirty = false;                                  // this upload IS the answer
+    c.phys = t.base_address & 0x1FFFFFFFu;
+    g_tex_phys_lo = std::min(g_tex_phys_lo, c.phys);
+    g_tex_phys_hi = std::max(g_tex_phys_hi, c.phys + up.source_bytes);
     if (auto rw = g_resolve_written.find(t.base_address & 0x1FFFFFFFu);
         rw != g_resolve_written.end()) {
         c.resolve_stamp = rw->second;
     }
+    // ONE line per new texture. It used to be three -- an alias probe, a
+    // non-zero byte count, and this -- which at a few hundred textures was
+    // most of a default run's log for information any one of them carries.
     if (reuse_slot == UINT32_MAX) {
         REXLOG_WARN("plume: uploaded texture {}x{} guest format {} as plume format {} {} base "
-                    "{:08X} swizzle {} ({:03X}) endian {} sign {}{}{}{} numfmt {} -> heap slot {}",
+                    "{:08X} via {:08X} swizzle {} ({:03X}) endian {} sign {}{}{}{} numfmt {} "
+                    "-- {} of {} bytes non-zero -> heap slot {}",
                     t.width, t.height, t.format, static_cast<uint32_t>(up.format),
-                    t.tiled ? "tiled" : "linear", t.base_address, SwizzleName(t.swizzle),
-                    t.swizzle, t.endianness, t.sign[0], t.sign[1], t.sign[2], t.sign[3],
-                    t.num_format, slot);
+                    t.tiled ? "tiled" : "linear", t.base_address, up.source_alias,
+                    SwizzleName(t.swizzle), t.swizzle, t.endianness, t.sign[0], t.sign[1],
+                    t.sign[2], t.sign[3], t.num_format, nonzero, up.data.size(), slot);
     }
 
     // DT_PLUME_TEXDUMP=<dir>: the staged RGBA8 bytes, exactly as the GPU will
@@ -3961,6 +4002,223 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
     }
 }
 
+// ── D3DDevice_Resolve's Flags: does Daytona clear THROUGH the resolve? ───────
+//
+// XDK 20209 d3d9types.h:222 gives Resolve's Flags two clear bits:
+//
+//   D3DRESOLVE_CLEARRENDERTARGET  0x0100   clear the RT after resolving
+//   D3DRESOLVE_CLEARDEPTHSTENCIL  0x0200   clear depth/stencil after resolving
+//
+// with the values riding on Resolve's own pClearColor / ClearZ / ClearStencil
+// parameters. So a title can clear EDRAM entirely through Resolve and never
+// call Clear once -- and with the frame target now persisting across Swap,
+// such a title presents as "the target never clears", which is indistinguish-
+// able from a bug in the persistence.
+//
+// This MEASURES first. Building the clear-after-resolve path for a bit the
+// game never sets would be dead code that can only rot; leaving the
+// measurement in is cheap insurance that says so out loud if it ever changes.
+//
+// Read at D3DDevice_ResolveEx (sub_8222DA70) rather than at D3DDevice_Resolve,
+// because the latter is a shim that shifts its arguments and tail-calls this
+// one: Flags stays in r4 either way, so this sees BOTH entry points.
+uint32_t g_resolve_flag_calls = 0;
+struct ResolveFlagSeen { uint32_t flags = 0; uint32_t count = 0; };
+constexpr uint32_t kMaxResolveFlags = 24;
+ResolveFlagSeen g_resolve_flags[kMaxResolveFlags];
+uint32_t g_resolve_flag_count = 0;
+uint32_t g_resolve_flag_overflow = 0;
+uint32_t g_resolve_clears = 0;   // resolve-clears folded into g_clear_pending
+
+const char* ResolveSourceName(uint32_t flags) {
+    switch (flags & 0x7u) {
+        case 0: return "RT0";
+        case 1: return "RT1";
+        case 2: return "RT2";
+        case 3: return "RT3";
+        case 4: return "DEPTHSTENCIL";
+        default: return "?";
+    }
+}
+
+// MEASURED (boot -> menu -> circuit select -> race): TWO distinct values, and
+// three resolves in four carry the clear.
+//
+//   0x0000  x14166   source RT0
+//   0x0300  x42492   source RT0  CLEARRENDERTARGET  CLEARDEPTHSTENCIL
+//
+// with pClearColor reading (1.000, 1.000, 1.000, 0.000). So the persisted frame
+// target is not merely allowed to be cleared by the guest's ClearF -- the guest
+// clears it three times as often through the resolve, and ignoring that leaves
+// every pass compositing on top of the previous pass's leftovers.
+//
+// The clear is recorded as PENDING rather than executed here, which is both
+// cheaper and more correct: a resolve-clear happens AFTER the copy-out, and
+// OnResolve (which runs later in the same guest call, from the D3DDevice_Resolve
+// hook) is what captures and closes the frame. BeginFrame executes it on the
+// next draw -- exactly the path a between-frames ClearF already takes.
+void OnResolveFlags(uint32_t flags, uint32_t stack_ea, float clear_z, const uint8_t* base) {
+    if (!Enabled()) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_resolve_flag_calls;
+
+    // pClearColor rides in the outgoing parameter slot at r1+92 and ClearStencil
+    // at r1+108 -- read off D3DDevice_Resolve's shim, which stores its incoming
+    // r10 there (`stw r31,92(r1)`) rather than guessed from an ABI. ClearZ is a
+    // float parameter, so it is in f1, which is why it arrives as an argument.
+    float clear[4] = {0, 0, 0, 0};
+    bool have_colour = false;
+    uint32_t colour_ea = 0, stencil = 0;
+    if ((flags & 0x0300u) != 0 && stack_ea != 0) {
+        if (const uint8_t* slot = dt_guest_mem::Resolve(base, stack_ea + 92, 4)) {
+            colour_ea = LoadBE32(slot);
+            if (const uint8_t* p = dt_guest_mem::Resolve(base, colour_ea, 16)) {
+                for (uint32_t i = 0; i < 4; ++i) {
+                    const uint32_t bits = LoadBE32(p + i * 4);
+                    std::memcpy(&clear[i], &bits, 4);
+                }
+                have_colour = true;
+            }
+        }
+        if (const uint8_t* slot = dt_guest_mem::Resolve(base, stack_ea + 108, 4)) {
+            stencil = LoadBE32(slot);
+        }
+
+        if (g_resolveclear) {
+            // Translate resolve-clear bits into the D3DCLEAR_* vocabulary
+            // ApplyGuestClear already speaks. TARGET is four bits (one per MRT)
+            // and this resolve names one source, so only the colour bit for
+            // RT0 is set -- ApplyGuestClear tests the mask, not equality.
+            uint32_t pending = 0;
+            if (flags & 0x0100u) {
+                pending |= 0x01u;                       // D3DCLEAR_TARGET0
+                if (have_colour) {
+                    for (uint32_t i = 0; i < 4; ++i) g_clear_color[i] = clear[i];
+                }
+            }
+            if (flags & 0x0200u) {
+                pending |= 0x10u | 0x20u;               // ZBUFFER | STENCIL
+                g_clear_z = clear_z;
+                g_clear_stencil = stencil;
+            }
+            // Always pending, never immediate: the clear follows the copy-out,
+            // and the copy-out has not happened yet at this point in the call.
+            g_clear_pending |= pending;
+            ++g_resolve_clears;
+        }
+    }
+
+    for (uint32_t i = 0; i < g_resolve_flag_count; ++i) {
+        if (g_resolve_flags[i].flags == flags) {
+            ++g_resolve_flags[i].count;
+            return;
+        }
+    }
+    if (g_resolve_flag_count >= kMaxResolveFlags) {
+        ++g_resolve_flag_overflow;
+        return;
+    }
+    g_resolve_flags[g_resolve_flag_count++] = {flags, 1};
+
+    REXLOG_WARN("plume: RESOLVE FLAGS {:#06x} (new, call #{}) -- source {} fragments {:#x} "
+                "exp-bias {}{}{} (frame {})",
+                flags, g_resolve_flag_calls, ResolveSourceName(flags), (flags >> 4) & 0x7u,
+                int32_t(flags) >> 26,
+                (flags & 0x0100u) ? "  *** CLEARRENDERTARGET ***" : "",
+                (flags & 0x0200u) ? "  *** CLEARDEPTHSTENCIL ***" : "", g_frame_index);
+    if (flags & 0x0300u) {
+        REXLOG_WARN("plume:   resolve-clear colour ptr {:08X} -> {} z={:.3f} stencil={} -- {}",
+                    colour_ea,
+                    have_colour ? fmt::format("({:.3f},{:.3f},{:.3f},{:.3f})", clear[0], clear[1],
+                                              clear[2], clear[3])
+                                : std::string("(unreadable)"),
+                    clear_z, stencil,
+                    g_resolveclear ? "APPLIED to the frame target"
+                                   : "IGNORED (DT_PLUME_RESOLVECLEAR=0)");
+    }
+}
+
+// ── D3DDevice_InvalidateGpuCache (sub_82221818) ──────────────────────────────
+//
+//   void D3DDevice_InvalidateGpuCache(D3DDevice*, void* pBaseAddress, DWORD Size,
+//                                     DWORD Flags)      (XDK 20209 d3d9.h:2286)
+//
+// r4/r5 verified against the recompiled body, not taken on the trace map's
+// word: it saves r4 into r30 and r5 into r29, masks r30 with 0x1FFFFFFF (the
+// physical address) and computes r29 = r30 + r29, i.e. an [address, address +
+// size) range. That is an EXACT dirty signal, delivered by the game, for the
+// case the sampled content probe is structurally blind to: a small patch to a
+// UI atlas that lands entirely between the probe's 32 windows.
+//
+// Measured before it is wired, for the same reason as the resolve flags: a
+// hook on a call the game never makes usefully is worse than no hook.
+uint64_t g_gpucache_calls = 0;
+struct GpuCacheRange { uint32_t base = 0; uint32_t size = 0; uint32_t count = 0; uint32_t hits = 0; };
+constexpr uint32_t kMaxGpuCacheRanges = 96;
+GpuCacheRange g_gpucache_ranges[kMaxGpuCacheRanges];
+uint32_t g_gpucache_range_count = 0;
+uint32_t g_gpucache_range_overflow = 0;
+uint32_t g_gpucache_dirtied = 0;      // cache entries marked dirty by it
+
+void OnGpuCacheInvalidate(uint32_t base_addr, uint32_t size) {
+    if (!Enabled()) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_gpucache_calls;
+
+    // Distinct (base,size) census, bounded. The first few of each are logged so
+    // an unattended run records WHEN they happen relative to the screen it is
+    // on; after that the census carries the counts and Dump prints it.
+    bool novel = false;
+    GpuCacheRange* rec = nullptr;
+    for (uint32_t i = 0; i < g_gpucache_range_count; ++i) {
+        if (g_gpucache_ranges[i].base == base_addr && g_gpucache_ranges[i].size == size) {
+            rec = &g_gpucache_ranges[i];
+            break;
+        }
+    }
+    if (rec == nullptr) {
+        if (g_gpucache_range_count < kMaxGpuCacheRanges) {
+            rec = &g_gpucache_ranges[g_gpucache_range_count++];
+            rec->base = base_addr;
+            rec->size = size;
+            novel = true;
+        } else {
+            ++g_gpucache_range_overflow;
+        }
+    }
+    if (rec != nullptr) ++rec->count;
+    if (novel && g_gpucache_range_count <= 8) {
+        REXLOG_WARN("plume: INVALIDATE GPU CACHE {:08X}+{:#x} (new range #{}, call #{}, frame {})",
+                    base_addr, size, g_gpucache_range_count, g_gpucache_calls, g_frame_index);
+    }
+
+    // Mark every cached texture whose source bytes the guest just rewrote, so
+    // the next bind re-uploads without waiting for the sampled probe to happen
+    // to land on a changed byte. The probe stays as the backstop for memory the
+    // guest rewrites WITHOUT telling us.
+    //
+    // The address is a GPU address; the physical one is the low 29 bits, which
+    // is what the function's own body masks off. The span check first: this
+    // fires thousands of times a second and the index holds hundreds of
+    // entries, and almost none of these calls are anywhere near a texture.
+    if (size == 0 || g_tex_phys_lo >= g_tex_phys_hi) return;
+    const uint32_t lo = base_addr & 0x1FFFFFFFu;
+    const uint32_t hi = lo + size;
+    if (hi <= g_tex_phys_lo || lo >= g_tex_phys_hi) return;
+    for (auto& [key, c] : g_texture_index) {
+        if (c.dirty || c.source_bytes == 0) continue;
+        if (hi <= c.phys || lo >= c.phys + c.source_bytes) continue;
+        c.dirty = true;
+        ++g_gpucache_dirtied;
+        if (rec != nullptr) ++rec->hits;
+        if (g_gpucache_dirtied <= 8) {
+            REXLOG_WARN("plume: INVALIDATE GPU CACHE {:08X}+{:#x} dirties cached texture {:08X}"
+                        "+{:#x} ({}x{}) -- exactly the change the sampled probe can miss",
+                        base_addr, size, c.phys, c.source_bytes, c.width, c.height);
+        }
+    }
+}
+
 void OnFrameEnd() {
     if (!Enabled() || !g_init_ok) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -4019,6 +4277,41 @@ void Dump(const char* reason) {
                     c.decl_ea, c.decl_mismatch ? "(VARIES!)" : "",
                     streams.empty() ? "(none bound)" : streams);
     }
+    // The two guest-side dirty/clear signals, measured rather than assumed.
+    REXLOG_WARN("   --- resolve Flags ({} calls, {} distinct{}, {} clears folded into the frame "
+                "target) ---", g_resolve_flag_calls, g_resolve_flag_count,
+                g_resolve_flag_overflow ? ", TABLE FULL" : "", g_resolve_clears);
+    for (uint32_t i = 0; i < g_resolve_flag_count; ++i) {
+        REXLOG_WARN("   {:#06x}  x{:<8} source {}{}{}", g_resolve_flags[i].flags,
+                    g_resolve_flags[i].count, ResolveSourceName(g_resolve_flags[i].flags),
+                    (g_resolve_flags[i].flags & 0x0100u) ? "  CLEARRENDERTARGET" : "",
+                    (g_resolve_flags[i].flags & 0x0200u) ? "  CLEARDEPTHSTENCIL" : "");
+    }
+    // The texture span is the POSITIVE CONTROL for "dirtied 0": without it,
+    // a span that was never populated and a guest that never invalidates a
+    // texture produce the same zero, and only one of those is a finding.
+    REXLOG_WARN("   --- InvalidateGpuCache ({} calls, {} distinct ranges{}, {} cache entries "
+                "dirtied; cached textures span {:08X}..{:08X}) ---", g_gpucache_calls,
+                g_gpucache_range_count, g_gpucache_range_overflow ? ", TABLE FULL" : "",
+                g_gpucache_dirtied,
+                g_tex_phys_lo == UINT32_MAX ? 0 : g_tex_phys_lo, g_tex_phys_hi);
+    // Busiest ranges only: the table holds 96 and printing all of them made
+    // this census the largest single item in a default log.
+    {
+        std::vector<uint32_t> order(g_gpucache_range_count);
+        for (uint32_t i = 0; i < g_gpucache_range_count; ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [](uint32_t a, uint32_t b) {
+            return g_gpucache_ranges[a].count > g_gpucache_ranges[b].count;
+        });
+        const uint32_t show = std::min<uint32_t>(8, g_gpucache_range_count);
+        for (uint32_t i = 0; i < show; ++i) {
+            const GpuCacheRange& r = g_gpucache_ranges[order[i]];
+            REXLOG_WARN("   {:08X}+{:<#9x} x{:<8} dirtied {}", r.base, r.size, r.count, r.hits);
+        }
+        if (g_gpucache_range_count > show) {
+            REXLOG_WARN("   (+{} quieter ranges)", g_gpucache_range_count - show);
+        }
+    }
     REXLOG_WARN("   --- vertex declarations bound ({} distinct) ---", g_decl_count);
     for (uint32_t i = 0; i < g_decl_count; ++i) {
         REXLOG_WARN("   decl {:08X}  binds={}", g_decls[i].ea, g_decls[i].binds);
@@ -4047,6 +4340,8 @@ void Shutdown() {
     g_index_state = IndexState::kNone;
     g_textures.clear();
     g_texture_index.clear();
+    g_tex_phys_lo = UINT32_MAX;
+    g_tex_phys_hi = 0;
     // The views go before the texture they view, and both before the heap they
     // are written into.
     g_mirror_views.clear();

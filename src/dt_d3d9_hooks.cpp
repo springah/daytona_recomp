@@ -126,7 +126,12 @@ DT_D3D9_TRACE(sub_8221FC10, 34)  // (unidentified)
 DT_D3D9_TRACE(sub_8221FC20, 35)  // D3DDevice_SetViewport
 DT_D3D9_TRACE(sub_822203C0, 36)  // D3DResource_GetType
 DT_D3D9_TRACE(sub_82221700, 37)  // D3DResource_Release
-DT_D3D9_TRACE(sub_82221818, 38)  // D3DDevice_InvalidateGpuCache
+// D3DDevice_InvalidateGpuCache(pDevice, pBaseAddress, Size, Flags) -- r4/r5
+// read off the recompiled body (it saves r4 into r30, r5 into r29, masks r30
+// to the low 29 bits and forms r29 = r30 + r29, an [address, address+size)
+// range), not off the trace map's label.
+DT_D3D9_TRACE_SEM(sub_82221818, 38,
+                  dt_plume::OnGpuCacheInvalidate(ctx.r4.u32, ctx.r5.u32))
 DT_D3D9_TRACE_SEM2(sub_82221918, 39, dt_plume::OnDrawVertices(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, base), dt_plume::SnapshotDrawVertices(base))  // D3DDevice_DrawVertices
 DT_D3D9_TRACE(sub_82222B70, 40)  // (unidentified)
 DT_D3D9_TRACE(sub_82222B90, 41)  // (unidentified)
@@ -234,7 +239,14 @@ REX_HOOK_RAW(sub_8222C390) {
 }
 DT_D3D9_TRACE(sub_8222C6A8, 103)  // D3DDevice_SetPredication
 DT_D3D9_TRACE(sub_8222C818, 104)  // D3DDevice_BeginTiling
-DT_D3D9_TRACE(sub_8222DA70, 105)  // D3DDevice_ResolveEx
+// D3DDevice_ResolveEx -- and, because D3DDevice_Resolve (sub_8222EBC0) is a
+// shim that shifts its arguments right and tail-calls this one, the single
+// place where EVERY resolve's Flags word can be read. Flags is r4 in both.
+// `pre`, so the value is the one the guest passed rather than whatever the
+// resolve left behind.
+DT_D3D9_TRACE_SEM(sub_8222DA70, 105,
+                  dt_plume::OnResolveFlags(ctx.r4.u32, ctx.r1.u32,
+                                           static_cast<float>(ctx.f1.f64), base))  // ResolveEx
 DT_D3D9_TRACE(sub_82230DB0, 106)  // (unidentified)
 DT_D3D9_TRACE(sub_82233260, 107)  // D3DVertexShader_Bind
 DT_D3D9_TRACE(sub_822337F0, 108)  // (unidentified)

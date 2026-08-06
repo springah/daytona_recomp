@@ -158,6 +158,32 @@ void OnClear(uint32_t flags, uint32_t rect_ea, uint32_t color_ea, float z, uint3
 // is embedded in the header); resolution and scaling are derived from it.
 void OnResolve(uint32_t dest_texture_ea, const uint8_t* base);
 
+// D3DDevice_ResolveEx (sub_8222DA70) -- the resolve's Flags word, which carries
+// D3DRESOLVE_CLEARRENDERTARGET (0x0100) and D3DRESOLVE_CLEARDEPTHSTENCIL
+// (0x0200): a console title may clear EDRAM entirely through Resolve and never
+// call Clear once. Taken here rather than at D3DDevice_Resolve because that is
+// a shim which shifts its arguments and tail-calls this, so this one hook sees
+// both entry points with Flags still in r4.
+//
+// MEASURED: Daytona sets 0x0300 (both clear bits) on three resolves in four,
+// clear colour (1,1,1,0). So this is not a hypothetical -- with the frame
+// target persisting across Swap, the resolve-clear is the majority of what
+// clears it. Recorded as a pending clear that the next BeginFrame executes,
+// because a resolve-clear happens after the copy-out. DT_PLUME_RESOLVECLEAR=0
+// reverts to ignoring the bits.
+//
+// `stack_ea` is the guest r1 at entry; pClearColor lives at r1+92 and
+// ClearStencil at r1+108 (the shim's `stw r31,92(r1)` / `stw r29,108(r1)`).
+// ClearZ is a float parameter, hence in f1, hence passed in.
+void OnResolveFlags(uint32_t flags, uint32_t stack_ea, float clear_z, const uint8_t* base);
+
+// D3DDevice_InvalidateGpuCache(pDevice, pBaseAddress, Size, Flags)
+// (XDK 20209 d3d9.h:2286) -- the guest's own "I rewrote this memory" signal,
+// which on real hardware it MUST issue or the GPU's texture cache serves stale
+// texels. Exact, free, and blind to none of the changes the sampled content
+// probe cannot see. r4/r5 verified against the recompiled body.
+void OnGpuCacheInvalidate(uint32_t base_addr, uint32_t size);
+
 // D3DDevice_Swap -- the game's frame boundary, and so ours.
 //
 // Every draw between two Swaps is recorded into ONE command list against ONE
