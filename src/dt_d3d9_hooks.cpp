@@ -10,9 +10,48 @@
 // listed at the bottom and must be folded into their existing bodies in phase 1.
 #include "daytona_init.h"
 #include "dt_d3d9_trace.h"
+#include "dt_guest_mem.h"
 #include "dt_plume.h"
 
 #include <rex/hook.h>
+
+namespace {
+// Guest ea -> host pointer, guarded (dt_guest_mem.h explains why an unguarded
+// read of a reverse-engineered address is the expensive failure mode).
+const uint8_t* HookGuestResolve(uint32_t ea, uint32_t size, void* ctx) {
+    return dt_guest_mem::Resolve(static_cast<const uint8_t*>(ctx), ea, size);
+}
+}  // namespace
+
+// ── The vertex-layout patcher ────────────────────────────────────────────────
+//
+// sub_82231BF8 is where D3D9 writes the real vertex format into a shader's
+// vfetch instructions, and BOTH patch paths converge on it:
+//
+//   D3DVertexShader_Bind (sub_82233260+0xD0) patches a second copy inside the
+//     shader's own microcode allocation, at *(shader+32) + *(record+0);
+//   IncrementalShaderPatchAndLoad (sub_822324F8+0x12C) memcpy's the microcode
+//     into the PM4 command buffer it is building an IM_LOAD_IMMEDIATE packet
+//     around, and patches THAT.
+//
+// The second is the path the 83%-of-draws shader takes, and it is why no amount
+// of re-reading the shader object ever showed a patched vfetch: the only patched
+// copy is in a command buffer on its way to the GPU, overwritten by the next
+// draw. Reading it has to happen here, at the patch, or not at all.
+//
+//   r3 = D3DVertexShader*   r4 = destination microcode   r5 = D3DVertexDeclaration*
+//   r6 = per-element stride bytes   r7 = shader variant index
+//
+// All five are volatile, so they are latched before __imp__ runs; the patched
+// instructions only exist afterwards, so the read happens after.
+REX_HOOK_RAW(sub_82231BF8) {
+    const uint32_t shader_ea = ctx.r3.u32;
+    const uint32_t ucode_ea  = ctx.r4.u32;
+    const uint32_t decl_ea   = ctx.r5.u32;
+    const uint32_t variant   = ctx.r7.u32;
+    __imp__sub_82231BF8(ctx, base);
+    dt_plume::OnVfetchPatch(shader_ea, ucode_ea, decl_ea, variant, HookGuestResolve, base);
+}
 
 #define DT_D3D9_TRACE(sub, idx)               \
     REX_HOOK_RAW(sub) {                       \

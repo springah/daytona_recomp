@@ -6,6 +6,7 @@
 #include <rex/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -211,6 +212,11 @@ DeclBind g_decls[kMaxDecls];
 uint32_t g_decl_count = 0;
 uint32_t g_decl_overflow = 0;
 uint64_t g_incremental_calls = 0;
+uint64_t g_vfetch_patches = 0;
+// sub_82231BF8 runs ~300 times a second and takes the mutex, so it needs a
+// lock-free way to say "nothing left to learn". Set whenever every created
+// vertex shader has a layout, cleared when a new vertex shader appears.
+std::atomic<bool> g_vfetch_watch_idle{false};
 
 unsigned long g_render_thread = 0;
 bool g_thread_warned = false;
@@ -422,6 +428,30 @@ const char* UsageName(uint8_t usage) {
     }
 }
 
+// Called with g_mutex held after anything that could complete a layout. Once
+// every created vertex shader has one, the sub_82231BF8 watcher can early-out
+// without taking the lock at all.
+void RefreshVfetchWatch() {
+    bool idle = true;
+    for (const auto& [hash, s] : g_shaders) {
+        if (s.entry != nullptr && s.entry->is_vertex && !s.layout_done) { idle = false; break; }
+    }
+    g_vfetch_watch_idle.store(idle, std::memory_order_relaxed);
+}
+
+// Decode one vfetch instruction (3 big-endian dwords) into an attribute. The
+// field polarities are the ones ucode.h:716-718 documents; see FetchedAttribute.
+FetchedAttribute DecodeVfetch(uint32_t w0, uint32_t w1, uint32_t w2) {
+    FetchedAttribute a;
+    a.format = (w1 >> 16) & 0x3F;
+    a.normalized = ((w1 >> 13) & 1) == 0;
+    a.is_signed = ((w1 >> 12) & 1) != 0;
+    a.stride = (w2 & 0xFF) * 4;              // the instruction stores dwords
+    a.offset = ((w2 >> 8) & 0x7FFFFF) * 4;
+    a.fetch_const = ((w0 >> 20) & 0x1F) * 3 + ((w0 >> 25) & 0x3);
+    return a;
+}
+
 }  // namespace
 
 bool Enabled() {
@@ -554,6 +584,7 @@ void OnShaderCreated(uint64_t container_hash, bool is_vertex) {
     }
 
     g_shaders.emplace(container_hash, std::move(created));
+    RefreshVfetchWatch();   // a new vertex shader re-arms the patch watcher
 }
 
 void OnShaderObject(uint32_t shader_object_ea, uint64_t container_hash,
@@ -693,6 +724,112 @@ void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
             REXLOG_WARN("      ^^ UNMAPPED GPUVERTEXFORMAT {}", a.format);
         }
     }
+    RefreshVfetchWatch();
+}
+
+// sub_82231BF8 -- the leaf that actually rewrites the vfetch operands. See the
+// header for the contract; the short version is that `ucode_ea` is a WRITABLE
+// SCRATCH COPY of the microcode, and by the time __imp__ returns the patched
+// instructions are sitting at ucode_ea + address*12.
+//
+// This is the only place vs_0f1a's layout ever exists. Its scratch copy is the
+// PM4 command buffer that IncrementalShaderPatchAndLoad is about to hand to the
+// GPU, so nothing durable is left behind to read afterwards: the shader object,
+// its stored microcode and the second copy at *(shader+32)+*(record+0) all keep
+// the compiler's placeholder operands forever.
+void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
+                   uint32_t variant, GuestResolve resolve, void* ctx) {
+    if (!Enabled() || ucode_ea == 0 || resolve == nullptr) return;
+    // ~300 calls/second once the race is running; every one of them would
+    // otherwise contend for the same mutex the draw path uses.
+    if (g_vfetch_watch_idle.load(std::memory_order_relaxed)) return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_vfetch_patches;
+
+    auto oit = g_shader_objects.find(shader_ea);
+    if (oit == g_shader_objects.end()) return;
+    auto sit = g_shaders.find(oit->second);
+    if (sit == g_shaders.end() || sit->second.entry == nullptr) return;
+    Created& s = sit->second;
+    if (!s.entry->is_vertex || s.layout_done || s.entry->element_count == 0) return;
+
+    // Instructions are addressed from ucode_ea by instruction NUMBER, so the
+    // read span is fixed by the highest element the container declares.
+    uint32_t max_addr = 0;
+    for (uint32_t e = 0; e < s.entry->element_count; ++e) {
+        max_addr = std::max<uint32_t>(max_addr, uint32_t(s.entry->elements[e].address));
+    }
+    const uint32_t span = (max_addr + 1) * 12;
+    const uint8_t* ucode = resolve(ucode_ea, span, ctx);
+    if (ucode == nullptr) {
+        if (!s.diagnosed_incremental) {
+            s.diagnosed_incremental = true;
+            REXLOG_WARN("plume: {} vfetch patch -- destination {:08X} is not {} bytes of "
+                        "readable guest memory (variant {}, decl {:08X})",
+                        s.entry->name, ucode_ea, span, variant, decl_ea);
+        }
+        return;
+    }
+
+    // Only the fetch-constant field (bits 20-29) of word 0 is rewritten; the
+    // opcode, source and destination registers and the must-be-one bit are the
+    // compiler's and survive. Checking them is what makes it safe to trust an
+    // address computed from a reverse-engineered call contract: if this buffer
+    // were not this shader's microcode, five 20-bit checks would not all pass.
+    std::vector<FetchedAttribute> attrs;
+    for (uint32_t e = 0; e < s.entry->element_count; ++e) {
+        const auto& el = s.entry->elements[e];
+        const uint32_t d = uint32_t(el.address) * 3;
+        if ((d + 3) * 4 > s.code.size()) return;
+        const uint32_t w0 = LoadBE32(ucode + d * 4);
+        const uint32_t w1 = LoadBE32(ucode + (d + 1) * 4);
+        const uint32_t w2 = LoadBE32(ucode + (d + 2) * 4);
+        const uint32_t made_w0 = LoadBE32(&s.code[d * 4]);
+        if ((w0 & 0x000FFFFFu) != (made_w0 & 0x000FFFFFu)) {
+            if (!s.diagnosed_incremental) {
+                s.diagnosed_incremental = true;
+                REXLOG_WARN("plume: {} vfetch patch at {:08X}+{} is NOT this shader -- insn {} "
+                            "reads {:08X}, the container says {:08X} (variant {}, decl {:08X})",
+                            s.entry->name, ucode_ea, d * 4, el.address, w0, made_w0,
+                            variant, decl_ea);
+            }
+            return;
+        }
+        FetchedAttribute a = DecodeVfetch(w0, w1, w2);
+        a.usage = el.usage;
+        a.usage_index = el.usage_index;
+        a.instruction = el.address;
+        if (a.format == 0 && a.stride == 0) {
+            if (!s.logged_placeholder) {
+                s.logged_placeholder = true;
+                REXLOG_WARN("plume: {} vfetch patch at {:08X} left insn {} on the compiler's "
+                            "placeholder (w1={:08X} w2={:08X}) -- variant {}, decl {:08X}",
+                            s.entry->name, ucode_ea, el.address, w1, w2, variant, decl_ea);
+            }
+            return;
+        }
+        attrs.push_back(a);
+    }
+    if (attrs.empty()) return;
+
+    s.attributes = std::move(attrs);
+    s.layout_done = true;
+    REXLOG_WARN("plume: vertex layout for {} via the VFETCH PATCHER sub_82231BF8 "
+                "(ucode {:08X}, variant {}, decl {:08X} -- decl=0 is the 83%-of-draws case)",
+                s.entry->name, ucode_ea, variant, decl_ea);
+    for (const auto& a : s.attributes) {
+        const auto rf = ToRenderFormat(a.format, a.normalized, a.is_signed);
+        REXLOG_WARN("   {}{}  insn {:<3} format {:<3} ({})  stride {:<4} offset {:<4} "
+                    "fetch-const {} -> plume {}",
+                    UsageName(a.usage), a.usage_index, a.instruction,
+                    a.format, VertexFormatName(a.format), a.stride, a.offset,
+                    a.fetch_const, static_cast<uint32_t>(rf));
+        if (rf == plume::RenderFormat::UNKNOWN) {
+            REXLOG_WARN("      ^^ UNMAPPED GPUVERTEXFORMAT {}", a.format);
+        }
+    }
+    RefreshVfetchWatch();
 }
 
 bool BuildIndexBuffers() {
@@ -2563,6 +2700,7 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx) {
                     "(pending = shader not bound yet, so not patched yet)",
                     reason, derived, pending);
     }
+    RefreshVfetchWatch();
 }
 
 void OnSetVertexShader(uint32_t shader_ea) {
@@ -2841,8 +2979,10 @@ void Dump(const char* reason) {
                     dt_shader_blobs::kEntryCount - g_resolved, dt_shader_blobs::kEntryCount);
     }
 
-    REXLOG_WARN("   draws={} unresolved={} decl changes={} combos={} incremental-patches={}",
-                g_draws, g_draws_unresolved, g_decl_changes, g_combo_count, g_incremental_calls);
+    REXLOG_WARN("   draws={} unresolved={} decl changes={} combos={} incremental-patches={} "
+                "vfetch-patches-seen={} dropped-for-want-of-a-pipeline={}",
+                g_draws, g_draws_unresolved, g_decl_changes, g_combo_count, g_incremental_calls,
+                g_vfetch_patches, g_draws_nopipe);
     if (g_combo_overflow) {
         REXLOG_WARN("   WARNING: {} draws fell outside the {}-combo table -- the census below "
                     "is INCOMPLETE, raise kMaxCombos", g_combo_overflow, kMaxCombos);

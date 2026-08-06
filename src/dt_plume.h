@@ -67,6 +67,31 @@ void DeriveVertexLayouts(const char* reason, GuestResolve resolve, void* ctx);
 void OnIncrementalPatch(uint32_t shader_ea, uint32_t decl_ea, uint32_t ucode_ea,
                         GuestResolve resolve, void* ctx);
 
+// THE patcher itself: sub_82231BF8, the leaf both patch paths converge on.
+//
+// Read out of the guest (daytona_recomp.8.cpp:52944 and the two call sites at
+// sub_82233260+0xD0 / sub_822324F8+0x12C), its contract is:
+//
+//   sub_82231BF8(r3 = D3DVertexShader*, r4 = destination microcode,
+//                r5 = D3DVertexDeclaration*, r6 = per-element stride bytes,
+//                r7 = shader variant index)
+//
+// and its final loop is
+//
+//   for each patched element i:  memcpy(r4 + (index[i] & 0xFFF) * 12, triple, 12)
+//
+// i.e. it writes whole 3-dword vfetch instructions into `r4` indexed by
+// INSTRUCTION NUMBER -- the same numbering dt_shader_blobs stores in
+// element.address. That is the only moment a patched vertex layout exists in
+// addressable memory for the 83%-of-draws shader: IncrementalShaderPatchAndLoad
+// hands this function a scratch copy it has just memcpy'd INTO THE PM4 COMMAND
+// BUFFER (sub_822324F8 builds an IM_LOAD_IMMEDIATE packet around it), so the
+// result is DMA'd to the GPU and the shader object is never touched.
+//
+// `ucode_ea` must be latched before __imp__ runs: r4 is volatile.
+void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
+                   uint32_t variant, GuestResolve resolve, void* ctx);
+
 // Build one plume graphics pipeline per observed (VS, PS, topology) combination.
 // Needs the vertex layouts, so it only builds a combination once that shader's
 // layout is known. Safe to call repeatedly; already-built ones are skipped.
