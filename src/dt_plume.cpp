@@ -7,15 +7,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -64,6 +67,129 @@ bool g_arena = true;
 // Likewise: whether the swapchain is presented ONLY at the guest's Swap, or at
 // every EndFrame the way it used to be. See EndFrame for what that cost.
 bool g_swap_present = true;
+
+// Whether the resolve scatter is split across worker threads. DT_PLUME_MTSCATTER=0
+// runs it single-threaded, which is the A/B for it.
+bool g_mtscatter = true;
+
+// ── The scatter worker pool ──────────────────────────────────────────────────
+//
+// The scatter writes 1920x1080 texels into tiled guest memory, twice a frame,
+// and measured 2.56ms each -- 1536ms of a 4999ms 300-frame window, ~31% of wall.
+// The per-texel work is already table-driven (offsets and source columns are
+// precomputed); what is left is 2.07M scattered stores, which is latency-bound
+// on cache and TLB misses rather than on arithmetic. That kind of loop does not
+// get faster by doing less per texel. It gets faster by having more misses in
+// flight, which means more cores.
+//
+// Rows are independent: every (x,y) maps to its own destination bytes, so no two
+// rows write the same byte. Bands are a multiple of the 32-row tile height so a
+// band boundary never falls inside a tile -- two workers filling halves of the
+// same 32x32 tile would keep stealing each other's cache lines.
+class ScatterPool {
+public:
+    using Fn = std::function<void(uint32_t y0, uint32_t y1)>;
+
+    static ScatterPool& Get() {
+        static ScatterPool pool;
+        return pool;
+    }
+
+    uint32_t Workers() const { return 1u + static_cast<uint32_t>(threads_.size()); }
+
+    // Runs fn over [0,height) in bands, on the workers AND this thread. Returns
+    // once every band is done.
+    void Run(const Fn& fn, uint32_t height, uint32_t band) {
+        if (threads_.empty() || height <= band) { fn(0, height); return; }
+        const uint32_t bands = (height + band - 1u) / band;
+        // These are ATOMIC, not plain fields, and that is not defensiveness. A
+        // worker that wakes late enters Drain() after Run() has already seen
+        // every band finished -- it finds nothing to claim and returns, but it
+        // still READS these while the next Run() is writing them. Plain fields
+        // there is a data race, i.e. undefined behaviour, in a loop that only
+        // misbehaves under timing nobody reproduces on demand.
+        fn_.store(&fn, std::memory_order_relaxed);
+        height_.store(height, std::memory_order_relaxed);
+        band_.store(band, std::memory_order_relaxed);
+        band_count_.store(bands, std::memory_order_relaxed);
+        next_band_.store(0, std::memory_order_relaxed);
+        bands_done_.store(0, std::memory_order_relaxed);
+        {
+            // Publishes the task fields above to the workers: they read gen_
+            // under this same mutex, so the store to gen_ happens-before their
+            // read of fn_.
+            std::lock_guard<std::mutex> lk(m_);
+            ++gen_;
+        }
+        cv_.notify_all();
+        Drain();
+        while (bands_done_.load(std::memory_order_acquire) < bands) {
+            std::this_thread::yield();
+        }
+        // Deliberately NOT cleared to nullptr here. Clearing it races with a
+        // straggler entering Drain(), and leaving the pointer set is harmless:
+        // no band can be claimed until the next Run() republishes band_count_.
+    }
+
+private:
+    ScatterPool() {
+        const unsigned hw = std::thread::hardware_concurrency();
+        // Leave the guest threads, the render worker and the D3D12 driver some
+        // room; taking every core makes the frame it is trying to shorten late
+        // for other reasons.
+        const unsigned n = hw > 4u ? std::min(hw - 2u, 6u) : 1u;
+        for (unsigned i = 1; i < n; ++i) threads_.emplace_back([this] { Worker(); });
+    }
+
+    ~ScatterPool() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : threads_) if (t.joinable()) t.join();
+    }
+
+    void Worker() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [&] { return quit_ || gen_ != seen; });
+                if (quit_) return;
+                seen = gen_;
+            }
+            Drain();
+        }
+    }
+
+    void Drain() {
+        const Fn* fn = fn_.load(std::memory_order_relaxed);
+        if (fn == nullptr) return;
+        const uint32_t bands = band_count_.load(std::memory_order_relaxed);
+        const uint32_t band = band_.load(std::memory_order_relaxed);
+        const uint32_t height = height_.load(std::memory_order_relaxed);
+        for (;;) {
+            const uint32_t b = next_band_.fetch_add(1, std::memory_order_relaxed);
+            if (b >= bands) break;
+            const uint32_t y0 = b * band;
+            const uint32_t y1 = std::min(y0 + band, height);
+            (*fn)(y0, y1);
+            bands_done_.fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    uint64_t gen_ = 0;
+    bool quit_ = false;
+
+    std::atomic<const Fn*> fn_{nullptr};
+    std::atomic<uint32_t> height_{0}, band_{0}, band_count_{0};
+    std::atomic<uint32_t> next_band_{0};
+    std::atomic<uint32_t> bands_done_{0};
+};
 
 // ── Sub-buckets inside `record` ──────────────────────────────────────────────
 // The 300-frame timing line names three buckets; `record` is the biggest of
@@ -737,6 +863,7 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_GPULOOP")) g_gpuloop = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_RESOLVECLEAR")) g_resolveclear = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_PROF")) g_prof = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_MTSCATTER")) g_mtscatter = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_ARENA")) g_arena = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_SWAPPRESENT")) g_swap_present = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_STATECENSUS")) g_statecensus = std::atoi(p) != 0;
@@ -4736,9 +4863,11 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
             }
         }
         REXLOG_WARN("plume: scatter map #{} built -- {}x{} pitch {} {} ({:.1f} MB); a map "
-                    "rebuilt every frame would cost more than it saves",
+                    "rebuilt every frame would cost more than it saves; scattering on {} "
+                    "thread(s)",
                     rebuilds, t.width, t.height, pitch_texels, t.tiled ? "tiled" : "linear",
-                    double(map.off.size() * 4) / (1024.0 * 1024.0));
+                    double(map.off.size() * 4) / (1024.0 * 1024.0),
+                    g_mtscatter ? ScatterPool::Get().Workers() : 1u);
     }
 
     // Destination byte `sel` receives shader channel `lane`, and channel
@@ -4755,25 +4884,53 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
 
     const bool full_permutation = take[0] != 0xFF && take[1] != 0xFF &&
                                   take[2] != 0xFF && take[3] != 0xFF;
-    for (uint32_t y = 0; y < t.height; ++y) {
-        const uint32_t sy = y * kFrameH / t.height;
-        const uint8_t* srow = g_resolve_pixels.data() + size_t(sy) * kFrameW * 4;
-        const uint32_t* orow = map.off.data() + size_t(y) * t.width;
-        const uint32_t* sxr = map.sx.data();
-        for (uint32_t x = 0; x < t.width; ++x) {
-            const uint32_t off = orow[x];
-            if (off == UINT32_MAX) continue;
-            const uint8_t* sp = srow + sxr[x] * 4;   // B8G8R8A8 as stored
-            uint8_t* dp = dst + off;
-            if (full_permutation) {
-                const uint8_t out[4] = {sp[take[0]], sp[take[1]], sp[take[2]], sp[take[3]]};
-                std::memcpy(dp, out, 4);
-            } else {
-                for (uint32_t b = 0; b < 4; ++b) {
-                    if (take[b] != 0xFF) dp[b] = sp[take[b]];
+
+    // The row band. Everything it touches is either read-only (the maps, the
+    // captured frame) or written at an offset unique to its own (x,y), so the
+    // bands need no synchronisation between them.
+    const uint32_t height = t.height, width = t.width;
+    auto do_rows = [&](uint32_t y0, uint32_t y1) {
+        // Everything the inner loop needs is copied into LOCALS first, and that
+        // is load-bearing, not tidiness. Captured by reference, `dst`, `take`
+        // and `full_permutation` live in the enclosing frame -- and the loop
+        // stores through a uint8_t*, which may alias anything. The compiler then
+        // has to reload them on every texel. Measured: leaving them as captures
+        // cost 2849ms per 300 frames single-threaded against 1536ms for the same
+        // loop with plain locals, i.e. the closure alone made it 1.9x slower.
+        uint8_t* const dst_l = dst;
+        const uint8_t* const px = g_resolve_pixels.data();
+        const uint32_t* const off_base = map.off.data();
+        const uint32_t* const sxr = map.sx.data();
+        const uint8_t t0 = take[0], t1 = take[1], t2 = take[2], t3 = take[3];
+        const bool full = full_permutation;
+        const uint32_t w = width, h = height;
+        for (uint32_t y = y0; y < y1; ++y) {
+            const uint32_t sy = y * kFrameH / h;
+            const uint8_t* srow = px + size_t(sy) * kFrameW * 4;
+            const uint32_t* orow = off_base + size_t(y) * w;
+            for (uint32_t x = 0; x < w; ++x) {
+                const uint32_t off = orow[x];
+                if (off == UINT32_MAX) continue;
+                const uint8_t* sp = srow + sxr[x] * 4;   // B8G8R8A8 as stored
+                uint8_t* dp = dst_l + off;
+                if (full) {
+                    const uint8_t out[4] = {sp[t0], sp[t1], sp[t2], sp[t3]};
+                    std::memcpy(dp, out, 4);
+                } else {
+                    if (t0 != 0xFF) dp[0] = sp[t0];
+                    if (t1 != 0xFF) dp[1] = sp[t1];
+                    if (t2 != 0xFF) dp[2] = sp[t2];
+                    if (t3 != 0xFF) dp[3] = sp[t3];
                 }
             }
         }
+    };
+
+    if (g_mtscatter) {
+        // 32 rows = one tile row, so a band boundary never splits a tile.
+        ScatterPool::Get().Run(do_rows, height, 32u);
+    } else {
+        do_rows(0, height);
     }
     if (resolves <= 8 || (resolves % 600) == 0) {
         REXLOG_WARN("plume: RESOLVE #{} -- frame -> guest {:08X} {}x{} {} (fetch at +{:#x})",
