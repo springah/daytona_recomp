@@ -72,6 +72,33 @@ bool g_swap_present = true;
 // runs it single-threaded, which is the A/B for it.
 bool g_mtscatter = true;
 
+// Whether the frame is written back into GUEST MEMORY at a resolve. OFF.
+//
+// It was on, and it was the most expensive thing the renderer did, for a reader
+// that does not exist. The GPU side stopped needing it at the GPU-loop change:
+// a resolve destination bound as a texture is served from the mirror, on the
+// GPU. The guest-memory copy was kept because game logic MIGHT read it -- an
+// assumption, never tested.
+//
+// Tested now, with the writeback fully off: attract (whole cycle), a driven
+// race with HUD, pause over a frozen race (99.4% of pixels coloured, identical
+// across ten sampled frames -- no alternation), leaderboards over a frozen
+// race, and course select. Those are four composites over resolved surfaces,
+// including both that historically broke. Nothing reads them.
+//
+// The cost was not the copy. The copy is ~0.83ms a frame; the readback it
+// required -- copyTextureRegion into g_readback, then map() -- is what forced
+// EndFrame to block on the GPU EVERY frame, ~2.5ms, the largest single cost in
+// the renderer and the reason a per-frame ring looked necessary at all.
+//
+// DT_PLUME_SCATTER=1 restores it, and restores the readback with it.
+bool g_guest_writeback = false;
+
+// Whether a frame's completion is deferred to the next frame instead of waited
+// on immediately -- see the frame-slot block further down for what that needs.
+// DT_PLUME_RING=0 waits every frame, as it used to.
+bool g_ring = true;
+
 // ── The scatter worker pool ──────────────────────────────────────────────────
 //
 // The scatter writes 1920x1080 texels into tiled guest memory, twice a frame,
@@ -864,6 +891,16 @@ bool Init() {
     if (const char* p = std::getenv("DT_PLUME_RESOLVECLEAR")) g_resolveclear = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_PROF")) g_prof = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_MTSCATTER")) g_mtscatter = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_SCATTER")) g_guest_writeback = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_RING")) g_ring = std::atoi(p) != 0;
+    // The ring defers this frame's completion to the next frame. That is only
+    // safe because nothing on the CPU needs this frame's pixels -- which stops
+    // being true the moment the guest-memory writeback is switched back on.
+    if (g_guest_writeback && g_ring) {
+        g_ring = false;
+        REXLOG_WARN("plume: DT_PLUME_SCATTER=1 forces DT_PLUME_RING off -- the writeback needs "
+                    "this frame's pixels on the CPU, so its completion cannot be deferred");
+    }
     if (const char* p = std::getenv("DT_PLUME_ARENA")) g_arena = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_SWAPPRESENT")) g_swap_present = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_STATECENSUS")) g_statecensus = std::atoi(p) != 0;
@@ -2090,6 +2127,35 @@ std::unique_ptr<plume::RenderCommandList> g_cmd;
 // and begin() on an already-open list is invalid.
 std::unique_ptr<plume::RenderCommandList> g_upload_cmd;
 std::unique_ptr<plume::RenderCommandFence> g_fence;
+
+// ── Frames in flight ────────────────────────────────────────────────────────
+//
+// EndFrame used to submit and then block until the GPU had finished, every
+// frame. That was correct and deliberate -- it is what made freeing the frame's
+// buffers safe -- and it cost ~2.5ms a frame, 85% of the endframe bucket, with
+// the CPU idle for all of it while the GPU sat ~70% idle in turn.
+//
+// It could not be removed while the guest-memory writeback existed, because the
+// CPU genuinely needed this frame's pixels before it could continue. With the
+// writeback gone nothing does, so the wait can move a frame back: submit frame
+// N, then wait on frame N-1, which has had a whole frame to finish and is
+// usually already done.
+//
+// Two of everything the GPU is still reading while a frame is in flight, rather
+// than one: the command list (frame N cannot record into a list frame N-1 is
+// still executing), the fence, the upload arena, and the two deferred-free
+// lists. They are swapped at the frame boundary rather than indexed, because
+// these globals are referenced throughout this file and a swap leaves every one
+// of those references meaning "the frame being recorded now".
+//
+// DT_PLUME_RING=0 restores the wait-every-frame behaviour. (g_ring itself is
+// declared with the other levers, above, because the env parser reads it there.)
+std::unique_ptr<plume::RenderCommandList> g_cmd_alt;
+std::unique_ptr<plume::RenderCommandFence> g_fence_alt;
+// True once the alternate slot has actually been submitted. Waiting on a fence
+// that has never been signalled does not return, so the first frame through
+// must not wait on the other slot.
+bool g_alt_submitted = false;
 // Uploads are submitted and waited on in the middle of a frame's recording, so
 // they get their own fence rather than racing the frame's.
 std::unique_ptr<plume::RenderCommandFence> g_upload_fence;
@@ -2146,6 +2212,7 @@ uint32_t g_frame_index = 0;
 uint32_t g_frame_draws = 0;
 uint32_t g_frame_skipped = 0;
 std::vector<std::unique_ptr<plume::RenderBuffer>> g_frame_buffers;
+std::vector<std::unique_ptr<plume::RenderBuffer>> g_frame_buffers_alt;   // in-flight, see g_ring
 
 // ── The per-frame upload arena ───────────────────────────────────────────────
 // Every draw used to create four UPLOAD buffers of its own: one per vertex slot
@@ -2177,6 +2244,7 @@ struct ArenaChunk {
     uint64_t size = 0;
 };
 std::vector<ArenaChunk> g_arena_chunks;
+std::vector<ArenaChunk> g_arena_chunks_alt;   // the in-flight frame's, see g_ring
 size_t g_arena_chunk = 0;      // the chunk being filled
 uint64_t g_arena_used = 0;     // how far into it
 uint64_t g_arena_peak = 0;     // high-water mark over a frame, for the log
@@ -2274,6 +2342,7 @@ std::vector<std::unique_ptr<plume::RenderTexture>> g_textures;
 // cannot be freed until that frame's fence signals -- same rule, and the same
 // release point, as g_frame_buffers.
 std::vector<std::unique_ptr<plume::RenderTexture>> g_texture_graveyard;
+std::vector<std::unique_ptr<plume::RenderTexture>> g_texture_graveyard_alt;  // in-flight, see g_ring
 
 // What the cache remembers about an uploaded texture. It used to remember only
 // the heap slot, and that was the bug behind two defects at once: a hit never
@@ -2871,11 +2940,20 @@ bool EnsureOffscreen() {
     g_upload_cmd = g_queue != nullptr ? g_queue->createCommandList() : nullptr;
     g_fence = g_device->createCommandFence();
     g_upload_fence = g_device->createCommandFence();
+    // The second slot, so a frame can be recorded while the previous one is
+    // still executing. Allocated whether or not DT_PLUME_RING is on: it is two
+    // objects, and having the lever switch behaviour rather than availability
+    // keeps the A/B a fair one.
+    g_cmd_alt = g_queue != nullptr ? g_queue->createCommandList() : nullptr;
+    g_fence_alt = g_device->createCommandFence();
     if (g_queue == nullptr || g_cmd == nullptr || g_upload_cmd == nullptr ||
-        g_fence == nullptr || g_upload_fence == nullptr) {
-        REXLOG_WARN("plume: frame setup failed -- queue={} list={} upload={} fences={}/{}",
+        g_fence == nullptr || g_upload_fence == nullptr ||
+        g_cmd_alt == nullptr || g_fence_alt == nullptr) {
+        REXLOG_WARN("plume: frame setup failed -- queue={} list={} upload={} fences={}/{} "
+                    "alt list={} alt fence={}",
                     g_queue != nullptr, g_cmd != nullptr, g_upload_cmd != nullptr,
-                    g_fence != nullptr, g_upload_fence != nullptr);
+                    g_fence != nullptr, g_upload_fence != nullptr,
+                    g_cmd_alt != nullptr, g_fence_alt != nullptr);
         return false;
     }
 
@@ -3137,8 +3215,9 @@ bool BeginFrame() {
     if (g_frame_open) return true;
     if (!EnsureOffscreen()) return false;
 
-    // The previous frame's fence was waited on inside its EndFrame, so nothing
-    // is still reading the arena's bytes.
+    // Safe because these are the RETIRED slot's chunks, not the in-flight one's:
+    // EndFrame swapped the slots and waited on this one's fence before handing
+    // it back. Nothing is still reading these bytes.
     ArenaRewind();
     g_cmd->begin();
     const plume::RenderTextureBarrier to_write[] = {
@@ -3730,7 +3809,15 @@ void EndFrame(bool present) {
         g_presents = g_presents_closed = g_swaps = 0;
     }
 
-    const bool report = g_capture_resolve || g_meshdump_want_bmp ||
+    // `report` is what makes the frame come back to the CPU: a copyTextureRegion
+    // into g_readback, and a map() after the fence. It is now DIAGNOSTIC ONLY.
+    //
+    // g_capture_resolve no longer forces it. It used to, on essentially every
+    // frame, purely so the guest-memory writeback had pixels to copy -- and
+    // since the CPU cannot read pixels the GPU has not drawn, that is what made
+    // the per-frame GPU block unavoidable. With the writeback off, nothing
+    // outside these diagnostics wants the frame CPU-side.
+    const bool report = (g_capture_resolve && g_guest_writeback) || g_meshdump_want_bmp ||
         g_frame_index <= kReportedFrames || (g_frame_index % kReportInterval) == 0;
 
     // DT_PLUME_SWAPPRESENT=0 restores the old present-at-every-EndFrame, which
@@ -3788,11 +3875,37 @@ void EndFrame(bool present) {
 
     const plume::RenderCommandList* lists[] = {g_cmd.get()};
     g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
-    // Waiting on every frame gives up all overlap, but it is what makes freeing
-    // the frame's buffers below safe without a per-frame ring. Correct first.
-    {
-        ScopedMs fence_timer(g_ms_e_fence);
-        g_queue->waitForCommandFence(g_fence.get());
+
+    // A `report` frame has to have THIS frame's pixels on the CPU below, so it
+    // waits on this frame's fence -- there is no deferring a readback. Those are
+    // diagnostic frames only now (periodic, first few, BMP dump), so the cost is
+    // paid a few times a run rather than sixty times a second.
+    const bool must_wait_now = !g_ring || report;
+    if (must_wait_now) {
+        {
+            ScopedMs fence_timer(g_ms_e_fence);
+            g_queue->waitForCommandFence(g_fence.get());
+        }
+        // Deliberately does NOT swap slots. The other slot may still be in
+        // flight from the previous frame; it is retired by the next frame that
+        // does swap, and nothing here touches it.
+    } else {
+        // Move to the other slot and retire it. After the swap every global
+        // below means "the frame that is no longer in flight", which is what
+        // makes the frees and the arena rewind safe.
+        std::swap(g_cmd, g_cmd_alt);
+        std::swap(g_fence, g_fence_alt);
+        std::swap(g_arena_chunks, g_arena_chunks_alt);
+        std::swap(g_frame_buffers, g_frame_buffers_alt);
+        std::swap(g_texture_graveyard, g_texture_graveyard_alt);
+        if (g_alt_submitted) {
+            // Frame N-1. It has had a whole frame to finish, so this is usually
+            // already signalled -- which is the entire point, and is what the
+            // GPU-wait bucket should now show.
+            ScopedMs fence_timer(g_ms_e_fence);
+            g_queue->waitForCommandFence(g_fence.get());
+        }
+        g_alt_submitted = true;
     }
 
     if (backbuffer != nullptr) {
@@ -3806,18 +3919,23 @@ void EndFrame(bool present) {
     PumpWindow();
 #endif
 
+    // These are the slot that was just retired -- either this frame, waited on
+    // above, or frame N-1 after the swap. Either way its fence has signalled.
     const size_t buffers = g_frame_buffers.size();
     g_frame_buffers.clear();
-    // Textures a re-upload replaced. The fence above is what makes this safe.
+    // Textures a re-upload replaced.
     g_texture_graveyard.clear();
 
     // A combination this frame discovered gets its pipeline NOW, not at the
     // next 600-frame periodic build. The draws that wanted it are already
     // lost, but only this frame's -- not ten seconds of them. Here rather
-    // than at the discovery site because pipeline creation is not something
-    // to do in the middle of recording, and the fence above has just been
-    // waited on, so nothing is in flight. Every caller of EndFrame holds
-    // g_mutex, which is why this takes the lock-free body.
+    // than at the discovery site because pipeline creation is not something to
+    // do in the middle of recording. It does NOT require a quiet GPU -- with the
+    // ring on, frame N is still executing here -- because creating a pipeline
+    // state is a device operation that touches nothing the in-flight list reads,
+    // and recording is single-threaded, so no one is reading the pipeline map
+    // while it grows. Every caller of EndFrame holds g_mutex, which is why this
+    // takes the lock-free body.
     if (g_pipelines_dirty) BuildPipelinesLocked("new combination");
 
     if (!report) return;
@@ -3830,7 +3948,7 @@ void EndFrame(bool present) {
 
     // The resolve path wants this frame's pixels CPU-side, to hand back to the
     // guest. Grabbed here because the readback is already mapped.
-    if (g_capture_resolve) {
+    if (g_capture_resolve && g_guest_writeback) {
         g_resolve_pixels.assign(pixels, pixels + size_t(kFrameW) * kFrameH * 4);
     }
 
@@ -4756,7 +4874,17 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
         EndFrame(false);
         g_capture_resolve = false;
     }
-    if (g_resolve_pixels.empty()) {
+    // NOT an early return any more, and that distinction is load-bearing.
+    //
+    // Everything below still has to run with no pixels in hand: decoding the
+    // destination, and above all stamping g_resolve_written and g_resolve_gen,
+    // which are what texture-staleness and mirror-generation tracking read. If
+    // this returned here -- as it did when the writeback was mandatory and empty
+    // pixels meant "nothing drawn yet" -- then with the writeback off those
+    // stamps would never update again and every resolve destination bound as a
+    // texture would silently go stale.
+    const bool have_pixels = !g_resolve_pixels.empty();
+    if (!have_pixels && g_guest_writeback) {
         if (entry <= 4 || (entry % 512) == 0) {
             REXLOG_WARN("plume: RESOLVE entry #{} -- no pixels ever captured (frame_open={}, "
                         "dest={:08X}); the recorder has not drawn anything yet",
@@ -4834,6 +4962,11 @@ void OnResolve(uint32_t dest_texture_ea, const uint8_t* base) {
     // unpack is now "data component N is byte N, the fetch constant's swizzle
     // says which reaches each shader lane", so the pack asks the same question
     // backwards: the byte lane L selects has to receive shader channel L.
+    // Stops here in the default configuration, and it stops AFTER the stamps
+    // above on purpose: the bookkeeping they do is what the rest of the renderer
+    // depends on, and only the copy into guest memory is skipped.
+    if (!g_guest_writeback || !have_pixels) return;
+
     ScopedMs scatter_timer(g_ms_scatter);
     ++g_scatter_count;
 
@@ -5316,12 +5449,23 @@ void Shutdown() {
             g_frame_open = false;
         }
         g_queue->waitForCommandFence(g_fence.get());
+        // BOTH slots. With the ring on, the frame that is still executing is the
+        // one in the OTHER slot -- draining only this one and then destroying
+        // buffers and mapped arena chunks would free memory the GPU is reading.
+        // Guarded: a fence that has never been signalled does not return.
+        if (g_alt_submitted && g_fence_alt != nullptr) {
+            g_queue->waitForCommandFence(g_fence_alt.get());
+        }
     }
     g_frame_buffers.clear();
+    g_frame_buffers_alt.clear();
+    g_texture_graveyard.clear();
+    g_texture_graveyard_alt.clear();
     // The arena's chunks are mapped for their whole life; the drain above is
     // what makes destroying them here safe.
     ArenaRewind();
     g_arena_chunks.clear();
+    g_arena_chunks_alt.clear();
     g_shaders.clear();
     for (uint32_t i = 0; i < g_combo_count; ++i) g_combos[i].pipeline.reset();
     g_pipeline_layout.reset();
