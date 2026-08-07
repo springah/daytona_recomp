@@ -667,9 +667,27 @@ REX_HOOK_RAW(sub_82233C80) {
         }
         // Layouts only exist once the runtime has patched a shader, which only
         // happens when the game binds it, so keep retrying as content changes.
-        if ((frames % 600) == 0) {
-            dt_plume::DeriveVertexLayouts("periodic", GuestResolveSized, base);
-            dt_plume::BuildPipelines("periodic");
+        //
+        // ⚠ THE % 600 TICK IS THE BACKSTOP, NOT THE MECHANISM. It used to be the
+        // only caller, and that cost the first 600 guest frames of EVERY run:
+        // no pipeline means DrawIntoFrame returns before BeginFrame, so no frame
+        // opens, so EndFrame -- which holds the "build the combination we just
+        // discovered" path -- never runs, so no pipeline. A closed loop that only
+        // this counter could break, at ~29fps boot = 20.4 SECONDS of discarded
+        // draws. That is the black screen where the SEGA/CRIWARE/Daytona logos
+        // belong (1821 dropped draws, measured, both logs). It also cost 279,234
+        // of 875,565 draws mid-race, because every combination discovered during
+        // play waited up to 600 frames too.
+        //
+        // So ask the renderer whether it has work, every Swap. The flag clears
+        // itself inside the build, so this fires once per NEW combination.
+        const bool tick = (frames % 600) == 0;
+        if (tick || dt_plume::PipelinesDirty()) {
+            // Distinct reasons so the two triggers stay apart in the log: a run
+            // whose builds all say "periodic" is one where this fix regressed.
+            const char* why = tick ? "periodic" : "new combination";
+            dt_plume::DeriveVertexLayouts(why, GuestResolveSized, base);
+            dt_plume::BuildPipelines(why);
             dt_plume::BuildIndexBuffers();
         }
     }

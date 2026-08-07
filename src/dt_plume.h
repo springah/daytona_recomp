@@ -108,6 +108,16 @@ void SetHostWindow(void* native_handle);
 
 void BuildPipelines(const char* reason);
 
+// True when a combination has been discovered that has no pipeline yet.
+//
+// The caller that matters is the guest Swap hook. Building on discovery INSIDE
+// the renderer is not possible: the only build call that does not need a guest
+// memory resolver lives at the tail of EndFrame, and EndFrame cannot run until
+// a frame is open, which needs a recorded draw, which needs a pipeline. That
+// loop kept the FIRST pipeline -- and therefore the whole picture -- waiting for
+// the 600-frame periodic tick. Asking from outside the loop breaks it.
+bool PipelinesDirty();
+
 // Create the static expansion index buffers. QUADLIST and TRIANGLEFAN do not
 // exist in D3D12/Vulkan, and neither depends on the vertex data, so one index
 // buffer per topology serves every draw.

@@ -100,6 +100,39 @@ bool g_guest_writeback = false;
 // DT_PLUME_RING=0 waits every frame, as it used to.
 bool g_ring = true;
 
+// Accumulate elapsed milliseconds for the lifetime of the scope. Unconditional,
+// unlike ProfMs above: used where a bucket is entered a few times a frame rather
+// than per draw.
+struct ScopedMs {
+    double& acc;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    explicit ScopedMs(double& a) : acc(a) {}
+    ~ScopedMs() {
+        acc += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+// ── The texture upload path ─────────────────────────────────────────────────
+//
+// Boot to the title takes ~40s, and with the staleness probe off it takes ~22s
+// -- the same as running with no renderer at all. So the texture path owns most
+// of boot. Where inside it was guesswork, and two attempts to answer it from
+// existing numbers were both wrong: the draw-path profiler cannot see this
+// (most of the cost is EnsureTexture responding to staleness, not recording a
+// draw), and its 300-frame report does not print AT ALL during a window with
+// fewer than 300 presents -- which boot is. A bisect by lever was worse than
+// useless: skipping strictly more work measured slower, which means single-run
+// boot timings carry seconds of noise.
+//
+// So these are ALWAYS ON -- a gated timer cannot measure the shipping build --
+// and CUMULATIVE rather than per-window, because "where did boot go" is a total.
+double g_ms_tex_untile = 0.0;    // ReadTexture: guest memory -> linear CPU bytes
+double g_ms_tex_staging = 0.0;   // createBuffer + map + row memcpy
+double g_ms_tex_submit = 0.0;    // executeCommandLists + waitForCommandFence
+uint32_t g_tex_uploads = 0;      // upload events
+uint64_t g_tex_bytes = 0;        // bytes untiled
+
 // ── The scatter worker pool ──────────────────────────────────────────────────
 //
 // The scatter writes 1920x1080 texels into tiled guest memory, twice a frame,
@@ -462,6 +495,12 @@ uint64_t g_draws_unresolved = 0;     // a draw whose VS or PS we have no blob fo
 // Cumulative, not per-frame: the earlier of the two drop sites runs before
 // BeginFrame, so there is no open frame to attribute it to.
 uint64_t g_draws_nopipe = 0;
+// The same class of invisible drop, one line further down: no index buffers, so
+// nothing can be expanded. Masked today because the index buffers open in the
+// same call as the pipelines -- but "masked" is not "safe", and while it was
+// uncounted this site could discard every draw in a frame that then reported
+// "0 skipped".
+uint64_t g_draws_noindex = 0;
 uint32_t g_combo_overflow = 0;
 
 // Render-state census (opt-in: DT_PLUME_STATECENSUS=1). Which of the three
@@ -496,11 +535,14 @@ StateSample g_state_samples[kMaxStateSamples];
 uint32_t g_state_sample_count = 0;
 uint32_t g_state_sample_overflow = 0;
 
-// A combination appeared that has no pipeline yet. The periodic build runs
-// every 600 guest frames, which is ~10 seconds, and every draw of that
-// combination in the meantime is dropped for want of a pipeline -- measured
-// at 279,234 of 875,565 draws in a run, i.e. the first seconds of a race
-// render with geometry missing. Set here, consumed by EndFrame.
+// A combination appeared that has no pipeline yet, and every draw of it until
+// one exists is dropped -- measured at 279,234 of 875,565 draws in a run, i.e.
+// the first seconds of a race render with geometry missing.
+//
+// Set at the discovery site, consumed by whoever builds first. That used to be
+// the 600-guest-frame periodic tick alone, described here as "~10 seconds": at
+// boot's ~29fps it is 20.4, and it was the whole of the black intro. The real
+// consumer now is PipelinesDirty(), asked from the Swap hook every frame.
 bool g_pipelines_dirty = false;
 
 bool g_bisected = false;   // the pipeline-failure bisect runs once, not per combo
@@ -2779,7 +2821,12 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
     }
 
     TextureUpload up;
-    if (!ReadTexture(t, base, up)) {
+    bool read_ok;
+    {
+        ScopedMs untile_timer(g_ms_tex_untile);
+        read_ok = ReadTexture(t, base, up);
+    }
+    if (!read_ok) {
         static std::set<uint32_t> reported;
         if (reported.insert(t.format).second) {
             REXLOG_WARN("plume: texture format {} ({}x{}, {}) not handled yet -- not uploaded",
@@ -2825,16 +2872,20 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
     // D3D12 wants each row of a buffer->texture copy 256-byte aligned, so the
     // staging copy is repacked to that pitch rather than the texture's own.
     const uint32_t padded = (up.row_bytes + 255u) & ~255u;
-    auto staging = g_device->createBuffer(
-        plume::RenderBufferDesc::UploadBuffer(uint64_t(padded) * up.rows));
-    if (staging == nullptr) return UINT32_MAX;
-    auto* dst = static_cast<uint8_t*>(staging->map());
-    if (dst == nullptr) return UINT32_MAX;
-    for (uint32_t y = 0; y < up.rows; ++y) {
-        std::memcpy(dst + size_t(y) * padded, up.data.data() + size_t(y) * up.row_bytes,
-                    up.row_bytes);
+    std::unique_ptr<plume::RenderBuffer> staging;
+    {
+        ScopedMs staging_timer(g_ms_tex_staging);
+        staging = g_device->createBuffer(
+            plume::RenderBufferDesc::UploadBuffer(uint64_t(padded) * up.rows));
+        if (staging == nullptr) return UINT32_MAX;
+        auto* dst = static_cast<uint8_t*>(staging->map());
+        if (dst == nullptr) return UINT32_MAX;
+        for (uint32_t y = 0; y < up.rows; ++y) {
+            std::memcpy(dst + size_t(y) * padded, up.data.data() + size_t(y) * up.row_bytes,
+                        up.row_bytes);
+        }
+        staging->unmap();
     }
-    staging->unmap();
 
     // plume takes the footprint pitch in TEXELS and converts: it divides by the
     // block edge and multiplies by the format's block size. So the padded byte
@@ -2853,9 +2904,24 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
     const plume::RenderTextureBarrier to_read(texture, plume::RenderTextureLayout::SHADER_READ);
     g_upload_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
     g_upload_cmd->end();
-    const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
-    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_upload_fence.get());
-    g_queue->waitForCommandFence(g_upload_fence.get());
+    {
+        ScopedMs submit_timer(g_ms_tex_submit);
+        const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
+        g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_upload_fence.get());
+        g_queue->waitForCommandFence(g_upload_fence.get());
+    }
+    ++g_tex_uploads;
+    g_tex_bytes += up.data.size();
+    // Every 25 uploads, so boot is visible as it happens rather than only from a
+    // 300-frame report that does not print until after it. 25 and not 200
+    // because the first attempt at this printed NOTHING across a whole boot --
+    // which was itself the finding: there are not many uploads.
+    if ((g_tex_uploads % 25) == 0) {
+        REXLOG_WARN("plume: texture uploads {} ({:.1f} MB untiled) -- untile {:.0f}ms, "
+                    "staging {:.0f}ms, submit+wait {:.0f}ms  [cumulative]",
+                    g_tex_uploads, double(g_tex_bytes) / (1024.0 * 1024.0),
+                    g_ms_tex_untile, g_ms_tex_staging, g_ms_tex_submit);
+    }
 
     uint32_t slot = reuse_slot;
     if (slot == UINT32_MAX) {
@@ -3484,6 +3550,22 @@ uint32_t g_scatter_count = 0;
 // know to enable is one that is actually there when the question comes up.
 double g_ms_e_fence = 0.0;     // ... blocked on the GPU finishing the frame
 double g_ms_e_present = 0.0;   // ... in swapchain present
+
+// ── The texture upload path ─────────────────────────────────────────────────
+//
+// Boot to the title screen takes ~40s, and turning the staleness probe off
+// takes it to ~22s -- the same as running with no renderer at all. So the
+// texture path owns most of boot. Where inside it was, until now, guesswork:
+// the draw-path profiler cannot see this, because most of the cost is in
+// EnsureTexture's response to staleness rather than in recording a draw, and
+// because the 300-frame report does not print at all during a window with
+// fewer than 300 presents -- which boot is.
+//
+// So: always-on, counted, and reported cumulatively as well as per window.
+// ALWAYS-ON because a lever-gated timer cannot measure the default build, and a
+// bisect by lever already produced a self-contradiction here (skipping MORE
+// work measured SLOWER, which means single-run boot timings carry several
+// seconds of noise and cannot attribute anything).
 // Presents and guest Swaps over the same 300-EndFrame window. These two numbers
 // are the standing check on the fix below: one present per Swap is the whole
 // point, and 2 presents per Swap is the flicker coming back.
@@ -3495,16 +3577,6 @@ uint32_t g_swaps = 0;
 // frame is being finished.
 uint32_t g_presents_closed = 0;
 std::chrono::steady_clock::time_point g_last_endframe{};
-
-struct ScopedMs {
-    double& acc;
-    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-    explicit ScopedMs(double& a) : acc(a) {}
-    ~ScopedMs() {
-        acc += std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t0).count();
-    }
-};
 
 // Is the frame currently being recorded one of the dumped ones? Draws run
 // BEFORE EndFrame's ++, so the frame they belong to is g_frame_index + 1.
@@ -3644,7 +3716,7 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
         ++g_draws_nopipe;
         return;
     }
-    if (g_index_state != IndexState::kReady) return;
+    if (g_index_state != IndexState::kReady) { ++g_draws_noindex; return; }
     if (!BeginFrame()) return;
     if (g_frame_draws >= kMaxDrawsPerFrame) { ++g_frame_skipped; return; }
 
@@ -4154,7 +4226,15 @@ void EndFrame(bool present) {
 
     // A combination this frame discovered gets its pipeline NOW, not at the
     // next 600-frame periodic build. The draws that wanted it are already
-    // lost, but only this frame's -- not ten seconds of them. Here rather
+    // lost, but only this frame's -- not ten seconds of them.
+    //
+    // ⚠ This can never build the FIRST pipeline, and the comment above used to
+    // claim otherwise. EndFrame returns at the top unless a frame is open, a
+    // frame only opens inside BeginFrame, and BeginFrame is only reached one
+    // line BELOW the no-pipeline drop in DrawIntoFrame. So until some pipeline
+    // exists this whole function is unreachable. The Swap hook asks
+    // PipelinesDirty() for exactly that reason; this remains the fast path once
+    // the renderer is running. Here rather
     // than at the discovery site because pipeline creation is not something to
     // do in the middle of recording. It does NOT require a quiet GPU -- with the
     // ring on, frame N is still executing here -- because creating a pipeline
@@ -4452,6 +4532,16 @@ void BuildPipelines(const char* reason) {
     if (!Enabled() || !g_init_ok) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     BuildPipelinesLocked(reason);
+}
+
+// Asked once per guest Swap, from outside the frame loop. Cheap by construction:
+// a bool read under the lock, and the flag self-clears in BuildPipelinesLocked,
+// so the build it triggers runs once per newly discovered combination over a
+// whole run -- not once per frame.
+bool PipelinesDirty() {
+    if (!Enabled() || !g_init_ok) return false;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_pipelines_dirty;
 }
 
 void BuildPipelinesLocked(const char* reason) {
@@ -5575,9 +5665,10 @@ void Dump(const char* reason) {
     }
 
     REXLOG_WARN("   draws={} unresolved={} decl changes={} combos={} incremental-patches={} "
-                "vfetch-patches-seen={} dropped-for-want-of-a-pipeline={}",
+                "vfetch-patches-seen={} dropped-for-want-of-a-pipeline={} "
+                "dropped-for-want-of-index-buffers={}",
                 g_draws, g_draws_unresolved, g_decl_changes, g_combo_count, g_incremental_calls,
-                g_vfetch_patches, g_draws_nopipe);
+                g_vfetch_patches, g_draws_nopipe, g_draws_noindex);
     if (g_combo_overflow) {
         REXLOG_WARN("   WARNING: {} draws fell outside the {}-combo table -- the census below "
                     "is INCOMPLETE, raise kMaxCombos", g_combo_overflow, kMaxCombos);
