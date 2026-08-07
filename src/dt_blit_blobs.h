@@ -8,9 +8,18 @@
 
 namespace dt_blit_blobs {
 
+// DXIL, for D3D12.
 extern const unsigned char kBlitVs[];
 extern const size_t kBlitVs_size;
 extern const unsigned char kBlitPs[];
 extern const size_t kBlitPs_size;
+
+// SPIR-V, for Vulkan (Linux, Steam Deck). NOT smol-v encoded -- that is a
+// XenosRecomp convention for the guest shader table; this one is ours and dxc
+// emits plain SPIR-V, so it goes to the device as-is.
+extern const unsigned char kBlitVsSpirv[];
+extern const size_t kBlitVsSpirv_size;
+extern const unsigned char kBlitPsSpirv[];
+extern const size_t kBlitPsSpirv_size;
 
 }  // namespace dt_blit_blobs

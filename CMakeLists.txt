@@ -73,6 +73,17 @@ set(DAYTONA_SOURCES
 set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/plume EXCLUDE_FROM_ALL)
 
+# smol-v -- the SPIR-V decompressor. dt_shader_blobs stores its SPIR-V smol-v
+# encoded because that is what XenosRecomp emits, and until this was linked the
+# Vulkan branch of OnShaderCreated was a stub that failed every shader. That
+# made a Linux/Deck build pointless: it would start and render nothing.
+#
+# Vendored (two files, MIT/public-domain, license.txt kept) from the same
+# _tools/XenosRecomp checkout that GENERATED the blobs, so the decoder and the
+# encoder cannot drift.
+add_library(smolv STATIC thirdparty/smol-v/source/smolv.cpp)
+target_include_directories(smolv PUBLIC thirdparty/smol-v/source)
+
 # Embed the application icon + VERSIONINFO resource (visible in Explorer /
 # taskbar) via a Windows resource script generated with the absolute .ico path
 # and project version substituted, so the RC compiler resolves the icon
@@ -119,7 +130,7 @@ target_compile_definitions(daytona PRIVATE DAYTONA_VERSION=${PROJECT_VERSION})
 
 # plume. Linked but inert unless DT_PLUME is set in the environment -- see
 # src/dt_plume.cpp.
-target_link_libraries(daytona PRIVATE plume)
+target_link_libraries(daytona PRIVATE plume smolv)
 
 # The renderer spike drives plume by hand from intercepted guest calls, so a
 # wrong descriptor or a mismatched pipeline shows up as a crash with no message.

@@ -26,6 +26,10 @@
 #include "plume_render_interface.h"
 #include "plume_render_interface_builders.h"
 
+// The SPIR-V in dt_shader_blobs is smol-v encoded (XenosRecomp's doing), so the
+// Vulkan path cannot hand it straight to the device.
+#include "smolv.h"
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -381,6 +385,13 @@ struct Created {
     bool snapshot_overflow = false;
 };
 std::unordered_map<uint64_t, Created> g_shaders;
+
+// Decoded SPIR-V, keyed the same way, Vulkan only. Held for the life of the run
+// rather than freed after createShader: plume's Vulkan backend keeps the pointer
+// it is given until the pipeline is built, so the obvious local buffer would be
+// a use-after-free -- and one that could never show up on Windows, because
+// Windows takes the DXIL branch and never allocates this at all.
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_spirv_cache;
 
 uint32_t g_resolved = 0;
 uint32_t g_unresolved = 0;
@@ -1079,12 +1090,39 @@ void OnShaderCreated(uint64_t container_hash, bool is_vertex) {
         data = dt_shader_blobs::kDxil + variant->dxil_offset;
         size = variant->dxil_size;
     } else {
-        // SPIR-V in the table is smol-v encoded; decoding it needs smol-v, which
-        // is not linked yet. D3D12 is the first target, so this is a stub.
-        REXLOG_WARN("plume: {} is SPIR-V (smol-v) and the decoder is not linked yet -- skipped",
-                    entry->name);
-        ++g_failed;
-        return;
+        // SPIR-V, i.e. Vulkan, i.e. Linux and the Deck. The table stores it
+        // smol-v encoded because that is what XenosRecomp emits, so it has to be
+        // decompressed before the device will look at it.
+        //
+        // No variant lookup here, and that is not an oversight: Vulkan takes
+        // spec constants natively, so one unsplit module covers every value the
+        // DXIL side needs a separate build for.
+        //
+        // Decoded once and cached for the life of the run. The decoded module is
+        // several times the size of the smol-v, and createShader does not own
+        // the memory it is handed -- plume's Vulkan backend keeps the pointer
+        // until it builds the pipeline -- so a local buffer here would be a
+        // dangling read that happens to work on Windows because Windows never
+        // takes this branch.
+        const uint8_t* smol = dt_shader_blobs::kSpirv + entry->spirv_offset;
+        const size_t decoded = smolv::GetDecodedBufferSize(smol, entry->spirv_size);
+        if (decoded == 0) {
+            ++g_failed;
+            REXLOG_WARN("plume: {} smol-v header is not decodable ({} bytes at +{})",
+                        entry->name, entry->spirv_size, entry->spirv_offset);
+            return;
+        }
+        auto& buf = g_spirv_cache[container_hash];
+        buf.resize(decoded);
+        if (!smolv::Decode(smol, entry->spirv_size, buf.data(), decoded)) {
+            ++g_failed;
+            g_spirv_cache.erase(container_hash);
+            REXLOG_WARN("plume: {} smol-v DECODE FAILED ({} -> {} bytes)",
+                        entry->name, entry->spirv_size, decoded);
+            return;
+        }
+        data = buf.data();
+        size = decoded;
     }
 
     Created created;
@@ -3063,12 +3101,24 @@ void RebuildSwapchainTargets() {
 bool BuildBlit() {
     if (g_blit_pipeline != nullptr) return true;
 
-    g_blit_vs_shader = g_device->createShader(dt_blit_blobs::kBlitVs, dt_blit_blobs::kBlitVs_size,
-                                              "main_vs", g_shader_format);
-    g_blit_ps_shader = g_device->createShader(dt_blit_blobs::kBlitPs, dt_blit_blobs::kBlitPs_size,
-                                              "main_ps", g_shader_format);
+    // The blob has to match the backend. This used to pass the DXIL
+    // unconditionally while still telling the device g_shader_format, which is
+    // correct on Windows and guaranteed failure on Linux -- and the failure
+    // would have been "no picture", not "no shader", because the blit is the
+    // whole present path.
+    const bool spirv = (g_shader_format == plume::RenderShaderFormat::SPIRV);
+    const void* vs_blob = spirv ? static_cast<const void*>(dt_blit_blobs::kBlitVsSpirv)
+                                : static_cast<const void*>(dt_blit_blobs::kBlitVs);
+    const size_t vs_size = spirv ? dt_blit_blobs::kBlitVsSpirv_size : dt_blit_blobs::kBlitVs_size;
+    const void* ps_blob = spirv ? static_cast<const void*>(dt_blit_blobs::kBlitPsSpirv)
+                                : static_cast<const void*>(dt_blit_blobs::kBlitPs);
+    const size_t ps_size = spirv ? dt_blit_blobs::kBlitPsSpirv_size : dt_blit_blobs::kBlitPs_size;
+
+    g_blit_vs_shader = g_device->createShader(vs_blob, vs_size, "main_vs", g_shader_format);
+    g_blit_ps_shader = g_device->createShader(ps_blob, ps_size, "main_ps", g_shader_format);
     if (g_blit_vs_shader == nullptr || g_blit_ps_shader == nullptr) {
-        REXLOG_WARN("plume: blit shaders failed to load (vs={} ps={})",
+        REXLOG_WARN("plume: blit shaders failed to load as {} (vs={} ps={})",
+                    spirv ? "SPIR-V" : "DXIL",
                     g_blit_vs_shader != nullptr, g_blit_ps_shader != nullptr);
         return false;
     }
