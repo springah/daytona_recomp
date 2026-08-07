@@ -2319,6 +2319,8 @@ plume::RenderWindow g_window {};
 // Always true on Linux: there is no path there that creates its own window.
 bool g_window_borrowed = false;
 bool g_window_tried = false;
+// The "not available yet" line is worth saying once, not once per retry.
+bool g_swapchain_warned = false;
 
 // Frame state. `g_frame_buffers` holds every per-draw upload alive until the
 // frame's fence signals -- a vertex buffer freed while the GPU is still reading
@@ -3098,12 +3100,17 @@ bool EnsureWindow() {
     return true;
 #elif defined(__linux__)
     if (g_window.window != 0) return true;
-    if (g_window_tried) return false;
-    g_window_tried = true;
 
+    // Only the explicit opt-out latches. Failing to FIND the window is not a
+    // permanent condition on X11 -- at the first frame (now t+0.1s, not t+21s)
+    // the window may not be mapped or registered yet -- and latching it would
+    // make a timing problem look like a capability problem for the whole run.
     const char* opt = std::getenv("DT_PLUME_WINDOW");
     if (opt != nullptr && opt[0] == '0') {
-        REXLOG_WARN("plume: DT_PLUME_WINDOW=0 -- composing headless, no window");
+        if (!g_window_tried) {
+            g_window_tried = true;
+            REXLOG_WARN("plume: DT_PLUME_WINDOW=0 -- composing headless, no window");
+        }
         return false;
     }
 
@@ -3118,7 +3125,11 @@ bool EnsureWindow() {
     int count = 0;
     SDL_Window** windows = SDL_GetWindows(&count);
     if (windows == nullptr || count < 1) {
-        REXLOG_WARN("plume: no SDL window to present into (count {}) -- composing headless", count);
+        if (!g_window_tried) {
+            g_window_tried = true;   // say it once; the caller retries
+            REXLOG_WARN("plume: no SDL window to present into yet (count {}) -- composing headless "
+                        "and retrying", count);
+        }
         return false;
     }
     if (count > 1) {
@@ -3142,9 +3153,12 @@ bool EnsureWindow() {
     const auto xwindow = static_cast<Window>(
         SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
     if (display == nullptr || xwindow == 0) {
-        REXLOG_WARN("plume: the SDL window has no X11 handle (display {}, window {}) -- this is a "
-                    "native Wayland session and the Vulkan path needs X11/XWayland. Composing "
-                    "headless.", static_cast<const void*>(display), uint64_t(xwindow));
+        if (!g_window_tried) {
+            g_window_tried = true;
+            REXLOG_WARN("plume: the SDL window has no X11 handle (display {}, window {}) -- a "
+                        "native Wayland session, and the Vulkan path needs X11/XWayland. Composing "
+                        "headless.", static_cast<const void*>(display), uint64_t(xwindow));
+        }
         return false;
     }
     g_window.display = display;
@@ -3261,6 +3275,57 @@ bool BuildBlit() {
 // the SDK creates the window with SDL_WINDOW_RESIZABLE (window_sdl.cpp:132), so
 // dragging an edge by one pixel froze it too -- and that one never recovered,
 // because recovery required landing back on exactly the frame size.
+// Create the swapchain, or say why not. RETRYABLE, and that is the whole point.
+//
+// This used to be inline in EnsureOffscreen and ran exactly once per run. That
+// was survivable only because it ran LATE: the swapchain was first attempted at
+// guest frame 600, ~21 seconds in, by which point every window system on earth
+// has finished mapping the window. Fixing the intro logos moved the first frame
+// to t+0.1s and took that accident away with it.
+//
+// On Windows nothing changed -- an HWND has a client rect the moment it exists.
+// On X11 it did: the SDL window is not mapped yet at t+0.1s, XGetWindowAttributes
+// reports 0x0, plume's swapchain is therefore "empty", and the ONE attempt was
+// spent. Measured on a Steam Deck (RADV VANGOGH): no Vulkan error at all -- the
+// surface was fine -- just an empty swapchain and a headless run for good.
+//
+// So ask again. It is a handful of Vulkan calls against a window whose size is
+// the only thing in question, and it stops as soon as it works.
+bool TrySwapchain(const char* reason) {
+    if (g_swapchain != nullptr) return true;
+    if (!EnsureWindow()) return false;
+
+    // maxFrameLatency must be at least 1: the swapchain is created with the
+    // waitable-object flag and SetMaximumFrameLatency(0) is invalid.
+    plume::RenderSwapChainDesc sc(g_window, kRenderTargetFormat, 2, false, 2);
+    auto chain = g_queue->createSwapChain(sc);
+    if (chain == nullptr || chain->isEmpty()) {
+        // Say WHICH, because they are different faults with the same symptom:
+        // a null chain is a surface that could not be created, an empty one is
+        // a window with no size yet -- and only the second is worth retrying.
+        const bool null_chain = (chain == nullptr);
+        if (!g_swapchain_warned) {
+            g_swapchain_warned = true;
+            REXLOG_WARN("plume: swapchain not available yet ({}) -- {}. Composing headless and "
+                        "retrying; if this never resolves the window never got a size.",
+                        reason, null_chain ? "the surface could not be created"
+                                           : "the window has no size yet (0x0)");
+        }
+        return false;
+    }
+
+    g_swapchain = std::move(chain);
+    // Any size is acceptable now. It used to have to be exactly the frame size,
+    // because presenting was a 1:1 copy -- which is why the renderer made its
+    // own window at exactly 1280x720, why the ini's `resolution` never did
+    // anything, and why going fullscreen froze the picture. The blit scales.
+    g_swapchain->setVsyncEnabled(false);
+    RebuildSwapchainTargets();
+    REXLOG_WARN("plume: swapchain ready ({}) -- {}x{} for a {}x{} frame, 2 buffers, vsync off",
+                reason, g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
+    return true;
+}
+
 bool EnsureSwapchainSized() {
     if (g_swapchain == nullptr) return false;
     if (!g_swapchain->needsResize()) return true;
@@ -3498,30 +3563,7 @@ bool EnsureOffscreen() {
         REXLOG_WARN("plume: present blit unavailable -- the window will not be updated");
     }
 
-    // No platform guard: g_window is plume::RenderWindow, which is the HWND on
-    // Windows and the X11 pair on Linux, and EnsureWindow fills whichever. This
-    // block was Windows-only, which is why a Linux build would have composed
-    // headless even with a perfectly good Vulkan device.
-    if (EnsureWindow()) {
-        // maxFrameLatency must be at least 1: the swapchain is created with the
-        // waitable-object flag and SetMaximumFrameLatency(0) is invalid.
-        plume::RenderSwapChainDesc sc(g_window, kRenderTargetFormat, 2, false, 2);
-        g_swapchain = g_queue->createSwapChain(sc);
-        if (g_swapchain == nullptr || g_swapchain->isEmpty()) {
-            REXLOG_WARN("plume: swapchain creation failed -- composing headless");
-            g_swapchain.reset();
-        } else {
-            // Any size is acceptable now. It used to have to be exactly the
-            // frame size, because presenting was a 1:1 copy -- which is why the
-            // renderer made its own window at exactly 1280x720, why the ini's
-            // `resolution` never did anything, and why going fullscreen froze
-            // the picture. The blit scales.
-            g_swapchain->setVsyncEnabled(false);
-            RebuildSwapchainTargets();
-            REXLOG_WARN("plume: swapchain ready -- {}x{} for a {}x{} frame, 2 buffers, vsync off",
-                        g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
-        }
-    }
+    TrySwapchain("first frame");
 
     g_offscreen = OffscreenState::kReady;
     REXLOG_WARN("plume: frame target ready -- {}x{} format {} + depth, readback, {}",
@@ -4260,6 +4302,13 @@ void EndFrame(bool present) {
     // outside these diagnostics wants the frame CPU-side.
     const bool report = (g_capture_resolve && g_guest_writeback) || g_meshdump_want_bmp ||
         g_frame_index <= kReportedFrames || (g_frame_index % kReportInterval) == 0;
+
+    // Still no swapchain? Ask again, twice a second. The first attempt happens
+    // at the first frame, which since the intro-logo fix is t+0.1s -- early
+    // enough that on X11 the window may not be mapped yet, which is exactly how
+    // a Deck ended up composing headless for an entire run. Cheap, bounded by
+    // succeeding, and silent after the first explanation.
+    if (g_swapchain == nullptr && (g_frame_index % 30) == 0) TrySwapchain("retry");
 
     // DT_PLUME_SWAPPRESENT=0 restores the old present-at-every-EndFrame, which
     // is the A/B for the flicker.
