@@ -32,8 +32,9 @@ THIS IS A BETA
 
 Known, and you do not need to report these:
 
-* Save Data and Records have had the least testing of any screens. If either
-  looks wrong, that IS worth telling me about, in detail.
+* Save Data has had the least testing of any screen. If it looks wrong, that IS
+  worth telling me about, in detail. (Records is fine -- a full race, a first
+  place and a saved record have all been driven on this build.)
 * Leaderboards says you must connect to Xbox LIVE. There is no Xbox LIVE here;
   the real game handles being offline on its own and this is what it does.
 * Achievements opens and closes immediately. This port has no achievements
@@ -42,9 +43,15 @@ Known, and you do not need to report these:
   a fixed 60Hz internally and paces itself off that, so changing it would change
   GAME SPEED rather than smoothness.
 
+Windows only, for now. There is a Linux/Steam Deck build in progress; it starts
+and gets as far as the first frame, then stalls, so it is not in this package.
+
 Please DO report:
 
 * Anything that freezes, or stops updating while the window stays open.
+* Anything MISSING that you would expect to see -- scenery, cars, trackside
+  detail. A batch of geometry that had been silently dropped is now drawn, and
+  the first races on that change were driven only hours before this build.
 * Anything that looks wrong: missing scenery, wrong colours, flickering, the HUD
   over the wrong thing, text that should not be there.
 * Sound that cuts out, distorts, or plays the wrong thing.
