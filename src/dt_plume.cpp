@@ -4049,10 +4049,28 @@ void PumpWindow() {
 // two different pictures on the screen: the bare 3D scene at the resolve, and
 // the composited scene+HUD at the Swap.
 //
-// MEASURED: 300 EndFrames took a metronomic 2500ms -- 120.0/s against a 60Hz
-// guest, i.e. exactly 2 presents per guest frame -- and a 20-shot in-race burst
-// classified 13 composited / 7 bare. The bare seven were not corrupt frames.
-// They were legitimate mid-frame states that had no business being presented.
+// MEASURED BEFORE: 300 EndFrames took a metronomic 2500ms -- 120.0/s against a
+// 60Hz guest, i.e. exactly 2 presents per guest frame -- and a 20-shot in-race
+// burst classified 13 composited / 7 bare. The bare seven were not corrupt
+// frames. They were legitimate mid-frame states that had no business being
+// presented.
+//
+// MEASURED AFTER (this is the number that is current -- the one above is the
+// symptom, kept because it is what the parameter exists to cure): 300 EndFrames
+// per 5000ms, i.e. 60.0fps, and 300 presents for 300 guest Swaps. Against 600
+// vblanks per 10.000s the guest is swapping once per vblank, so the "is Daytona
+// really double-swapping?" question is answered: it is not, and it never was --
+// we were.
+//
+// It also cannot come back by accident. The only two present sites are the two
+// branches of a single if/else in OnFrameEnd, which the Swap hook calls exactly
+// once per guest Swap; the resolve path calls EndFrame(false) and presents
+// nothing. One present per Swap is structural, not a tuning.
+//
+// ⚠ All 300 of those presents came "from an already-closed frame", i.e. every
+// one went through the resolve path. That is the same path a race takes, which
+// is why an attract-mode measurement is worth something here -- but the ratio
+// itself has not been read off an in-race run.
 //
 // Everything else a resolve-EndFrame does it still does: the readback that
 // captures g_resolve_pixels for the guest, the mirror refresh, the fence wait,
