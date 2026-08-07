@@ -42,4 +42,36 @@ class NullAudioSystem : public rex::audio::AudioSystem {
   void DestroyDriver(rex::audio::AudioDriver* driver) override;
 };
 
+// The shipping backend: SDL, but silent instead of dead when there is no device.
+//
+// The guest treats a failed audio init as FATAL -- it calls KeBugCheckEx and the
+// process dies at startup, after the window has appeared but before anything
+// renders, which reads to a player as a graphics crash. The SDK's SDL system
+// returns X_STATUS_UNSUCCESSFUL when SDL_OpenAudioDeviceStream cannot open the
+// default playback device, and there is nothing rare about that: a machine whose
+// display has slept has usually taken its HDMI audio endpoint with it, and a
+// player who unplugged their headphones has no default device either.
+//
+// So try SDL, and if it will not open, run the silent driver above rather than
+// failing the guest. LOUDLY -- the objection to an automatic fallback was that a
+// silent substitution turns "my sound is broken" into an invisible config state,
+// and that objection is right. It argues for saying so at ERROR, in a line that
+// names the cause and the fix, not for killing the game.
+//
+// DT_NOAUDIO=1 still forces NullAudioSystem outright, which is what unattended
+// runs should use: it never touches an audio device at all.
+class ResilientAudioSystem : public rex::audio::AudioSystem {
+ public:
+  explicit ResilientAudioSystem(rex::runtime::FunctionDispatcher* function_dispatcher);
+  ~ResilientAudioSystem() override;
+
+  static bool IsAvailable() { return true; }
+  static std::unique_ptr<rex::audio::AudioSystem> Create(
+      rex::runtime::FunctionDispatcher* function_dispatcher);
+
+  X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
+                        rex::audio::AudioDriver** out_driver) override;
+  void DestroyDriver(rex::audio::AudioDriver* driver) override;
+};
+
 }  // namespace dt_null_audio

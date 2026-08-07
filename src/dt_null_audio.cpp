@@ -4,6 +4,7 @@
 #include <chrono>
 #include <thread>
 
+#include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/logging.h>
 
 namespace dt_null_audio {
@@ -84,6 +85,63 @@ void NullAudioSystem::DestroyDriver(rex::audio::AudioDriver* driver) {
   if (!null_driver) return;
   null_driver->Shutdown();
   delete null_driver;
+}
+
+// ── ResilientAudioSystem ────────────────────────────────────────────────────
+
+std::unique_ptr<rex::audio::AudioSystem> ResilientAudioSystem::Create(
+    rex::runtime::FunctionDispatcher* function_dispatcher) {
+  return std::make_unique<ResilientAudioSystem>(function_dispatcher);
+}
+
+ResilientAudioSystem::ResilientAudioSystem(rex::runtime::FunctionDispatcher* function_dispatcher)
+    : AudioSystem(function_dispatcher) {}
+
+ResilientAudioSystem::~ResilientAudioSystem() = default;
+
+X_STATUS ResilientAudioSystem::CreateDriver(size_t /*index*/, rex::thread::Semaphore* semaphore,
+                                            rex::audio::AudioDriver** out_driver) {
+  if (!out_driver) return X_STATUS_INVALID_PARAMETER;
+
+  auto* sdl = new rex::audio::sdl::SDLAudioDriver(memory_, semaphore);
+  if (sdl->Initialize()) {
+    *out_driver = sdl;
+    return X_STATUS_SUCCESS;
+  }
+  sdl->Shutdown();
+  delete sdl;
+
+  // Once per driver, not once per process: the guest creates several, and if a
+  // device disappears mid-session the next one should say so too.
+  REXLOG_ERROR(
+      "AUDIO: no playback device could be opened -- THERE WILL BE NO SOUND. The game is "
+      "continuing in silence rather than exiting, which is what a failed audio init used to "
+      "do here. Check that an output device is present and enabled (a sleeping display often "
+      "takes an HDMI audio endpoint with it), then restart.");
+
+  auto* silent = new NullAudioDriver(memory_, semaphore);
+  if (!silent->Initialize()) {
+    delete silent;
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  *out_driver = silent;
+  return X_STATUS_SUCCESS;
+}
+
+void ResilientAudioSystem::DestroyDriver(rex::audio::AudioDriver* driver) {
+  if (!driver) return;
+  // Either kind may be live at once -- the fallback is per driver, so a session
+  // can hold an SDL driver created before a device vanished and a silent one
+  // created after.
+  if (auto* sdl = dynamic_cast<rex::audio::sdl::SDLAudioDriver*>(driver)) {
+    sdl->Shutdown();
+    delete sdl;
+    return;
+  }
+  if (auto* silent = dynamic_cast<NullAudioDriver*>(driver)) {
+    silent->Shutdown();
+    delete silent;
+  }
 }
 
 }  // namespace dt_null_audio

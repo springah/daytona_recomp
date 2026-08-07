@@ -455,26 +455,36 @@ protected:
             }
         }
 
-        // DT_NOAUDIO=1 swaps the SDL audio backend for the SDK's no-op one.
+        // Audio backend.
         //
-        // Why this exists: the guest treats audio-device init failure as FATAL --
-        // it calls KeBugCheckEx and the process dies at startup, after the window
-        // appears but before anything renders, which reads as a graphics crash.
-        // On this machine that happens whenever the display sleeps and takes the
-        // HDMI audio endpoint with it, so any unattended or overnight run dies a
-        // few minutes in for a reason that has nothing to do with the port.
+        // The guest treats audio-device init failure as FATAL -- it calls
+        // KeBugCheckEx and the process dies at startup, after the window appears
+        // but before anything renders, which reads as a graphics crash. The
+        // stock SDL backend reports exactly that failure when no default
+        // playback device can be opened, and that is not an exotic state: a
+        // machine whose display has slept has usually taken its HDMI audio
+        // endpoint with it, and a player who unplugged their headphones has no
+        // default device either. Either way the game died at the title.
+        //
+        // So the default is ResilientAudioSystem: SDL when a device opens, the
+        // silent driver when it does not, and an ERROR line that says so. The
+        // old objection to falling back -- that a silent substitution turns "my
+        // sound is broken" into an invisible config state -- is right, and it
+        // argues for being loud about it, not for exiting.
+        //
+        // DT_NOAUDIO=1 still forces silence outright, and remains what unattended
+        // runs should use: it never opens a device at all, so it cannot be
+        // affected by one disappearing mid-run.
         //
         // ReXApp::SetupPresentation() assigns the SDL backend and THEN calls
         // OnPreSetup(config_), so overriding here wins without touching the SDK
         // that the other six ports share.
-        //
-        // Deliberately opt-in, not an automatic fallback: silently substituting a
-        // silent audio system would turn "my sound is broken" into an invisible
-        // config state. No env => stock SDL audio, unchanged.
         if (std::getenv("DT_NOAUDIO")) {
             config.audio_factory = REX_AUDIO_BACKEND(dt_null_audio::NullAudioSystem);
             REXLOG_WARN("DT_NOAUDIO set -- using the silent null audio backend. "
                         "There will be NO SOUND; this is for unattended runs.");
+        } else {
+            config.audio_factory = REX_AUDIO_BACKEND(dt_null_audio::ResilientAudioSystem);
         }
 
         // Non-game runtime settings are baked into the binary (not exposed in
