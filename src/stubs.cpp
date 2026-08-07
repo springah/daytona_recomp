@@ -29,12 +29,52 @@
 
 #define DT_STUB(name) DT_STUB_RETURN(name, 0)
 
-// ── XUI / Overlay stubs (no Xbox Live — all no-ops) ──────────────────────────
+// ── XUI / Overlay blades (no Xbox Live) ──────────────────────────────────────
 // Wrappers: UiShowFriends, UiShowAchievements, UiShowMarketplace, UiShowGamerCard
-DT_STUB(__imp__XamShowGamerCardUI)
-DT_STUB(__imp__XamShowMarketplaceUI)
-DT_STUB(__imp__XamShowFriendsUI)
-DT_STUB(__imp__XamShowMessageComposeUI)
+//
+// These are NOT no-ops, and the difference is the whole point. A blade stub that
+// returns SUCCESS and does nothing FREEZES the menu that opened it: the title
+// takes success to mean the blade is up, and then waits to be told it closed --
+// XN_SYS_UI (0x9) going false, read through the title's game-logic
+// XNotifyGetNext poll. Nothing sends it, and the menu never comes back. That is
+// exactly what Achievements did, and every one of these had the same shape.
+//
+// A stub reporting success without doing the job is worse than one that fails,
+// because failure is something the title knows how to handle.
+//
+// The SDK implements MessageBox, Keyboard and DeviceSelector only -- none of
+// these -- but it has the shape, in xeXamDispatchDialog: broadcast XN_SYS_UI =
+// true, run the dialog, delay, broadcast false. With no dialog to show, this is
+// that sequence with the middle removed: the blade opens and closes at once.
+namespace {
+void DtBladeOpenClose(const char* name, std::atomic<uint32_t>& calls) {
+    if (calls.fetch_add(1, std::memory_order_relaxed) == 0) {
+        REXLOG_WARN("{}: this port has no such blade -- reporting it opened and closed "
+                    "immediately, so the title does not wait for one", name);
+    }
+    REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
+    // The delay is the SDK's, and its reason is worth keeping: a title may not
+    // create its notification listener until after the call returns, and a
+    // `false` broadcast too early is one nobody is listening for -- which is the
+    // same freeze by a different route.
+    rex::thread::Sleep(std::chrono::milliseconds(100));
+    REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
+}
+}  // namespace
+
+#define DT_STUB_BLADE(name)                       \
+    extern "C" REX_FUNC(name) {                   \
+        (void)base;                               \
+        static std::atomic<uint32_t> calls{0};    \
+        DtBladeOpenClose(#name, calls);           \
+        ctx.r3.u64 = 0;                           \
+    }
+
+DT_STUB_BLADE(__imp__XamShowAchievementsUI)   // user-confirmed: froze the main menu
+DT_STUB_BLADE(__imp__XamShowGamerCardUI)
+DT_STUB_BLADE(__imp__XamShowMarketplaceUI)
+DT_STUB_BLADE(__imp__XamShowFriendsUI)
+DT_STUB_BLADE(__imp__XamShowMessageComposeUI)
 
 // ── Network stubs (offline — XNetConnect/GetConnectStatus no-op) ─────────────
 // Wrappers: NetXNetConnect, NetGetConnectStatus
@@ -42,44 +82,13 @@ DT_STUB(__imp__NetDll_XNetUnregisterInAddr)
 DT_STUB(__imp__NetDll_XNetConnect)
 DT_STUB(__imp__NetDll_XNetGetConnectStatus)
 
-// XamShowAchievementsUI -- the achievements blade. NOT a no-op, and that is the
-// whole point of it.
-//
-// Returning SUCCESS and doing nothing is what FROZE the main menu. The title
-// takes success to mean the blade opened, and then waits for the system to tell
-// it the blade closed -- XN_SYS_UI (0x9) going false, read through its
-// game-logic XNotifyGetNext poll. Nothing ever sent that, so Achievements
-// stopped responding and never came back. A stub that reports success without
-// doing the job is worse than one that fails: failure the title can handle.
-//
-// The SDK has no XamShowAchievementsUI (it implements MessageBox, Keyboard and
-// DeviceSelector only), but it has the shape, in xeXamDispatchDialog: broadcast
-// XN_SYS_UI = true, run the dialog, then delay and broadcast false. With no
-// dialog to show, this is that sequence with the middle taken out -- the blade
-// opens and closes immediately.
-//
-// The delay is the SDK's, and its reason is worth keeping: a title may not
-// create its notification listener until after the call returns, and a `false`
-// broadcast too early is one nobody is listening for -- which is the freeze
-// again, by a different route.
-extern "C" REX_FUNC(__imp__XamShowAchievementsUI) {
-    (void)base;
-    static std::atomic<uint32_t> calls{0};
-    if (calls.fetch_add(1, std::memory_order_relaxed) == 0) {
-        REXLOG_WARN("XamShowAchievementsUI: this port has no achievements blade -- reporting it "
-                    "opened and closed immediately, so the menu does not wait for one");
-    }
-    REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
-    rex::thread::Sleep(std::chrono::milliseconds(100));
-    REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
-    ctx.r3.u64 = 0;
-}
-
 // ── Leaderboard / Achievement stubs (no Xbox Live) ───────────────────────────
+// These return data, not UI, so a plain zero is the right answer for them.
 DT_STUB(__imp__XUserWriteAchievements)
 DT_STUB(__imp__XUserCreateStatsEnumeratorByRank)
 DT_STUB(__imp__XUserCreateStatsEnumeratorByXuid)
-DT_STUB(__imp__XamShowGamerCardUIForXUID)
+// ...but this one IS a blade, despite sitting with the leaderboard calls.
+DT_STUB_BLADE(__imp__XamShowGamerCardUIForXUID)
 
 // ── Kernel I/O stubs (device driver path unused on PC) ───────────────────────
 DT_STUB(__imp__IoCheckShareAccess)
