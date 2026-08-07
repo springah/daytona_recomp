@@ -430,20 +430,28 @@ protected:
         rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
 
         // Since the SDK's v0.9 GPU-plugin split an empty gpu_plugin means
-        // headless; daytona always renders through the Xenos plugin. An
-        // explicit --gpu_plugin (cvar non-empty by now) still takes precedence.
+        // headless. This branch defaults to `plume`, which does NOT draw: it
+        // supplies the three things a GPU is besides a renderer (the vblank tick
+        // and its interrupt, the register window at 0x7FC80000, and draining the
+        // ring) and discards the draws, because dt_plume has already recorded
+        // them off the D3D9 hooks. See src/gpu_plume/plugin.cpp.
+        //
+        // `--gpu_plugin=xenos` is the no-rebuild A/B against Xenos emulation and
+        // pairs with DT_PLUME=0. An explicit --gpu_plugin (cvar non-empty by
+        // now) still takes precedence over both.
         if (config.gpu_plugin.empty()) {
-            // DT_PLUME_NOGPU=1 leaves it empty, i.e. genuinely headless: no
-            // Xenos emulation at all, with DT_PLUME's native renderer the only
-            // thing drawing. That is the end state this port is aiming at, and
-            // it is worth being able to reach it with an env var rather than a
-            // rebuild -- it says immediately what the native renderer would
-            // still have to supply (the vblank tick, the GPU MMIO range, and
-            // draining the PM4 ring so the guest does not stall on a full one).
+            // DT_PLUME_NOGPU=1 leaves it empty, i.e. genuinely headless: no GPU
+            // plugin of any kind. That is a DIAGNOSTIC, not a shipping mode --
+            // it is the experiment that established what the plume plugin has to
+            // supply. With nothing supplying the vblank tick, the register
+            // window and the ring drain, the guest gets through boot and shader
+            // creation and then HANGS before the first draw. Expect that; it is
+            // the measurement, not a regression.
             if (std::getenv("DT_PLUME_NOGPU") != nullptr) {
-                REXLOG_WARN("DT_PLUME_NOGPU: no GPU plugin -- Xenos emulation is OFF");
+                REXLOG_WARN("DT_PLUME_NOGPU: no GPU plugin at all -- the guest is "
+                            "expected to hang before the first draw");
             } else {
-                config.gpu_plugin = "xenos";
+                config.gpu_plugin = "plume";
             }
         }
 

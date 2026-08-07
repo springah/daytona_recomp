@@ -703,8 +703,21 @@ FetchedAttribute DecodeVfetch(uint32_t w0, uint32_t w1, uint32_t w2) {
 
 }  // namespace
 
+// ON by default on this branch. This is the native-renderer build of Daytona --
+// the renderer is the point of it, and it was still opt-in long after it became
+// the thing that draws every screen correctly. A shipped build that renders
+// through Xenos emulation unless the player happens to set an environment
+// variable is not the product; it is the fallback wearing the product's name.
+//
+// The stock rexglue build lives on `main`, in the daytona_stock worktree, which
+// is what "run this without the native renderer" now means.
+//
+// DT_PLUME=0 still reverts, in place, for A/B against the old path.
 bool Enabled() {
-    static const bool on = std::getenv("DT_PLUME") != nullptr;
+    static const bool on = [] {
+        const char* p = std::getenv("DT_PLUME");
+        return p == nullptr || std::atoi(p) != 0;
+    }();
     return on;
 }
 
@@ -714,7 +727,7 @@ bool Init() {
     if (g_init_attempted) return g_init_ok;
     g_init_attempted = true;
 
-    REXLOG_WARN("DT_PLUME set -- bringing up the native renderer (shader resolve only, no drawing)");
+    REXLOG_WARN("bringing up the native renderer (DT_PLUME=0 reverts to Xenos emulation)");
 
     // The console's backbuffer persists across a present, so ours does too, and
     // only the guest's clear clears it. DT_PLUME_PERSIST=0 goes back to
