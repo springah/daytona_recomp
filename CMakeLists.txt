@@ -132,6 +132,29 @@ target_compile_definitions(daytona PRIVATE DAYTONA_VERSION=${PROJECT_VERSION})
 # src/dt_plume.cpp.
 target_link_libraries(daytona PRIVATE plume smolv)
 
+# X11, for plume's Vulkan backend.
+#
+# plume calls XGetWindowAttributes (it reads the window size off the X11 handle
+# in its Linux RenderWindow) but its CMakeLists never declares the dependency,
+# so libplume.a leaves the symbol undefined and the FINAL link is where it
+# surfaces -- here. Fixed here rather than in the plume fork because this is
+# where the failure is, and because it costs one line instead of a submodule
+# commit; worth pushing upstream to springah/plume eventually.
+if(UNIX AND NOT APPLE)
+    find_package(X11 REQUIRED)
+    target_link_libraries(daytona PRIVATE X11::X11)
+endif()
+
+# SDL3 headers, for the Linux window lookup in dt_plume's EnsureWindow.
+#
+# Explicit rather than transitive: the SDK links SDL3::SDL3 PUBLIC from its audio
+# subdirectory, but daytona links `rexruntime`, which absorbs rexcore as OBJECT
+# libraries -- and that is exactly the shape where usage requirements can fail to
+# propagate. Relying on it would mean a header that resolves by luck.
+if(UNIX AND NOT APPLE AND TARGET SDL3::SDL3)
+    target_link_libraries(daytona PRIVATE SDL3::SDL3)
+endif()
+
 # The renderer spike drives plume by hand from intercepted guest calls, so a
 # wrong descriptor or a mismatched pipeline shows up as a crash with no message.
 # -DDT_PLUME_D3D12_DEBUG=ON turns on the D3D12 validation layer, which names the

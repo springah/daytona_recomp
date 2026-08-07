@@ -40,6 +40,14 @@
 #include <windows.h>
 #endif
 
+#ifdef __linux__
+// The window is the SDK's, and it is an SDL3 window; plume wants the X11 pair
+// behind it. Both headers are already in the link -- the SDK vendors SDL3, and
+// plume's own Linux RenderWindow is declared in terms of Xlib types.
+#include <SDL3/SDL_video.h>
+#include <SDL3/SDL_properties.h>
+#endif
+
 namespace plume {
 // Defined in plume_d3d12.cpp / plume_vulkan.cpp; plume declares neither in a
 // public header, so the example does the same thing.
@@ -2266,13 +2274,18 @@ OffscreenState g_offscreen = OffscreenState::kNone;
 // The presentation window and its swapchain. Both are optional: if either
 // fails, the frame still composes and reads back, and only the picture is lost.
 std::unique_ptr<plume::RenderSwapChain> g_swapchain;
-#ifdef _WIN32
+
 // ── The present blit ────────────────────────────────────────────────────────
 //
 // Its own pipeline layout, not the guest's: one texture in space0 and one
 // sampler in space1, no input layout. The guest's layout is XenosRecomp's
 // bindless model with three texture heaps and three root CBVs, and a fullscreen
 // triangle needs none of it.
+//
+// NOT Windows-only, though it lived inside the _WIN32 guard below until the
+// first Linux build tripped over it. Nothing here is a platform type -- it is
+// plume objects and a shader that now exists in both DXIL and SPIR-V. Only the
+// WINDOW is platform-specific, and it is what the guard is actually for.
 std::unique_ptr<plume::RenderPipelineLayout> g_blit_layout;
 std::unique_ptr<plume::RenderPipeline> g_blit_pipeline;
 std::unique_ptr<plume::RenderShader> g_blit_vs_shader;
@@ -2283,7 +2296,11 @@ std::unique_ptr<plume::RenderSampler> g_blit_sampler;
 // One per swapchain image. Rebuilt whenever the swapchain is.
 std::vector<std::unique_ptr<plume::RenderFramebuffer>> g_blit_fbs;
 
-HWND g_window = nullptr;
+// The window we present into. plume::RenderWindow IS an HWND on Windows and an
+// X11 {Display*, Window} on Linux, so this one declaration serves both and the
+// swapchain call below needs no platform branch.
+plume::RenderWindow g_window {};
+
 // True when g_window belongs to the SDK's ReXApp rather than to us.
 //
 // This port used to put TWO windows on screen: the SDK creates one in
@@ -2298,8 +2315,9 @@ HWND g_window = nullptr;
 // owns the handle, and the two things that follow from that: we must not pump
 // its messages (it belongs to the UI thread, which pumps it) and we must not
 // destroy it at shutdown.
+//
+// Always true on Linux: there is no path there that creates its own window.
 bool g_window_borrowed = false;
-#endif
 bool g_window_tried = false;
 
 // Frame state. `g_frame_buffers` holds every per-draw upload alive until the
@@ -3078,6 +3096,63 @@ bool EnsureWindow() {
     // NOACTIVATE: stealing focus from the game window would break input.
     ShowWindow(g_window, SW_SHOWNOACTIVATE);
     return true;
+#elif defined(__linux__)
+    if (g_window.window != 0) return true;
+    if (g_window_tried) return false;
+    g_window_tried = true;
+
+    const char* opt = std::getenv("DT_PLUME_WINDOW");
+    if (opt != nullptr && opt[0] == '0') {
+        REXLOG_WARN("plume: DT_PLUME_WINDOW=0 -- composing headless, no window");
+        return false;
+    }
+
+    // We do NOT create a window here, unlike the Windows path above. Two windows
+    // was a bug there and would be a worse one on a Deck, where the second one
+    // has nowhere to go. So find the SDK's and present into it.
+    //
+    // Found rather than handed over: WindowSDL::GetNativeWindowHandle() returns
+    // nullptr on everything but Win32 (rexglue-sdk src/ui/window_sdl.cpp:219),
+    // and sdl_window_ is private, so SetHostWindow gets nothing to pass us. SDL
+    // keeps its own registry though, and this process has exactly one window.
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    if (windows == nullptr || count < 1) {
+        REXLOG_WARN("plume: no SDL window to present into (count {}) -- composing headless", count);
+        return false;
+    }
+    if (count > 1) {
+        // Take the first anyway. Refusing to guess would be the tidier rule and
+        // the worse outcome: on a Deck the two failures are "a picture, possibly
+        // in the wrong window" and "a black screen", and only the first is
+        // diagnosable by the person holding it. The SDK creates exactly one
+        // window today, so this is a warning about a future change, not a
+        // condition anything has been seen to hit.
+        REXLOG_WARN("plume: {} SDL windows exist -- presenting into the first. If the picture is "
+                    "in the wrong place, this line is why.", count);
+    }
+
+    // plume's Linux RenderWindow is X11 ({Display*, Window}), not a handle. Under
+    // gamescope, and under WSLg, SDL is on XWayland and these are populated; on a
+    // native-Wayland session they are not, and that is a real limitation to find
+    // out about from a log line rather than from a black screen.
+    SDL_PropertiesID props = SDL_GetWindowProperties(windows[0]);
+    auto* display = static_cast<Display*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr));
+    const auto xwindow = static_cast<Window>(
+        SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
+    if (display == nullptr || xwindow == 0) {
+        REXLOG_WARN("plume: the SDL window has no X11 handle (display {}, window {}) -- this is a "
+                    "native Wayland session and the Vulkan path needs X11/XWayland. Composing "
+                    "headless.", static_cast<const void*>(display), uint64_t(xwindow));
+        return false;
+    }
+    g_window.display = display;
+    g_window.window = xwindow;
+    g_window_borrowed = true;
+    REXLOG_WARN("plume: presenting into the application's X11 window ({:#x}), not a second one",
+                uint64_t(xwindow));
+    return true;
 #else
     return false;
 #endif
@@ -3423,7 +3498,10 @@ bool EnsureOffscreen() {
         REXLOG_WARN("plume: present blit unavailable -- the window will not be updated");
     }
 
-#ifdef _WIN32
+    // No platform guard: g_window is plume::RenderWindow, which is the HWND on
+    // Windows and the X11 pair on Linux, and EnsureWindow fills whichever. This
+    // block was Windows-only, which is why a Linux build would have composed
+    // headless even with a perfectly good Vulkan device.
     if (EnsureWindow()) {
         // maxFrameLatency must be at least 1: the swapchain is created with the
         // waitable-object flag and SetMaximumFrameLatency(0) is invalid.
@@ -3444,7 +3522,6 @@ bool EnsureOffscreen() {
                         g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
         }
     }
-#endif
 
     g_offscreen = OffscreenState::kReady;
     REXLOG_WARN("plume: frame target ready -- {}x{} format {} + depth, readback, {}",
@@ -5843,6 +5920,10 @@ void SetHostWindow(void* native_handle) {
     REXLOG_WARN("plume: presenting into the application's window ({}), not a second one",
                 static_cast<const void*>(g_window));
 #else
+    // Nothing to take: WindowSDL::GetNativeWindowHandle() returns nullptr on
+    // every platform but Win32, so this is always called with null here. The
+    // Linux branch of EnsureWindow finds the window through SDL's own registry
+    // instead -- see there.
     (void)native_handle;
 #endif
 }
@@ -5912,6 +5993,10 @@ void Shutdown() {
         // left dangling here.
         g_window = nullptr;
     }
+#else
+    // On Linux the window is ALWAYS the SDK's -- there is no path that creates
+    // one -- so there is nothing to destroy, only the handle to drop.
+    g_window = {};
 #endif
     g_offscreen = OffscreenState::kNone;
     g_device.reset();
