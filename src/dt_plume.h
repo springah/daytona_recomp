@@ -95,6 +95,17 @@ void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
 // Build one plume graphics pipeline per observed (VS, PS, topology) combination.
 // Needs the vertex layouts, so it only builds a combination once that shader's
 // layout is known. Safe to call repeatedly; already-built ones are skipped.
+// Hand the renderer the application's existing window to present into, instead
+// of it creating a second one. Call once, after the SDK's window exists
+// (OnPostSetup) and before the first frame.
+//
+// The port used to show two windows: the SDK's, which owns input, F11 and the
+// close button, and the renderer's, which had the picture. Passing the SDK's
+// native handle here means there is one window that both owns input and shows
+// the game. A null handle, or never calling this, leaves the old behaviour --
+// the renderer makes its own.
+void SetHostWindow(void* native_handle);
+
 void BuildPipelines(const char* reason);
 
 // Create the static expansion index buffers. QUADLIST and TRIANGLEFAN do not

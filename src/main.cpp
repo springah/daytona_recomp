@@ -600,6 +600,20 @@ protected:
         // src/keyboard_driver.*) was a stale Crazy-Taxi mapping that put WASD AND
         // arrows on the D-pad, and since the InputSystem MERGES every connected
         // driver it double-drove the stick (MnK) and the D-pad (ours) at once.
+
+        // One window, not two. The native renderer owns its own swapchain and
+        // used to create its own window for it, so the port put a second window
+        // on screen beside this one -- and this is the one that matters: input
+        // is attached to it, F11 belongs to it, and closing it shuts the game
+        // down. Hand the renderer this window's native handle and it presents
+        // into it instead.
+        //
+        // Here rather than in OnPreSetup because the window does not exist until
+        // SetupPresentation has run, and before the first frame because the
+        // swapchain is built from whatever handle the renderer has by then.
+        if (rex::ui::Window* w = window()) {
+            dt_plume::SetHostWindow(w->GetNativeWindowHandle());
+        }
     }
 
     void OnPreLaunchModule() override {

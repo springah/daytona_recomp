@@ -1,5 +1,6 @@
 #include "dt_plume.h"
 
+#include "dt_blit_blobs.h"
 #include "dt_guest_mem.h"
 #include "dt_shader_blobs.h"
 
@@ -2152,10 +2153,26 @@ std::unique_ptr<plume::RenderCommandFence> g_fence;
 // declared with the other levers, above, because the env parser reads it there.)
 std::unique_ptr<plume::RenderCommandList> g_cmd_alt;
 std::unique_ptr<plume::RenderCommandFence> g_fence_alt;
-// True once the alternate slot has actually been submitted. Waiting on a fence
-// that has never been signalled does not return, so the first frame through
-// must not wait on the other slot.
-bool g_alt_submitted = false;
+// Whether each fence has a signal nobody has consumed yet.
+//
+// This is not bookkeeping for its own sake. plume's waitForCommandFence is
+// WaitForSingleObjectEx(event, INFINITE) on an AUTO-RESET event, with no fence
+// value involved (plume_d3d12.cpp) -- so waiting on a fence with no pending
+// submission blocks FOREVER, and each wait consumes the signal, so two waits
+// for one submit deadlock just as hard. Every wait in this file has to know
+// whether there is something to wait for.
+//
+// That is exactly what froze the window on F11: the resize path drained both
+// fences unconditionally, and from PresentTarget the previous EndFrame had
+// already consumed g_fence's signal.
+bool g_fence_pending = false;
+bool g_fence_alt_pending = false;
+
+void WaitFence(const std::unique_ptr<plume::RenderCommandFence>& fence, bool& pending) {
+    if (!pending || fence == nullptr) return;
+    g_queue->waitForCommandFence(fence.get());
+    pending = false;
+}
 // Uploads are submitted and waited on in the middle of a frame's recording, so
 // they get their own fence rather than racing the frame's.
 std::unique_ptr<plume::RenderCommandFence> g_upload_fence;
@@ -2170,7 +2187,38 @@ OffscreenState g_offscreen = OffscreenState::kNone;
 // fails, the frame still composes and reads back, and only the picture is lost.
 std::unique_ptr<plume::RenderSwapChain> g_swapchain;
 #ifdef _WIN32
+// ── The present blit ────────────────────────────────────────────────────────
+//
+// Its own pipeline layout, not the guest's: one texture in space0 and one
+// sampler in space1, no input layout. The guest's layout is XenosRecomp's
+// bindless model with three texture heaps and three root CBVs, and a fullscreen
+// triangle needs none of it.
+std::unique_ptr<plume::RenderPipelineLayout> g_blit_layout;
+std::unique_ptr<plume::RenderPipeline> g_blit_pipeline;
+std::unique_ptr<plume::RenderShader> g_blit_vs_shader;
+std::unique_ptr<plume::RenderShader> g_blit_ps_shader;
+std::unique_ptr<plume::RenderDescriptorSet> g_blit_tex_set;
+std::unique_ptr<plume::RenderDescriptorSet> g_blit_smp_set;
+std::unique_ptr<plume::RenderSampler> g_blit_sampler;
+// One per swapchain image. Rebuilt whenever the swapchain is.
+std::vector<std::unique_ptr<plume::RenderFramebuffer>> g_blit_fbs;
+
 HWND g_window = nullptr;
+// True when g_window belongs to the SDK's ReXApp rather than to us.
+//
+// This port used to put TWO windows on screen: the SDK creates one in
+// SetupPresentation -- which is not decorative, it is where input is attached,
+// where F11 lives, and whose close button shuts the game down -- and then this
+// renderer created a second one to present into, because it owns its own
+// swapchain. The player got the real picture in one window and a dead one
+// beside it.
+//
+// So borrow the SDK's instead. Everything downstream already keys off this
+// HWND, including the swapchain, so nothing else changes; what changes is who
+// owns the handle, and the two things that follow from that: we must not pump
+// its messages (it belongs to the UI thread, which pumps it) and we must not
+// destroy it at shutdown.
+bool g_window_borrowed = false;
 #endif
 bool g_window_tried = false;
 
@@ -2884,6 +2932,7 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
 // and still reads back, so the measurements are unaffected.
 bool EnsureWindow() {
 #ifdef _WIN32
+    // Borrowed from the SDK, if it handed one over -- see g_window_borrowed.
     if (g_window != nullptr) return true;
     if (g_window_tried) return false;
     g_window_tried = true;
@@ -2928,6 +2977,174 @@ bool EnsureWindow() {
 #else
     return false;
 #endif
+}
+
+// One framebuffer per swapchain image. Rebuilt whenever the swapchain is, which
+// is every time the window changes size -- including F11.
+void RebuildSwapchainTargets() {
+    g_blit_fbs.clear();
+    if (g_swapchain == nullptr) return;
+    const uint32_t n = g_swapchain->getTextureCount();
+    g_blit_fbs.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        const plume::RenderTexture* tex = g_swapchain->getTexture(i);
+        plume::RenderFramebufferDesc fb(&tex, 1, nullptr);   // colour only, no depth
+        g_blit_fbs.push_back(g_device->createFramebuffer(fb));
+    }
+}
+
+// Build the present blit's pipeline. Once, at setup.
+bool BuildBlit() {
+    if (g_blit_pipeline != nullptr) return true;
+
+    g_blit_vs_shader = g_device->createShader(dt_blit_blobs::kBlitVs, dt_blit_blobs::kBlitVs_size,
+                                              "main_vs", g_shader_format);
+    g_blit_ps_shader = g_device->createShader(dt_blit_blobs::kBlitPs, dt_blit_blobs::kBlitPs_size,
+                                              "main_ps", g_shader_format);
+    if (g_blit_vs_shader == nullptr || g_blit_ps_shader == nullptr) {
+        REXLOG_WARN("plume: blit shaders failed to load (vs={} ps={})",
+                    g_blit_vs_shader != nullptr, g_blit_ps_shader != nullptr);
+        return false;
+    }
+
+    plume::RenderPipelineLayoutBuilder lb;
+    lb.begin(false, false);   // no push constants, no input layout
+    plume::RenderDescriptorSetBuilder tex;
+    tex.begin();
+    tex.addTexture(0);
+    tex.end();
+    lb.addDescriptorSet(tex);     // space0: the frame
+    plume::RenderDescriptorSetBuilder smp;
+    smp.begin();
+    smp.addSampler(0);
+    smp.end();
+    lb.addDescriptorSet(smp);     // space1: how to filter it
+    lb.end();
+    g_blit_layout = lb.create(g_device.get());
+
+    g_blit_tex_set = tex.create(g_device.get());
+    g_blit_smp_set = smp.create(g_device.get());
+    // LINEAR, because this is a scale: the frame is 1280x720 and the window is
+    // whatever the player made it. Nearest would alias badly at non-integer
+    // ratios, which is most of them.
+    plume::RenderSamplerDesc sd;
+    sd.minFilter = plume::RenderFilter::LINEAR;
+    sd.magFilter = plume::RenderFilter::LINEAR;
+    sd.addressU = plume::RenderTextureAddressMode::CLAMP;
+    sd.addressV = plume::RenderTextureAddressMode::CLAMP;
+    sd.addressW = plume::RenderTextureAddressMode::CLAMP;
+    g_blit_sampler = g_device->createSampler(sd);
+
+    if (g_blit_layout == nullptr || g_blit_tex_set == nullptr || g_blit_smp_set == nullptr ||
+        g_blit_sampler == nullptr) {
+        REXLOG_WARN("plume: blit layout/sets/sampler failed");
+        return false;
+    }
+    g_blit_smp_set->setSampler(0, g_blit_sampler.get());
+    g_blit_tex_set->setTexture(0, g_color_target.get(), plume::RenderTextureLayout::SHADER_READ);
+
+    plume::RenderGraphicsPipelineDesc pd;
+    pd.pipelineLayout = g_blit_layout.get();
+    pd.vertexShader = g_blit_vs_shader.get();
+    pd.pixelShader = g_blit_ps_shader.get();
+    pd.renderTargetFormat[0] = kRenderTargetFormat;
+    pd.renderTargetCount = 1;
+    pd.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    // No depth: there is nothing to occlude, and asking for a depth target the
+    // framebuffer does not have fails pipeline creation.
+    g_blit_pipeline = g_device->createGraphicsPipeline(pd);
+    if (g_blit_pipeline == nullptr) {
+        REXLOG_WARN("plume: blit pipeline creation failed");
+        return false;
+    }
+    REXLOG_WARN("plume: present blit ready -- the frame is DRAWN into the backbuffer, so the "
+                "window may be any size");
+    return true;
+}
+
+// Resize the swapchain if the window changed shape. Returns false if there is
+// nothing presentable.
+//
+// The old code simply gave up while a resize was pending, in BOTH present
+// paths, which is what froze the picture. And it was worse than "F11 freezes":
+// the SDK creates the window with SDL_WINDOW_RESIZABLE (window_sdl.cpp:132), so
+// dragging an edge by one pixel froze it too -- and that one never recovered,
+// because recovery required landing back on exactly the frame size.
+bool EnsureSwapchainSized() {
+    if (g_swapchain == nullptr) return false;
+    if (!g_swapchain->needsResize()) return true;
+    // Nothing may still be executing against the old backbuffers. Only fences
+    // that actually have a pending signal -- see WaitFence.
+    WaitFence(g_fence, g_fence_pending);
+    WaitFence(g_fence_alt, g_fence_alt_pending);
+    g_blit_fbs.clear();   // these view the old images
+    g_swapchain->resize();
+    RebuildSwapchainTargets();
+    REXLOG_WARN("plume: swapchain resized to {}x{} (frame is {}x{})",
+                g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
+    return !g_swapchain->needsResize();
+}
+
+// Record the scaled present into `cmd`. The caller owns begin/end/submit.
+//
+// Both present paths go through here deliberately. Presentation lives in TWO
+// places -- EndFrame when a frame closes at the guest's Swap, and PresentTarget
+// when the Swap finds the frame already closed by a resolve, which is in fact
+// where essentially every present comes from. Converting one and not the other
+// is exactly the bug that put a 1280x720 picture in the corner of a 1920x1080
+// window.
+// `restore_to` is not optional and not cosmetic. Sampling the frame target means
+// moving it to SHADER_READ, and every OTHER user of it assumes the layout it was
+// left in: EndFrame's readback copy expects COPY_SOURCE, the next frame's draws
+// expect COLOR_WRITE. Leaving it in SHADER_READ made the next readback run
+// against a wrongly-tracked layout, the GPU faulted, and waitForCommandFence
+// never returned -- the render thread hung ~17s in while the vblank thread kept
+// ticking, so the process still looked alive.
+bool RecordPresentBlit(plume::RenderCommandList* cmd, plume::RenderTexture* backbuffer,
+                       uint32_t swap_index, plume::RenderTextureLayout restore_to) {
+    if (cmd == nullptr || backbuffer == nullptr || g_blit_pipeline == nullptr) return false;
+    if (swap_index >= g_blit_fbs.size() || g_blit_fbs[swap_index] == nullptr) return false;
+
+    // Aspect-fit, computed here rather than in the shader: the bars are simply
+    // where the viewport is not, and the arithmetic stays somewhere readable.
+    const float dst_w = float(g_swapchain->getWidth());
+    const float dst_h = float(g_swapchain->getHeight());
+    const float scale = std::min(dst_w / float(kFrameW), dst_h / float(kFrameH));
+    const float w = float(kFrameW) * scale;
+    const float h = float(kFrameH) * scale;
+    const float x = (dst_w - w) * 0.5f;
+    const float y = (dst_h - h) * 0.5f;
+
+    // From whatever it was in -- COLOR_WRITE after a draw, COPY_SOURCE after a
+    // resolve closed the frame -- to something samplable.
+    const plume::RenderTextureBarrier to_read(g_color_target.get(),
+                                              plume::RenderTextureLayout::SHADER_READ);
+    cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
+    const plume::RenderTextureBarrier to_draw(backbuffer,
+                                              plume::RenderTextureLayout::COLOR_WRITE);
+    cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_draw, 1);
+
+    cmd->setFramebuffer(g_blit_fbs[swap_index].get());
+    // The letterbox bars, every present: the window can change shape between two.
+    cmd->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+    cmd->setPipeline(g_blit_pipeline.get());
+    cmd->setGraphicsPipelineLayout(g_blit_layout.get());
+    cmd->setGraphicsDescriptorSet(g_blit_tex_set.get(), 0);
+    cmd->setGraphicsDescriptorSet(g_blit_smp_set.get(), 1);
+    const plume::RenderViewport vp(x, y, w, h);
+    const plume::RenderRect sc(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h));
+    cmd->setViewports(&vp, 1);
+    cmd->setScissors(&sc, 1);
+    cmd->drawInstanced(3, 1, 0, 0);   // one fullscreen triangle
+
+    const plume::RenderTextureBarrier to_present(backbuffer,
+                                                 plume::RenderTextureLayout::PRESENT);
+    cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_present, 1);
+
+    // Put the frame target back where its next user expects to find it.
+    const plume::RenderTextureBarrier restore(g_color_target.get(), restore_to);
+    cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &restore, 1);
+    return true;
 }
 
 bool EnsureOffscreen() {
@@ -3086,6 +3303,10 @@ bool EnsureOffscreen() {
         }
     }
 
+    if (!BuildBlit()) {
+        REXLOG_WARN("plume: present blit unavailable -- the window will not be updated");
+    }
+
 #ifdef _WIN32
     if (EnsureWindow()) {
         // maxFrameLatency must be at least 1: the swapchain is created with the
@@ -3095,16 +3316,16 @@ bool EnsureOffscreen() {
         if (g_swapchain == nullptr || g_swapchain->isEmpty()) {
             REXLOG_WARN("plume: swapchain creation failed -- composing headless");
             g_swapchain.reset();
-        } else if (g_swapchain->getWidth() != kFrameW || g_swapchain->getHeight() != kFrameH) {
-            // The copy into the backbuffer is 1:1, so a mismatch would be a
-            // silently wrong picture rather than an error. Refuse it instead.
-            REXLOG_WARN("plume: swapchain is {}x{} but the frame is {}x{} -- not presenting",
-                        g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
-            g_swapchain.reset();
         } else {
+            // Any size is acceptable now. It used to have to be exactly the
+            // frame size, because presenting was a 1:1 copy -- which is why the
+            // renderer made its own window at exactly 1280x720, why the ini's
+            // `resolution` never did anything, and why going fullscreen froze
+            // the picture. The blit scales.
             g_swapchain->setVsyncEnabled(false);
-            REXLOG_WARN("plume: swapchain ready -- {}x{}, 2 buffers, vsync off",
-                        g_swapchain->getWidth(), g_swapchain->getHeight());
+            RebuildSwapchainTargets();
+            REXLOG_WARN("plume: swapchain ready -- {}x{} for a {}x{} frame, 2 buffers, vsync off",
+                        g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
         }
     }
 #endif
@@ -3725,6 +3946,9 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
 // this one. Without a pump it is marked unresponsive and never repaints.
 void PumpWindow() {
     if (g_window == nullptr) return;
+    // A borrowed window belongs to the SDK's UI thread, which pumps it. Pumping
+    // it from here would pull its messages onto the render thread.
+    if (g_window_borrowed) return;
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
@@ -3825,7 +4049,8 @@ void EndFrame(bool present) {
     const bool do_present = g_swap_present ? present : true;
     uint32_t swap_index = 0;
     plume::RenderTexture* backbuffer = nullptr;
-    if (do_present && g_swapchain != nullptr && !g_swapchain->needsResize() &&
+
+    if (do_present && EnsureSwapchainSized() &&
         g_swapchain->acquireTexture(nullptr, &swap_index)) {
         backbuffer = g_swapchain->getTexture(swap_index);
     }
@@ -3858,12 +4083,9 @@ void EndFrame(bool present) {
     }
 
     if (backbuffer != nullptr) {
-        // 1:1 -- the window was created at exactly the frame size and the
-        // swapchain was rejected at startup if it did not agree.
-        g_cmd->copyTexture(backbuffer, g_color_target.get());
-        const plume::RenderTextureBarrier to_present(backbuffer,
-                                                     plume::RenderTextureLayout::PRESENT);
-        g_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_present, 1);
+        // COLOR_WRITE: the next frame draws into it.
+        RecordPresentBlit(g_cmd.get(), backbuffer, swap_index,
+                          plume::RenderTextureLayout::COLOR_WRITE);
     }
     if (report) {
         g_cmd->copyTextureRegion(
@@ -3875,6 +4097,7 @@ void EndFrame(bool present) {
 
     const plume::RenderCommandList* lists[] = {g_cmd.get()};
     g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
+    g_fence_pending = true;
 
     // A `report` frame has to have THIS frame's pixels on the CPU below, so it
     // waits on this frame's fence -- there is no deferring a readback. Those are
@@ -3884,7 +4107,7 @@ void EndFrame(bool present) {
     if (must_wait_now) {
         {
             ScopedMs fence_timer(g_ms_e_fence);
-            g_queue->waitForCommandFence(g_fence.get());
+            WaitFence(g_fence, g_fence_pending);
         }
         // Deliberately does NOT swap slots. The other slot may still be in
         // flight from the previous frame; it is retired by the next frame that
@@ -3895,17 +4118,20 @@ void EndFrame(bool present) {
         // makes the frees and the arena rewind safe.
         std::swap(g_cmd, g_cmd_alt);
         std::swap(g_fence, g_fence_alt);
+        // The pending flags travel WITH their fences, or the next wait asks the
+        // wrong one whether it has anything to wait for.
+        std::swap(g_fence_pending, g_fence_alt_pending);
         std::swap(g_arena_chunks, g_arena_chunks_alt);
         std::swap(g_frame_buffers, g_frame_buffers_alt);
         std::swap(g_texture_graveyard, g_texture_graveyard_alt);
-        if (g_alt_submitted) {
+        {
             // Frame N-1. It has had a whole frame to finish, so this is usually
             // already signalled -- which is the entire point, and is what the
-            // GPU-wait bucket should now show.
+            // GPU-wait bucket should now show. WaitFence no-ops on the first
+            // frame through, when the other slot has never been submitted.
             ScopedMs fence_timer(g_ms_e_fence);
-            g_queue->waitForCommandFence(g_fence.get());
+            WaitFence(g_fence, g_fence_pending);
         }
-        g_alt_submitted = true;
     }
 
     if (backbuffer != nullptr) {
@@ -4144,22 +4370,23 @@ plume::RenderBlendDesc BlendDescFromControl(uint32_t bc, uint8_t write_mask) {
 // nothing is uploading at a Swap with no frame open.
 void PresentTarget() {
     if (g_offscreen != OffscreenState::kReady || !g_target_primed) return;
-    if (g_swapchain == nullptr || g_swapchain->needsResize()) return;
+    // Resize rather than give up: this early-return is where a resized or
+    // fullscreened window used to freeze, and since essentially every present
+    // comes through here, this is the one that mattered.
+    if (!EnsureSwapchainSized()) return;
     uint32_t swap_index = 0;
     if (!g_swapchain->acquireTexture(nullptr, &swap_index)) return;
     plume::RenderTexture* backbuffer = g_swapchain->getTexture(swap_index);
     if (backbuffer == nullptr) return;
 
-    // The frame target has been in COPY_SOURCE since the EndFrame that closed
-    // the frame and it is not transitioned back until the next BeginFrame, so
-    // only the backbuffer needs a barrier here.
     g_upload_cmd->begin();
-    const plume::RenderTextureBarrier to_dst(backbuffer, plume::RenderTextureLayout::COPY_DEST);
-    g_upload_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_dst, 1);
-    g_upload_cmd->copyTexture(backbuffer, g_color_target.get());
-    const plume::RenderTextureBarrier to_present(backbuffer,
-                                                 plume::RenderTextureLayout::PRESENT);
-    g_upload_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_present, 1);
+    // COPY_SOURCE: this runs after the frame is closed, and that is the layout
+    // EndFrame's readback copy and the resolve capture expect to find it in.
+    if (!RecordPresentBlit(g_upload_cmd.get(), backbuffer, swap_index,
+                           plume::RenderTextureLayout::COPY_SOURCE)) {
+        g_upload_cmd->end();
+        return;
+    }
     g_upload_cmd->end();
 
     const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
@@ -5439,6 +5666,28 @@ void Dump(const char* reason) {
     REXLOG_WARN("===== end plume renderer =====");
 }
 
+void SetHostWindow(void* native_handle) {
+#ifdef _WIN32
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (native_handle == nullptr) return;
+    // Never swap a handle out from under a live swapchain -- if a window
+    // already exists this call is too late, and silently retargeting would be
+    // worse than ignoring it.
+    if (g_window != nullptr) return;
+    g_window = static_cast<HWND>(native_handle);
+    g_window_borrowed = true;
+    g_window_tried = true;   // stop EnsureWindow from creating a second one
+
+    // Its size is left alone: the present blit scales the frame to whatever the
+    // window is, so daytona.ini's `resolution` finally means something, and the
+    // window may be resized or made fullscreen at will.
+    REXLOG_WARN("plume: presenting into the application's window ({}), not a second one",
+                static_cast<const void*>(g_window));
+#else
+    (void)native_handle;
+#endif
+}
+
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
     // A frame left open holds a recording command list and the GPU may still be
@@ -5448,14 +5697,11 @@ void Shutdown() {
             g_cmd->end();
             g_frame_open = false;
         }
-        g_queue->waitForCommandFence(g_fence.get());
-        // BOTH slots. With the ring on, the frame that is still executing is the
-        // one in the OTHER slot -- draining only this one and then destroying
-        // buffers and mapped arena chunks would free memory the GPU is reading.
-        // Guarded: a fence that has never been signalled does not return.
-        if (g_alt_submitted && g_fence_alt != nullptr) {
-            g_queue->waitForCommandFence(g_fence_alt.get());
-        }
+        // BOTH slots. With the ring on, the frame still executing is the one in
+        // the OTHER slot -- draining only this one and then destroying buffers
+        // and mapped arena chunks would free memory the GPU is reading.
+        WaitFence(g_fence, g_fence_pending);
+        WaitFence(g_fence_alt, g_fence_alt_pending);
     }
     g_frame_buffers.clear();
     g_frame_buffers_alt.clear();
@@ -5499,8 +5745,12 @@ void Shutdown() {
     g_upload_fence.reset();
     g_queue.reset();
 #ifdef _WIN32
+    // Only if it is ours. Destroying the SDK's window here would take the
+    // application's window out from under it during its own shutdown.
     if (g_window != nullptr) {
-        DestroyWindow(g_window);
+        if (!g_window_borrowed) DestroyWindow(g_window);
+        // Cleared either way: a borrowed handle outlives us but must not be
+        // left dangling here.
         g_window = nullptr;
     }
 #endif

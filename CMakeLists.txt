@@ -53,6 +53,10 @@ set(DAYTONA_SOURCES
     # Native renderer (spike): plume bring-up + the game's 9 precompiled shaders.
     # dt_shader_blobs.cpp is GENERATED -- see _tools/daytona_d3d9_sigscan/gen_shader_blobs.py.
     src/dt_shader_blobs.cpp
+    # dt_blit_blobs.cpp is GENERATED from shaders/blit.hlsl by scripts/gen_blit_blobs.py,
+    # and committed, so an ordinary build needs no shader compiler. It is the only
+    # shader in this port that is not the guest's: the present blit.
+    src/dt_blit_blobs.cpp
     src/dt_plume.cpp
     src/dt_shader_patchtest.cpp
 )
