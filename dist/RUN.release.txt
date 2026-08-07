@@ -40,6 +40,32 @@ Windows 10/11 x64, a Direct3D 12 capable GPU, and the Microsoft Visual C++
 Redistributable (x64):  https://aka.ms/vs/17/release/vc_redist.x64.exe
 
 
+THIS IS A BETA
+--------------
+
+Known, and you do not need to report them:
+
+* Save Data and Records have had the least testing of any screens. If either
+  looks wrong, that is worth telling me about in detail.
+* Leaderboards correctly says you must connect to Xbox LIVE. There is no Xbox
+  LIVE; the game handles being offline on its own and this is what it does.
+* Achievements opens and closes immediately. There is no achievements blade in
+  this port, so it reports one that opened and closed rather than waiting for a
+  blade that will never appear.
+* The game runs at a fixed 60Hz internally. The `refresh_rate` setting in
+  daytona.ini is ignored on purpose -- honouring it would change GAME SPEED
+  rather than smoothness.
+
+Worth reporting, with as much detail as you can:
+
+* Anything that freezes, or stops updating while the window stays open.
+* Anything that looks wrong on screen: missing geometry, wrong colours, flicker,
+  HUD over the wrong thing, text that should not be there.
+* Sound that cuts out, distorts, or plays the wrong thing.
+* Please say what you were doing, which course, and attach the newest file from
+  the logs\ folder -- it records far more than the screen shows.
+
+
 SETTINGS AND LOGS
 -----------------
 
