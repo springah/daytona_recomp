@@ -158,6 +158,9 @@ void WriteDefaultIni(const std::filesystem::path& path) {
         << "fullscreen = false\n"
         << "monitor = 0\n"
         << "vsync = true\n"
+        << "# The game runs at a fixed 60Hz and paces its own logic off that, so\n"
+        << "# this is ignored: changing it would change GAME SPEED, not smoothness.\n"
+        << "# Kept so existing settings files stay valid.\n"
         << "refresh_rate = 60\n"
         << "letterbox = true\n"
         << "safe_area_x = 100\n"
@@ -249,6 +252,9 @@ struct DaytonaIniSettings {
     bool debug_overlay = false;
 };
 
+// Set while parsing the ini, reported once logging exists. 0 = nothing to say.
+double g_ini_refresh_rate_ignored = 0.0;
+
 DaytonaIniSettings LoadDaytonaIni(const std::filesystem::path& exe_dir,
                                   rex::PathConfig& paths) {
     const std::filesystem::path ini_path = exe_dir / "daytona.ini";
@@ -279,9 +285,24 @@ DaytonaIniSettings LoadDaytonaIni(const std::filesystem::path& exe_dir,
     if (auto it = values.find("display.vsync"); it != values.end()) {
         if (auto value = ParseBool(it->second)) SetCvarBool("vsync", *value);
     }
+    // display.refresh_rate is deliberately NOT wired to video_mode_refresh_rate
+    // any more. That cvar is the GUEST's video mode -- a console property -- and
+    // the guest paces itself off the vblank derived from it, 1:1. Measured: at
+    // 30 the whole game ran at half speed. A player on a 144Hz panel setting
+    // refresh_rate = 144, which is exactly what a key of that name in [Display]
+    // invites, got a game running 2.4x too fast.
+    //
+    // The guest tick is fixed at 60Hz in the plume plugin now. An ini key that
+    // silently changes game speed is worse than one that does nothing, so this
+    // one is accepted and ignored rather than removed -- existing ini files stay
+    // valid, and it says so instead of failing.
     if (auto it = values.find("display.refresh_rate"); it != values.end()) {
         if (auto value = ParseDouble(it->second)) {
-            SetCvarDouble("video_mode_refresh_rate", std::clamp(*value, 24.0, 240.0));
+            // Reported from OnPreSetup, not here: the ini is parsed before
+            // logging exists, so a warning at this point goes nowhere. Silently
+            // ignoring a setting the user changed on purpose is the same defect
+            // as silently substituting a silent audio backend.
+            if (*value != 60.0) g_ini_refresh_rate_ignored = *value;
         }
     }
     if (auto it = values.find("display.letterbox"); it != values.end()) {
@@ -423,6 +444,14 @@ protected:
 
     void OnPreSetup(rex::RuntimeConfig& config) override {
         daytona_debug::SetStage(daytona_debug::AppStage::kPreSetup);
+
+        // The first point at which the log exists. See LoadDaytonaIni.
+        if (g_ini_refresh_rate_ignored != 0.0) {
+            REXLOG_WARN("daytona.ini: refresh_rate = {} is IGNORED. The guest runs at a fixed 60Hz "
+                        "and paces its own logic off that tick, so honouring this would change "
+                        "GAME SPEED rather than smoothness -- at 30 the whole game runs at half "
+                        "speed. Your window is unaffected.", g_ini_refresh_rate_ignored);
+        }
         // By-name set: this cvar's storage moved into the rexgpu-xenos plugin
         // DLL with the SDK's v0.9 GPU split, so the link-time REXCVAR_SET
         // macro can no longer reach it. The v0.9 deferred-registration cvar

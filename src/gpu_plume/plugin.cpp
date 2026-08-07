@@ -869,9 +869,29 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // way rexglue does: catch up in whole intervals rather than sleeping to the
   // next one, so a late wake-up does not silently drop frames.
   void VsyncLoop() {
-    rex::system::X_VIDEO_MODE mode;
-    rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
-    const double refresh_hz = std::max(1.0, double(float(mode.refresh_rate)));
+    // The guest's vblank is a CONSOLE property, fixed at the title's authentic
+    // 60Hz. It is deliberately NOT the host display's refresh rate.
+    //
+    // It used to read VdQueryVideoMode's refresh_rate, which daytona.ini feeds
+    // from a `refresh_rate` key sitting in [Display] next to `resolution` and
+    // `fullscreen`, where it reads like "match my monitor". It is not that. The
+    // guest paces itself off this tick 1:1 -- measured, by halving it: at 30Hz
+    // the entire game ran at 30fps, attract included, i.e. at HALF SPEED. So a
+    // player on a 144Hz panel who set refresh_rate = 144 would have got a game
+    // running 2.4x too fast, and it would have looked like a broken port rather
+    // than a wrong setting.
+    //
+    // DT_PLUME_VBLANKHZ overrides it for experiments -- that is how the 1:1
+    // pacing was established -- but it is off the user-facing path now.
+    double refresh_hz = 60.0;
+    if (const char* p = std::getenv("DT_PLUME_VBLANKHZ")) {
+      const double hz = std::atof(p);
+      if (hz >= 1.0 && hz <= 1000.0) {
+        refresh_hz = hz;
+        REXLOG_WARN("rexgpu-plume: DT_PLUME_VBLANKHZ={} -- the guest paces off this 1:1, so the "
+                    "GAME SPEED changes with it. Diagnostic only.", refresh_hz);
+      }
+    }
     const uint64_t tick_frequency = rex::chrono::Clock::guest_tick_frequency();
     const uint64_t interval =
         std::max(uint64_t(1), uint64_t(double(tick_frequency) / refresh_hz));
