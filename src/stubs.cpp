@@ -12,7 +12,11 @@
 #include <rex/hook.h>
 #include <rex/chrono/clock.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
+#include <rex/thread.h>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -28,7 +32,6 @@
 // ── XUI / Overlay stubs (no Xbox Live — all no-ops) ──────────────────────────
 // Wrappers: UiShowFriends, UiShowAchievements, UiShowMarketplace, UiShowGamerCard
 DT_STUB(__imp__XamShowGamerCardUI)
-DT_STUB(__imp__XamShowAchievementsUI)
 DT_STUB(__imp__XamShowMarketplaceUI)
 DT_STUB(__imp__XamShowFriendsUI)
 DT_STUB(__imp__XamShowMessageComposeUI)
@@ -38,6 +41,39 @@ DT_STUB(__imp__XamShowMessageComposeUI)
 DT_STUB(__imp__NetDll_XNetUnregisterInAddr)
 DT_STUB(__imp__NetDll_XNetConnect)
 DT_STUB(__imp__NetDll_XNetGetConnectStatus)
+
+// XamShowAchievementsUI -- the achievements blade. NOT a no-op, and that is the
+// whole point of it.
+//
+// Returning SUCCESS and doing nothing is what FROZE the main menu. The title
+// takes success to mean the blade opened, and then waits for the system to tell
+// it the blade closed -- XN_SYS_UI (0x9) going false, read through its
+// game-logic XNotifyGetNext poll. Nothing ever sent that, so Achievements
+// stopped responding and never came back. A stub that reports success without
+// doing the job is worse than one that fails: failure the title can handle.
+//
+// The SDK has no XamShowAchievementsUI (it implements MessageBox, Keyboard and
+// DeviceSelector only), but it has the shape, in xeXamDispatchDialog: broadcast
+// XN_SYS_UI = true, run the dialog, then delay and broadcast false. With no
+// dialog to show, this is that sequence with the middle taken out -- the blade
+// opens and closes immediately.
+//
+// The delay is the SDK's, and its reason is worth keeping: a title may not
+// create its notification listener until after the call returns, and a `false`
+// broadcast too early is one nobody is listening for -- which is the freeze
+// again, by a different route.
+extern "C" REX_FUNC(__imp__XamShowAchievementsUI) {
+    (void)base;
+    static std::atomic<uint32_t> calls{0};
+    if (calls.fetch_add(1, std::memory_order_relaxed) == 0) {
+        REXLOG_WARN("XamShowAchievementsUI: this port has no achievements blade -- reporting it "
+                    "opened and closed immediately, so the menu does not wait for one");
+    }
+    REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
+    rex::thread::Sleep(std::chrono::milliseconds(100));
+    REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
+    ctx.r3.u64 = 0;
+}
 
 // ── Leaderboard / Achievement stubs (no Xbox Live) ───────────────────────────
 DT_STUB(__imp__XUserWriteAchievements)
