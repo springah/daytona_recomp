@@ -3169,6 +3169,21 @@ double g_ms_endframe = 0.0;
 double g_ms_scatter = 0.0;
 double g_ms_record = 0.0;
 uint32_t g_scatter_count = 0;
+// ── Sub-buckets inside `endframe` ───────────────────────────────────────────
+//
+// endframe is the biggest bucket in a race (~900ms of a 2500ms window) and it
+// was being read as if it were work to optimise. Most of it is not work at all:
+// EndFrame submits the frame and then BLOCKS on waitForCommandFence until the
+// GPU has finished it, every frame, deliberately -- that is what makes freeing
+// the frame's buffers safe without a per-frame ring. A number that is mostly a
+// wait invites exactly the wrong fix, so it is split.
+//
+// Unlike the `record` buckets these are NOT behind DT_PLUME_PROF. Those are two
+// clock reads per DRAW at ~885 draws a frame; these are two per FRAME, i.e. ~240
+// reads a second. That is affordable to leave on, and a diagnostic nobody has to
+// know to enable is one that is actually there when the question comes up.
+double g_ms_e_fence = 0.0;     // ... blocked on the GPU finishing the frame
+double g_ms_e_present = 0.0;   // ... in swapchain present
 // Presents and guest Swaps over the same 300-EndFrame window. These two numbers
 // are the standing check on the fix below: one present per Swap is the whole
 // point, and 2 presents per Swap is the flicker coming back.
@@ -3685,11 +3700,14 @@ void EndFrame(bool present) {
         const double wall = g_last_endframe.time_since_epoch().count() != 0
             ? std::chrono::duration<double, std::milli>(now - g_last_endframe).count() : 0.0;
         REXLOG_WARN("plume: timing over 300 frames -- wall {:.0f}ms ({:.1f}fps), endframe "
-                    "{:.0f}ms, scatter {:.0f}ms ({} scatters), record {:.0f}ms, guest+rest "
+                    "{:.0f}ms (of which GPU-wait {:.0f}ms = {:.0f}%, present {:.0f}ms, our work "
+                    "{:.0f}ms), scatter {:.0f}ms ({} scatters), record {:.0f}ms, guest+rest "
                     "{:.0f}ms; {} binds served from the mirror ({} a generation late); "
                     "{} presents ({} of them from an already-closed frame) for {} guest Swaps",
-                    wall, wall > 0 ? 300000.0 / wall : 0.0, g_ms_endframe, g_ms_scatter,
-                    g_scatter_count, g_ms_record,
+                    wall, wall > 0 ? 300000.0 / wall : 0.0, g_ms_endframe,
+                    g_ms_e_fence, g_ms_endframe > 0 ? 100.0 * g_ms_e_fence / g_ms_endframe : 0.0,
+                    g_ms_e_present, g_ms_endframe - g_ms_e_fence - g_ms_e_present,
+                    g_ms_scatter, g_scatter_count, g_ms_record,
                     wall - g_ms_endframe - g_ms_scatter - g_ms_record,
                     g_mirror_hits, g_mirror_stale, g_presents, g_presents_closed, g_swaps);
         if (g_prof) {
@@ -3704,6 +3722,7 @@ void EndFrame(bool present) {
         }
         g_last_endframe = now;
         g_ms_endframe = g_ms_scatter = g_ms_record = 0.0;
+        g_ms_e_fence = g_ms_e_present = 0.0;
         g_ms_p_vtx = g_ms_p_vbuf = g_ms_p_tex = g_ms_p_probe = g_ms_p_cb = g_ms_p_cmd = 0.0;
         g_probe_calls = 0;
         g_scatter_count = 0;
@@ -3771,9 +3790,13 @@ void EndFrame(bool present) {
     g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
     // Waiting on every frame gives up all overlap, but it is what makes freeing
     // the frame's buffers below safe without a per-frame ring. Correct first.
-    g_queue->waitForCommandFence(g_fence.get());
+    {
+        ScopedMs fence_timer(g_ms_e_fence);
+        g_queue->waitForCommandFence(g_fence.get());
+    }
 
     if (backbuffer != nullptr) {
+        ScopedMs present_timer(g_ms_e_present);
         g_swapchain->present(swap_index, nullptr, 0);
         ++g_presents;
     }
