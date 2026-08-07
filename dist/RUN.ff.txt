@@ -1,0 +1,69 @@
+Daytona USA -- PC (native renderer) -- BETA 1
+============================================
+
+A recompiled PC build of the Xbox 360 version of Daytona USA. Everything it
+needs is in this folder.
+
+
+TO PLAY
+-------
+
+Double-click daytona.exe.
+
+That is the whole setup. No installer, no launcher, nothing to configure first.
+
+Controller recommended -- an Xbox pad works as-is. On the keyboard: WASD steers,
+Return is Start, Space is A, Shift is B, arrows are the D-pad.
+
+
+IF IT DOES NOT START
+--------------------
+
+Almost always the Microsoft Visual C++ Redistributable (x64):
+
+    https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+Otherwise you need Windows 10/11 64-bit and a graphics card that supports
+Direct3D 12 -- anything from roughly 2016 onward.
+
+
+THIS IS A BETA
+--------------
+
+Known, and you do not need to report these:
+
+* Save Data and Records have had the least testing of any screens. If either
+  looks wrong, that IS worth telling me about, in detail.
+* Leaderboards says you must connect to Xbox LIVE. There is no Xbox LIVE here;
+  the real game handles being offline on its own and this is what it does.
+* Achievements opens and closes immediately. This port has no achievements
+  screen, so it says so rather than hanging waiting for one.
+* The `refresh_rate` line in daytona.ini is ignored on purpose. The game runs at
+  a fixed 60Hz internally and paces itself off that, so changing it would change
+  GAME SPEED rather than smoothness.
+
+Please DO report:
+
+* Anything that freezes, or stops updating while the window stays open.
+* Anything that looks wrong: missing scenery, wrong colours, flickering, the HUD
+  over the wrong thing, text that should not be there.
+* Sound that cuts out, distorts, or plays the wrong thing.
+* Anything that feels wrong to drive, even if you cannot say why.
+
+When you do, please say what you were doing and which course, and attach the
+newest file from the logs\ folder next to daytona.exe. That log records far more
+than the screen shows and is usually what makes a bug findable.
+
+
+SETTINGS
+--------
+
+Edit daytona.ini next to the exe, then restart -- settings are read at startup.
+
+  resolution      the window size. The game renders at 1280x720 and is scaled
+                  to fit whatever you set, keeping its aspect ratio.
+  fullscreen      or just press F11 while playing.
+  vsync, monitor, letterbox, safe_area
+  log_level       under [Diagnostics]; leave at warn unless asked.
+
+Please do not redistribute this build.
