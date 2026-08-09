@@ -9,13 +9,20 @@ A static recompilation of **Daytona USA** (Xbox 360 / XBLA, 2011) for native PC
 execution, built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)
 (a Xenia-derived runtime + PPC→C++ recompiler).
 
+This branch (`native-renderer`) is the shipping product: the game's D3D9 calls
+are intercepted app-side and drawn through a **native renderer** ([plume](https://github.com/springah/plume)
+RHI -- D3D12 on Windows, Vulkan on Linux/Steam Deck) instead of Xenos GPU
+emulation. The whole game renders this way -- boot, menus, attract, races --
+referee-verified against the emulated renderer screen by screen. The `main`
+branch is the stock ReXGlue port it grew out of.
+
 No copyrighted game files are included. This tree excludes the extracted game
 directory, `default.xex`, media archives, audio, images, and build outputs — you
 supply your own legally obtained Daytona USA XBLA package.
 
-This is one of a family of Xbox 360 recomps that share the same ReXGlue SDK
-fork; daytona builds on the same `main` SDK branch as the
-sibling ports (futari, gh, guwange, sdoj, sotn).
+This is one of a family of Xbox 360 recomps built on the ReXGlue SDK; daytona
+pins a tagged SDK release as a submodule, like its sibling ports (futari, gh,
+guwange, sdoj, sotn).
 
 ## Prerequisites
 
@@ -59,8 +66,8 @@ The package this tree was prepared against: title/media `XA-2845`, media ID
 git clone -c core.symlinks=true --recurse-submodules <repo-url> daytona_recomp
 ```
 
-The [ReXGlue SDK](https://github.com/springah/rexglue-sdk) is a submodule at
-`thirdparty/rexglue-sdk`, **pinned at a tagged release** (currently v0.8.5.1) so
+The [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) is a submodule at
+`thirdparty/rexglue-sdk`, **pinned at a tagged release** (currently v0.9.2) so
 every build links a recorded SDK SHA. To develop against a live SDK checkout
 instead, set `REXSDK_DIR` to it at configure time (step 4) — when unset, the
 build uses the submodule.
@@ -94,8 +101,8 @@ is gitignored.
 ### 4. Configure & build
 
 ```sh
-cmake --preset win-amd64      # or linux-amd64
-cmake --build out/build/win-amd64 --config Release --target daytona
+cmake --preset win-amd64-release      # or linux-amd64-release
+cmake --build out/build/win-amd64-release --target daytona
 ```
 
 The SDK defaults to the pinned `thirdparty/rexglue-sdk` submodule and is built
@@ -153,10 +160,13 @@ thirdparty/plume        plume rendering abstraction submodule
 
 | Feature | Status |
 |---------|--------|
-| Arbitrary resolution support (including ultrawide 21:9 and wider) | Planned |
-| Keyboard control mapping | Planned |
-| Android port | Planned |
-| Native rendering (replace Xbox 360 GPU emulation with a native Vulkan/D3D12 backend) | Planned |
+| Native rendering (D3D12/Vulkan through plume, replacing GPU emulation) | **Done** -- the default on this branch |
+| Arbitrary window size / resolution scaling | **Done** (aspect-fit blit; `resolution` in daytona.ini) |
+| Windows build | **Done** (beta) |
+| Linux / Steam Deck build (native Vulkan, no Proton) | **Done** (beta) |
+| Keyboard control mapping | Basic (WASD + Return/Space/Shift) |
+| macOS port | Planned |
+| Android port | Maybe |
 
 ## Acknowledgements
 
