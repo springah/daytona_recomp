@@ -1,0 +1,26 @@
+Daytona USA -- Steam Deck (native Vulkan) -- BETA 1.1
+=====================================================
+
+First Deck build that actually draws: the title screen renders correctly on
+RADV through the native renderer. Everything past the title is UNTESTED on
+this hardware -- that is what this beta is for.
+
+TO PLAY
+
+  Desktop Mode: run ./run.sh from this folder (Konsole, or double-click and
+  choose Execute). Game Mode: add ./run.sh as a non-Steam game.
+
+  The first launch is the slow one -- up to a minute of black window before
+  the SEGA logo while the files come off disk. Later launches are faster.
+
+KNOWN / EXPECTED
+
+  * Needs SteamOS with glibc 2.38+ (any 2025+ SteamOS is fine). If it will
+    not start, run.sh writes deck-report.txt -- send that.
+  * Boot is slower than the Windows build on the same content. Known, being
+    worked on.
+  * Sound, controller input, and everything past the title screen have had
+    almost no Deck testing. Reports valuable.
+
+Please send back the newest file in logs/ with any report.
+Please do not redistribute this build.
