@@ -4303,12 +4303,10 @@ void EndFrame(bool present) {
     const bool report = (g_capture_resolve && g_guest_writeback) || g_meshdump_want_bmp ||
         g_frame_index <= kReportedFrames || (g_frame_index % kReportInterval) == 0;
 
-    // Still no swapchain? Ask again, twice a second. The first attempt happens
-    // at the first frame, which since the intro-logo fix is t+0.1s -- early
-    // enough that on X11 the window may not be mapped yet, which is exactly how
-    // a Deck ended up composing headless for an entire run. Cheap, bounded by
-    // succeeding, and silent after the first explanation.
-    if (g_swapchain == nullptr && (g_frame_index % 30) == 0) TrySwapchain("retry");
+    // (The swapchain retry used to live here. It is in the guest Swap hook
+    // instead -- see RetrySwapchain. Retrying from EndFrame only works while the
+    // guest keeps swapping, which is precisely not true on the boot this is
+    // meant to rescue.)
 
     // DT_PLUME_SWAPPRESENT=0 restores the old present-at-every-EndFrame, which
     // is the A/B for the flicker.
@@ -4736,6 +4734,17 @@ bool PipelinesDirty() {
     if (!Enabled() || !g_init_ok) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_pipelines_dirty;
+}
+
+// Called once per guest Swap, from the same hook that asks PipelinesDirty().
+// One predicate read in the common case; the work happens only while there is
+// still no swapchain, and stops permanently once there is one.
+void RetrySwapchain() {
+    if (!Enabled() || !g_init_ok) return;
+    if (g_swapchain != nullptr) return;              // the overwhelmingly common case
+    if (g_offscreen != OffscreenState::kReady) return;  // nothing to present yet
+    std::lock_guard<std::mutex> lock(g_mutex);
+    TrySwapchain("swap hook");
 }
 
 void BuildPipelinesLocked(const char* reason) {

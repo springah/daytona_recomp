@@ -118,6 +118,18 @@ void BuildPipelines(const char* reason);
 // the 600-frame periodic tick. Asking from outside the loop breaks it.
 bool PipelinesDirty();
 
+// Create the swapchain if it does not exist yet. Safe and cheap to call every
+// guest Swap; returns immediately once there is one.
+//
+// Needed because the FIRST attempt happens at the first frame, which since the
+// intro-logo fix is t+0.1s. On Windows that is fine -- an HWND has a client rect
+// the moment it exists. On X11 the window is not mapped that early, it measures
+// 0x0, and plume calls the swapchain empty. Retrying from EndFrame was the
+// obvious fix and the wrong one: EndFrame only runs when the guest swaps, so a
+// guest that stops swapping never retries -- which is exactly the state a Deck
+// was found in, with a perfectly good 1280x722 window and a headless renderer.
+void RetrySwapchain();
+
 // Create the static expansion index buffers. QUADLIST and TRIANGLEFAN do not
 // exist in D3D12/Vulkan, and neither depends on the vertex data, so one index
 // buffer per topology serves every draw.
