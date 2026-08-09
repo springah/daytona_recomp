@@ -2285,6 +2285,9 @@ OffscreenState g_offscreen = OffscreenState::kNone;
 // The presentation window and its swapchain. Both are optional: if either
 // fails, the frame still composes and reads back, and only the picture is lost.
 std::unique_ptr<plume::RenderSwapChain> g_swapchain;
+// Acquire/render semaphores for the Vulkan present chain; see TrySwapchain.
+std::unique_ptr<plume::RenderCommandSemaphore> g_acquire_sem;
+std::unique_ptr<plume::RenderCommandSemaphore> g_render_sem;
 
 // ── The present blit ────────────────────────────────────────────────────────
 //
@@ -2442,8 +2445,15 @@ UploadSpan ArenaTake(uint64_t bytes, uint64_t align) {
         const uint64_t size = std::max<uint64_t>(kArenaChunkBytes, bytes + align);
         // VERTEX and CONSTANT because one chunk serves both, and Vulkan turns
         // these flags into usage bits a buffer cannot be bound without.
-        fresh.buffer = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(
-            size, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::CONSTANT));
+        // DEVICE_ADDRESSABLE on SPIRV because the constant buffers are handed
+        // to the shaders as raw device addresses there.
+        plume::RenderBufferFlags arena_flags =
+            plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::CONSTANT;
+        if (g_shader_format == plume::RenderShaderFormat::SPIRV) {
+            arena_flags |= plume::RenderBufferFlag::DEVICE_ADDRESSABLE;
+        }
+        fresh.buffer = g_device->createBuffer(
+            plume::RenderBufferDesc::UploadBuffer(size, arena_flags));
         if (fresh.buffer == nullptr) return out;
         // Mapped once and never unmapped: an UPLOAD heap is host-visible for its
         // whole life on both backends, and unmapping per draw was part of what
@@ -2462,6 +2472,10 @@ UploadSpan ArenaTake(uint64_t bytes, uint64_t align) {
 UploadSpan TakeUpload(uint64_t bytes, uint64_t align, plume::RenderBufferFlags flags) {
     if (g_arena) return ArenaTake(bytes, align);
     UploadSpan out;
+    // Same rule as the arena chunks: SPIRV binds constants by device address.
+    if (g_shader_format == plume::RenderShaderFormat::SPIRV) {
+        flags |= plume::RenderBufferFlag::DEVICE_ADDRESSABLE;
+    }
     auto buf = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(bytes, flags));
     if (buf == nullptr) return out;
     out.cpu = static_cast<uint8_t*>(buf->map());
@@ -3172,7 +3186,22 @@ bool EnsureWindow() {
         }
         return false;
     }
-    g_window.display = display;
+    // Use our OWN connection to the X server, not SDL's. The Display* above
+    // belongs to SDL's video thread, and Xlib connections are not thread-safe
+    // to share without XInitThreads -- which must be the process's FIRST Xlib
+    // call and SDL has long since made others. Sharing it meant this thread's
+    // XGetWindowAttributes round-trips interleaved with SDL's event pump:
+    // measured on a Deck as a mapped, visible 1280x722 window that plume
+    // permanently measured as 0x0. The WINDOW id is the same either way; only
+    // the connection it is queried through is ours.
+    Display* own = XOpenDisplay(nullptr);
+    if (own != nullptr) {
+        g_window.display = own;
+    } else {
+        REXLOG_WARN("plume: XOpenDisplay failed -- falling back to SDL's shared connection "
+                    "(size queries may race SDL's event pump)");
+        g_window.display = display;
+    }
     g_window.window = xwindow;
     g_window_borrowed = true;
     REXLOG_WARN("plume: presenting into the application's X11 window ({:#x}), not a second one",
@@ -3310,6 +3339,14 @@ bool TrySwapchain(const char* reason) {
     // waitable-object flag and SetMaximumFrameLatency(0) is invalid.
     plume::RenderSwapChainDesc sc(g_window, kRenderTargetFormat, 2, false, 2);
     auto chain = g_queue->createSwapChain(sc);
+    // A Vulkan swapchain is BORN empty: plume's ctor only creates the surface,
+    // and the VkSwapchainKHR (and the width/height isEmpty() checks) appear on
+    // the first resize(). D3D12's is born fully sized, which is why this was
+    // invisible on Windows -- and why a Deck retried "0x0" forever against a
+    // perfectly good 1280x722 window.
+    if (chain != nullptr && chain->isEmpty()) {
+        chain->resize();
+    }
     if (chain == nullptr || chain->isEmpty()) {
         // Say WHICH, because they are different faults with the same symptom:
         // a null chain is a surface that could not be created, an empty one is
@@ -3326,6 +3363,13 @@ bool TrySwapchain(const char* reason) {
     }
 
     g_swapchain = std::move(chain);
+    // Vulkan's acquire is only valid with a semaphore to signal, and the
+    // present must wait on the submit that wrote the backbuffer. D3D12 gets by
+    // with neither -- passing nullptr worked there and left the Deck's guest
+    // thread blocked INSIDE vkAcquireNextImageKHR forever. One pair suffices:
+    // every acquire/submit/present triple runs serially on one queue.
+    if (g_acquire_sem == nullptr) g_acquire_sem = g_device->createCommandSemaphore();
+    if (g_render_sem == nullptr) g_render_sem = g_device->createCommandSemaphore();
     // Any size is acceptable now. It used to have to be exactly the frame size,
     // because presenting was a 1:1 copy -- which is why the renderer made its
     // own window at exactly 1280x720, why the ini's `resolution` never did
@@ -3398,7 +3442,13 @@ bool RecordPresentBlit(plume::RenderCommandList* cmd, plume::RenderTexture* back
     cmd->setGraphicsPipelineLayout(g_blit_layout.get());
     cmd->setGraphicsDescriptorSet(g_blit_tex_set.get(), 0);
     cmd->setGraphicsDescriptorSet(g_blit_smp_set.get(), 1);
-    const plume::RenderViewport vp(x, y, w, h);
+    // Vulkan's NDC Y points the other way from D3D12's, so the same frame
+    // comes out vertically mirrored (measured on a Deck: (c)SEGA at the top).
+    // A negative-height viewport (core since Vulkan 1.1) flips it back at the
+    // present, which corrects everything downstream in one place -- the frame
+    // itself renders identically on both backends.
+    const bool flip = (g_shader_format == plume::RenderShaderFormat::SPIRV);
+    const plume::RenderViewport vp(x, flip ? y + h : y, w, flip ? -h : h);
     const plume::RenderRect sc(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h));
     cmd->setViewports(&vp, 1);
     cmd->setScissors(&sc, 1);
@@ -4153,11 +4203,23 @@ void DrawIntoFrame(Combo& c, const Created& s, uint32_t start_vertex, uint32_t v
     g_cmd->setPipeline(c.pipeline.get());
     Step("setGraphicsPipelineLayout");
     g_cmd->setGraphicsPipelineLayout(g_pipeline_layout.get());
-    // Root descriptor order matches how the layout was built: b0, b1, b2.
-    Step("setGraphicsRootDescriptor x3");
-    g_cmd->setGraphicsRootDescriptor(g_cb_vs.buffer->at(g_cb_vs.offset), 0);
-    g_cmd->setGraphicsRootDescriptor(g_cb_ps.buffer->at(g_cb_ps.offset), 1);
-    g_cmd->setGraphicsRootDescriptor(shared_cb.buffer->at(shared_cb.offset), 2);
+    // Constant-buffer binding order matches how the layout was built: b0, b1,
+    // b2. On SPIRV they go by device address through the push-constant block
+    // (see the layout build for why); on DXIL they are root descriptors.
+    if (g_shader_format == plume::RenderShaderFormat::SPIRV) {
+        Step("setGraphicsPushConstants (3 CBV addresses)");
+        const uint64_t addrs[3] = {
+            g_cb_vs.buffer->getDeviceAddress() + g_cb_vs.offset,
+            g_cb_ps.buffer->getDeviceAddress() + g_cb_ps.offset,
+            shared_cb.buffer->getDeviceAddress() + shared_cb.offset,
+        };
+        g_cmd->setGraphicsPushConstants(0, addrs, 0, sizeof(addrs));
+    } else {
+        Step("setGraphicsRootDescriptor x3");
+        g_cmd->setGraphicsRootDescriptor(g_cb_vs.buffer->at(g_cb_vs.offset), 0);
+        g_cmd->setGraphicsRootDescriptor(g_cb_ps.buffer->at(g_cb_ps.offset), 1);
+        g_cmd->setGraphicsRootDescriptor(shared_cb.buffer->at(shared_cb.offset), 2);
+    }
     Step("setGraphicsDescriptorSet x2");
     g_cmd->setGraphicsDescriptorSet(g_texture_set.get(), 0);   // space0 Texture2D
     g_cmd->setGraphicsDescriptorSet(g_sampler_set.get(), 3);   // space3 SamplerState
@@ -4326,7 +4388,7 @@ void EndFrame(bool present) {
     plume::RenderTexture* backbuffer = nullptr;
 
     if (do_present && EnsureSwapchainSized() &&
-        g_swapchain->acquireTexture(nullptr, &swap_index)) {
+        g_swapchain->acquireTexture(g_acquire_sem.get(), &swap_index)) {
         backbuffer = g_swapchain->getTexture(swap_index);
     }
 
@@ -4371,7 +4433,15 @@ void EndFrame(bool present) {
     g_cmd->end();
 
     const plume::RenderCommandList* lists[] = {g_cmd.get()};
-    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
+    if (backbuffer != nullptr) {
+        // The submit that writes the backbuffer must wait for its acquisition
+        // and announce its completion for the present to wait on.
+        plume::RenderCommandSemaphore* waits[] = {g_acquire_sem.get()};
+        plume::RenderCommandSemaphore* signals[] = {g_render_sem.get()};
+        g_queue->executeCommandLists(lists, 1, waits, 1, signals, 1, g_fence.get());
+    } else {
+        g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_fence.get());
+    }
     g_fence_pending = true;
 
     // A `report` frame has to have THIS frame's pixels on the CPU below, so it
@@ -4411,7 +4481,8 @@ void EndFrame(bool present) {
 
     if (backbuffer != nullptr) {
         ScopedMs present_timer(g_ms_e_present);
-        g_swapchain->present(swap_index, nullptr, 0);
+        plume::RenderCommandSemaphore* waits[] = {g_render_sem.get()};
+        g_swapchain->present(swap_index, waits, 1);
         ++g_presents;
     }
 #ifdef _WIN32
@@ -4658,7 +4729,7 @@ void PresentTarget() {
     // comes through here, this is the one that mattered.
     if (!EnsureSwapchainSized()) return;
     uint32_t swap_index = 0;
-    if (!g_swapchain->acquireTexture(nullptr, &swap_index)) return;
+    if (!g_swapchain->acquireTexture(g_acquire_sem.get(), &swap_index)) return;
     plume::RenderTexture* backbuffer = g_swapchain->getTexture(swap_index);
     if (backbuffer == nullptr) return;
 
@@ -4673,9 +4744,16 @@ void PresentTarget() {
     g_upload_cmd->end();
 
     const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
-    g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_upload_fence.get());
+    {
+        plume::RenderCommandSemaphore* waits[] = {g_acquire_sem.get()};
+        plume::RenderCommandSemaphore* signals[] = {g_render_sem.get()};
+        g_queue->executeCommandLists(lists, 1, waits, 1, signals, 1, g_upload_fence.get());
+    }
     g_queue->waitForCommandFence(g_upload_fence.get());
-    g_swapchain->present(swap_index, nullptr, 0);
+    {
+        plume::RenderCommandSemaphore* waits[] = {g_render_sem.get()};
+        g_swapchain->present(swap_index, waits, 1);
+    }
     ++g_presents;
     ++g_presents_closed;
 #ifdef _WIN32
@@ -4753,9 +4831,40 @@ bool PipelinesDirty() {
 void RetrySwapchain() {
     if (!Enabled() || !g_init_ok) return;
     if (g_swapchain != nullptr) return;              // the overwhelmingly common case
-    if (g_offscreen != OffscreenState::kReady) return;  // nothing to present yet
+    // Deck diagnosis: every 300 no-swapchain Swaps, say WHERE the retry is
+    // stuck -- gate, window, or a create that keeps failing. "Silent after the
+    // first explanation" hid five minutes of failing retries on real hardware.
+    static uint32_t attempts = 0;
+    const bool speak = (++attempts % 300) == 0;
+    if (g_offscreen != OffscreenState::kReady) {
+        if (speak) {
+            REXLOG_WARN("plume: swapchain retry #{} still waiting -- offscreen state {} not "
+                        "ready", attempts, int(g_offscreen));
+        }
+        return;
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
+    // Un-latch the one-shot fault line so the periodic attempt reprints WHICH
+    // fault it is (null chain vs 0x0 window) with current information.
+    if (speak) g_swapchain_warned = false;
     TrySwapchain("swap hook");
+    if (speak && g_swapchain == nullptr) {
+#ifdef __linux__
+        // Measure the window OURSELVES through the same handle plume uses, so
+        // the log shows exactly what the create saw rather than a summary.
+        XWindowAttributes wa = {};
+        const int wok = g_window.window != 0
+            ? XGetWindowAttributes(g_window.display, g_window.window, &wa) : -1;
+        REXLOG_WARN("plume: swapchain retry #{} -- window 0x{:x} via display {} measures "
+                    "{}x{} (query {}), create still failing",
+                    attempts, uint64_t(g_window.window),
+                    static_cast<const void*>(g_window.display), wa.width, wa.height,
+                    wok == 0 ? "FAILED" : "ok");
+#else
+        REXLOG_WARN("plume: swapchain retry #{} -- window {}, create still failing",
+                    attempts, EnsureWindow() ? "FOUND" : "NOT FOUND");
+#endif
+    }
 }
 
 void BuildPipelinesLocked(const char* reason) {
@@ -4800,9 +4909,22 @@ void BuildPipelinesLocked(const char* reason) {
         samplers.end(true, kSamplerDescriptorSize);
         builder.addDescriptorSet(samplers);   // space3 SamplerState
 
-        builder.addRootDescriptor(0, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
-        builder.addRootDescriptor(1, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
-        builder.addRootDescriptor(2, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
+        if (g_shader_format == plume::RenderShaderFormat::SPIRV) {
+            // XenosRecomp's VULKAN binding model is not root descriptors -- the
+            // three constant buffers arrive as 64-bit buffer device addresses
+            // in one 24-byte push-constant block (b0/b1/b2, space4), which is
+            // how UnleashedRecomp binds them on this same RHI. plume's Vulkan
+            // setGraphicsRootDescriptor is assert(false) -- compiled OUT in
+            // Release, so on a Deck it silently bound NOTHING and the first
+            // shader constant fetch read GPU address 0: GPUVM fault, SQC
+            // (data), device lost, every later submit failing 0xFFFFFFFC.
+            builder.addPushConstant(0, 4, 24, plume::RenderShaderStageFlag::VERTEX |
+                                              plume::RenderShaderStageFlag::PIXEL);
+        } else {
+            builder.addRootDescriptor(0, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
+            builder.addRootDescriptor(1, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
+            builder.addRootDescriptor(2, 4, plume::RenderRootDescriptorType::CONSTANT_BUFFER);
+        }
         builder.end();
 
         g_pipeline_layout = builder.create(g_device.get());
@@ -4811,7 +4933,10 @@ void BuildPipelinesLocked(const char* reason) {
             return;
         }
         REXLOG_WARN("plume: pipeline layout built -- 4 descriptor sets (t/space0-2, s/space3) "
-                    "+ 3 root CBVs (b0/b1/b2 space4), matching XenosRecomp's binding model");
+                    "+ b0/b1/b2 space4 as {}, matching XenosRecomp's binding model",
+                    g_shader_format == plume::RenderShaderFormat::SPIRV
+                        ? "a 24-byte push-constant block of buffer addresses"
+                        : "3 root CBVs");
     }
 
     uint32_t built = 0, waiting = 0, failed = 0;
