@@ -12,6 +12,10 @@ Double-click daytona.exe.
 
 That is the whole setup. No installer, no launcher, nothing to configure first.
 
+The FIRST launch after a reboot is the slow one -- expect up to a minute before
+the title screen while Windows reads the game's files for the first time. After
+that it is roughly twenty seconds. Not frozen, just loading.
+
 Controller recommended -- an Xbox pad works as-is. On the keyboard: WASD steers,
 Return is Start, Space is A, Shift is B, arrows are the D-pad.
 

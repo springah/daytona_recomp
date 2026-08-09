@@ -32,6 +32,10 @@ TO PLAY
 Once assets\default.xex exists, double-click daytona.exe. It loads the .\assets
 folder next to it, so there is no launcher and no configuration to do first.
 
+The FIRST launch after a reboot is the slow one -- expect up to a minute before
+the title screen while Windows reads the game's files for the first time. After
+that it is roughly twenty seconds. Not frozen, just loading.
+
 
 REQUIREMENTS
 ------------
