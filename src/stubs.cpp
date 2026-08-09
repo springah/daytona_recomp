@@ -310,18 +310,26 @@ REX_HOOK_RAW(sub_822346A0) {
         const uint32_t cb = block != 0 ? REX_LOAD_U32(block + 16) : 0;
         const uint32_t cb_ctx = block != 0 ? REX_LOAD_U32(block + 20) : 0;
         const uint32_t pending_before = block != 0 ? REX_LOAD_U32(block + 0) : 0xDEADDEAD;
+        const uint32_t latch_before = REX_LOAD_U32(0xB0090044u);
         __imp__sub_822346A0(ctx, base);
+        const uint32_t latch_after = REX_LOAD_U32(0xB0090044u);
         const uint32_t pending_after = block != 0 ? REX_LOAD_U32(block + 0) : 0xDEADDEAD;
         // Storm-aware: 2.7M deliveries in 40s means per-call logging is the
         // problem, not the probe. Log the first few and every 100000th, and
         // for the XPS notify dump its ctx block -- the re-arm decision reads
         // from there, and diffing it against xenos names the field that never
         // completes under plume.
-        if (calls <= 6 || (calls % 100000) == 0) {
+        // latch_before/latch_after bracket the ISR: the kick RELEASE LATCH
+        // (scratch reg 1's mirror, physical 10090044 = virtual B0090044). The
+        // drain parks on it reading 0 and the parks clear +1-2ms after vblank
+        // ticks -- so SOME guest path zeroes it; a transition across THIS call
+        // names this delivery as the clearer.
+        if (calls <= 6 || latch_before != latch_after || (calls % 100000) == 0) {
             REXLOG_WARN("Daytona ISR source-1 #{}: callback={:08X} ctx={:08X} pending "
-                        "{:08X}->{:08X}{}",
+                        "{:08X}->{:08X}{} latch {:08X}->{:08X}",
                         calls, cb, cb_ctx, pending_before, pending_after,
-                        pending_before == pending_after ? "  << NO-OP CLEAR" : "");
+                        pending_before == pending_after ? "  << NO-OP CLEAR" : "",
+                        latch_before, latch_after);
             if (cb == 0x8223C150u && cb_ctx != 0) {
                 std::string w;
                 for (uint32_t i = 0; i < 24; ++i) {
@@ -329,6 +337,22 @@ REX_HOOK_RAW(sub_822346A0) {
                 }
                 REXLOG_WARN("Daytona xps-ctx @{:08X}: {}", cb_ctx, w);
             }
+        }
+        return;
+    }
+    // Source-0 (vblank) deliveries: bracket the same release latch. The park
+    // phase data says the clear lands 1-2ms after a tick; if the transition
+    // happens across THIS call, the vblank ISR path is the clearer and the
+    // whole kick handshake is serialized on the 60Hz tick.
+    if (TraceBoot() && ctx.r3.u32 == 0) {
+        static uint32_t v_calls = 0, v_logged = 0;
+        ++v_calls;
+        const uint32_t latch_before = REX_LOAD_U32(0xB0090044u);
+        __imp__sub_822346A0(ctx, base);
+        const uint32_t latch_after = REX_LOAD_U32(0xB0090044u);
+        if (latch_before != latch_after && ++v_logged <= 60) {
+            REXLOG_WARN("Daytona ISR source-0 #{}: latch {:08X}->{:08X}  << VBLANK PATH CLEARED",
+                        v_calls, latch_before, latch_after);
         }
         return;
     }
@@ -648,6 +672,29 @@ REX_HOOK_RAW(sub_82233C80) {
     // XDK 20500 d3d9.lib), so it is the frame tick. Drives the trace dump cadence
     // and doubles as the "did we render at all" control.
     dt_d3d9_trace::OnFrame();
+    // Boot-pace instrument: the guest's own tick arithmetic, one line per Swap.
+    // The 40s-vs-14s boot gap is tick-QUANTIZED (probe: doubling the vblank rate
+    // halves it) yet the D3D9 call mix per frame is IDENTICAL under both plugins
+    // -- so the extra time is a blocking wait inside equal-count calls, and the
+    // question is which ticks the guest sees between its own Swaps. r3 is the
+    // D3D device; +16824 = its vblank counter (bumped per accepted source-0
+    // ISR), +16840/+16848 = swaps submitted/retired. First 700 frames only.
+    if (TraceBoot()) {
+        static uint32_t swap_no = 0;
+        if (++swap_no <= 700) {
+            const uint32_t device = ctx.r3.u32;
+            REXLOG_WARN("Daytona boot-pace: swap #{} guest-vblanks={} submitted={} retired={}",
+                        swap_no, REX_LOAD_U32(device + 16824), REX_LOAD_U32(device + 16840),
+                        REX_LOAD_U32(device + 16848));
+        }
+    }
+    // Before the present, not after: if the swapchain becomes available on this
+    // tick, THIS frame should go on the screen rather than the next one.
+    //
+    // It lives here rather than in EndFrame because EndFrame only runs when a
+    // frame is open, and the whole point is to keep retrying on a boot where the
+    // window was not mapped in time. Free once a swapchain exists.
+    dt_plume::RetrySwapchain();
     // Same boundary, for the same reason: every draw since the last Swap has
     // been recorded into one command list, and this is where it is submitted,
     // presented and freed. A no-op unless DT_PLUME is set.
