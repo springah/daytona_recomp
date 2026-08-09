@@ -276,6 +276,12 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
       reader.set_write_offset(write_ptr * sizeof(uint32_t));
       while (reader.read_count() >= sizeof(uint32_t)) {
         if (!ExecutePacket(&reader)) break;
+        // Top-of-ring position of the last FULLY consumed packet, for the
+        // publish-before-park path in WAIT_REG_MEM. Consumed-but-unpublished
+        // progress was invisible to the guest for the whole length of a park
+        // (the pass-end publish below is the only one), and the boot allocator
+        // polls that publish for ring space.
+        ring_consumed_ = uint32_t(reader.read_offset() / sizeof(uint32_t));
       }
       read_ptr_ = write_ptr;
       // The guest can learn the read pointer two ways: the write-back address
@@ -341,6 +347,19 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
                       scratch, value, addr);
         }
         ++scratch_writebacks_;
+        // Boot-pace geometry: scratch reg 1 is the swap-in-flight latch. The
+        // vblank ISR clears it +1-2ms after ticks; when the STREAM sets it
+        // relative to the tick tells how many whole ticks each in-flight
+        // period spans, i.e. why boot pays 2-4 ticks per frame instead of 1.
+        if (scratch == 1 && vblanks_ < 2400 && latch_set_logged_ < 80) {
+          ++latch_set_logged_;
+          const double after_tick = (std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count() -
+              last_tick_ns_.load()) / 1e6;
+          REXLOG_WARN("rexgpu-plume: latch reg1 {} value {:08X} at +{:.2f}ms after tick "
+                      "(vblank {}, {} swaps seen)",
+                      value != 0 ? "SET" : "stream-clear", value, after_tick, vblanks_, swaps_);
+        }
       }
     }
   }
@@ -505,6 +524,26 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
                       is_memory ? "mem" : "reg", poll_addr, wait_info & 0x7, ref, mask);
         }
         ++waits_;
+        // Park accounting. The boot-pace hunt showed the guest's boot frames
+        // eat whole vblank ticks somewhere that is not the swap retire and not
+        // a register spin; a drain parked HERE serializes every kick queued
+        // behind it, which fits. Cheap: two counters and a clock read only on
+        // waits that actually spun.
+        const auto park_t0 = std::chrono::steady_clock::now();
+        // Publish consumed ring progress BEFORE a potential park. The pass-end
+        // publish in DrainLoop is the only other one, so a 15ms park at the
+        // swap guard used to hide every packet this pass had already consumed
+        // -- the guest's ring-space allocator saw no progress and stalled the
+        // NEXT frame's content behind the park. Only what is fully consumed is
+        // published, which is simply the truth arriving earlier.
+        if (ring_consumed_ != ring_published_) {
+          ring_published_ = ring_consumed_;
+          registers_[kReg_CP_RB_RPTR] = ring_published_;
+          if (read_ptr_writeback_ != 0) {
+            rex::memory::store_and_swap<uint32_t>(
+                memory_->TranslatePhysical(read_ptr_writeback_), ring_published_);
+          }
+        }
         uint32_t spins = 0;
         bool matched = false;
         uint32_t value = 0;
@@ -540,16 +579,43 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
                           value);
             }
             // The value being polled is written by a guest CPU thread (the
-            // scratch-mailbox fill), which lands within microseconds -- a 1ms
-            // sleep per poll made every kick handshake a millisecond, and a
-            // frame has many. Spin-yield first; sleep only if it drags.
-            if (spins < 500) {
+            // scratch-mailbox fill / release-latch clear), which lands within
+            // microseconds OF THAT THREAD RUNNING -- but the thread may need a
+            // schedule first. The old shape (500 yields, then sleep) put every
+            // boot kick to sleep, and Sleep here is quantized by the OS timer
+            // (~15.6ms default on Windows): measured 8-15ms parks, 475 of them
+            // in boot's first 10s, drain parked 49% of wall time, boot at a
+            // third of the referee's speed. Yield for long enough to cover a
+            // thread schedule instead, and only then concede to the coarse
+            // sleep as the deep-stall fallback.
+            if (spins < 500 ||
+                std::chrono::steady_clock::now() - park_t0 < std::chrono::milliseconds(4)) {
               std::this_thread::yield();
             } else {
               rex::thread::Sleep(std::chrono::milliseconds(wait >= 0x100 ? wait / 0x100 : 1));
             }
           }
         } while (!matched);
+        if (spins > 0) {
+          const double ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - park_t0).count();
+          park_ms_ += ms;
+          if (ms >= 1.0) {
+            ++park_count_1ms_;
+            if (park_count_1ms_ <= 40) {
+              // Phase of the clear relative to the vblank tick: ~constant small
+              // values mean the clear is vblank-gated guest work; uniform noise
+              // means thread scheduling.
+              const double after_tick = (std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch()).count() -
+                  last_tick_ns_.load()) / 1e6;
+              REXLOG_WARN("rexgpu-plume: WAIT_REG_MEM park #{} took {:.2f}ms, cleared {:+.2f}ms "
+                          "after tick -- {} {:08X} op={} ref={:08X} mask={:08X}",
+                          park_count_1ms_, ms, after_tick, is_memory ? "mem" : "reg", poll_addr,
+                          wait_info & 0x7, ref, mask);
+            }
+          }
+        }
         break;
       }
       // -- The full guest-visible side-effect surface, ported in ONE sweep
@@ -900,6 +966,8 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
     while (workers_running_) {
       const uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
       while (now - last >= interval) {
+        last_tick_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
         DispatchInterrupt();
         last += interval;
       }
@@ -961,8 +1029,52 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
                                            uint32_t(std::size(args)));
     if (source == 0) ++vblanks_;
     if (source == 0 && (vblanks_ % 600) == 0) {
-      REXLOG_WARN("rexgpu-plume: {} vblanks; {} INTERRUPT packets seen; read pointer {:08X}",
-                  vblanks_, cs_interrupts_, read_ptr_);
+      // read AND write pointer, because with only the read pointer a frozen ring
+      // is ambiguous: it looks the same whether the guest stopped submitting or
+      // the drainer stopped consuming, and those are opposite bugs. If write ==
+      // read the guest is waiting on us; if write > read we are behind.
+      // Also whether the guest's command-stream interrupt callback has appeared
+      // yet -- a source-1 dispatch before it does is delivered to nobody.
+      REXLOG_WARN("rexgpu-plume: {} vblanks; {} INTERRUPT packets seen; rptr {:08X} wptr {:08X}{}; "
+                  "cs-callback {}; {} cs pending; WAIT parks {:.0f}ms total, {} over 1ms",
+                  vblanks_, cs_interrupts_, read_ptr_, write_ptr_.load(),
+                  (write_ptr_.load() != read_ptr_ &&
+                   write_ptr_.load() != kWritePointerUnset) ? "  <-- WE ARE BEHIND" : "",
+                  GuestCsCallbackReady() ? "ready" : "NOT REGISTERED",
+                  [this] {
+                      std::lock_guard<std::mutex> lock(pending_cs_mutex_);
+                      return pending_cs_.size();
+                  }(),
+                  park_ms_, park_count_1ms_);
+      // WHICH registers is the guest actually watching? A stalled guest polls
+      // one or two of them relentlessly, and the identity of those is the
+      // shortest description of what it is waiting for. Printed as a census so
+      // the same run on two platforms can be diffed: the register that differs
+      // names the missing side effect.
+      //
+      // reg_reads_ is written by guest threads and read here on the vsync
+      // thread without synchronisation. Deliberate and already the pattern in
+      // this file: these are counters for a human, and a torn read costs a
+      // wrong digit, not a wrong conclusion.
+      {
+        uint32_t top[6] = {}, topn[6] = {};
+        for (uint32_t r = 0; r < kRegisterCount; ++r) {
+          const uint32_t n = reg_reads_[r];
+          if (n == 0) continue;
+          for (uint32_t s = 0; s < 6; ++s) {
+            if (n > topn[s]) {
+              for (uint32_t t = 5; t > s; --t) { topn[t] = topn[t - 1]; top[t] = top[t - 1]; }
+              topn[s] = n; top[s] = r;
+              break;
+            }
+          }
+        }
+        std::string census;
+        for (uint32_t s = 0; s < 6 && topn[s] != 0; ++s) {
+          census += fmt::format("{:04X}x{} ", top[s], topn[s]);
+        }
+        REXLOG_WARN("rexgpu-plume:   most-read registers: {}", census);
+      }
     }
   }
 
@@ -1018,6 +1130,19 @@ class PlumeGraphicsSystem final : public rex::system::IGraphicsSystem {
   }
 
   uint64_t vblanks_ = 0;
+  // WAIT_REG_MEM park accounting (drain thread writes, vblank thread reads for
+  // the report; torn reads cost a digit, same policy as the other counters).
+  double park_ms_ = 0.0;
+  uint32_t park_count_1ms_ = 0;
+  uint32_t latch_set_logged_ = 0;
+  // Publish-before-park bookkeeping (drain thread only, no sync needed).
+  uint32_t ring_consumed_ = 0;
+  uint32_t ring_published_ = 0;
+  // When the last vblank tick fired, for phase-stamping park exits: a clear
+  // that lands just AFTER a tick every time is vblank-gated guest work (the
+  // park is then the swap throttle, protocol-correct); a uniform phase is a
+  // scheduling artifact (fixable). Nanoseconds since steady_clock epoch.
+  std::atomic<int64_t> last_tick_ns_{0};
   std::atomic<bool> workers_running_{false};
   rex::system::object_ref<rex::system::XHostThread> drain_thread_;
   rex::system::object_ref<rex::system::XHostThread> vsync_thread_;
