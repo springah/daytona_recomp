@@ -5,11 +5,16 @@
 # to (re)generate it together with the recompiled sources under generated/.
 
 cmake_minimum_required(VERSION 3.25)
-# 1.1.0 on this branch: the native renderer replaced the Xenos GPU plugin as the
+# 1.1.x on this branch: the native renderer replaced the Xenos GPU plugin as the
 # default, which is a different product from the 1.0.x line that `main` still
 # builds. The two ship side by side from separate worktrees, so the version has
 # to say which one you are holding.
-project(daytona VERSION 1.1.0 LANGUAGES C CXX)
+#
+# 1.1.1 = beta 1.1: boot no longer serializes behind the swap guard (publish-
+# before-park), the swapchain retries from the Swap hook (the Deck headless
+# boot), --gpu_plugin=xenos alone no longer crashes, first-launch note in the
+# READMEs.
+project(daytona VERSION 1.1.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
