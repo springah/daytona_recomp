@@ -118,6 +118,12 @@ void BuildPipelines(const char* reason);
 // the 600-frame periodic tick. Asking from outside the loop breaks it.
 bool PipelinesDirty();
 
+// Turn the native renderer OFF for this run, regardless of DT_PLUME. For
+// configurations that cannot host it -- an explicit --gpu_plugin=xenos runs the
+// Xenos renderer on the same window, and the two together die silently seconds
+// after launch. Must win over the env default, hence a call and not a setenv.
+void ForceDisable();
+
 // Create the swapchain if it does not exist yet. Safe and cheap to call every
 // guest Swap; returns immediately once there is one.
 //

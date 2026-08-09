@@ -484,6 +484,29 @@ protected:
             }
         }
 
+        // An explicit --gpu_plugin=xenos means "render through Xenos emulation".
+        // Since the native renderer became the default, that flag ALONE ran both
+        // renderers against the same window, and the process died silently ~4s
+        // after launch with nothing in the log (measured 2026-08-09; the old
+        // "no-rebuild A/B" recipe predates the default flip). The referee
+        // configuration is xenos + no dt_plume, so choosing xenos now implies
+        // it -- loudly, because silent config states are how this port gets
+        // unfixable bug reports.
+        if (config.gpu_plugin == "xenos") {
+            const char* p = std::getenv("DT_PLUME");
+            if (p != nullptr && std::atoi(p) != 0) {
+                REXLOG_ERROR("--gpu_plugin=xenos with DT_PLUME=1 forced: BOTH renderers will "
+                             "fight over one window. This combination is known to die silently "
+                             "seconds after launch. Unset DT_PLUME unless you are debugging "
+                             "exactly this conflict.");
+            } else {
+                dt_plume::ForceDisable();
+                REXLOG_WARN("--gpu_plugin=xenos: rendering through Xenos emulation; the native "
+                            "renderer is OFF for this run. (This is the referee configuration; "
+                            "no DT_PLUME=0 needed.)");
+            }
+        }
+
         // Audio backend.
         //
         // The guest treats audio-device init failure as FATAL -- it calls

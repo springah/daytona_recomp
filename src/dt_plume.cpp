@@ -928,7 +928,18 @@ FetchedAttribute DecodeVfetch(uint32_t w0, uint32_t w1, uint32_t w2) {
 // is what "run this without the native renderer" now means.
 //
 // DT_PLUME=0 still reverts, in place, for A/B against the old path.
+// Set by main.cpp's OnPreSetup when the run's configuration cannot host the
+// native renderer (an explicit --gpu_plugin=xenos: two renderers on one window
+// died silently ~4s after launch, measured 2026-08-09). Checked on every
+// Enabled() call, so it works regardless of when the env latch below first ran.
+static bool g_force_disabled = false;
+
+void ForceDisable() {
+    g_force_disabled = true;
+}
+
 bool Enabled() {
+    if (g_force_disabled) return false;
     static const bool on = [] {
         const char* p = std::getenv("DT_PLUME");
         return p == nullptr || std::atoi(p) != 0;
