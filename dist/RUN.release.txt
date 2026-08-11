@@ -73,8 +73,12 @@ Worth reporting, with as much detail as you can:
 SETTINGS AND LOGS
 -----------------
 
-Edit daytona.ini next to the exe, then restart - the settings are read at
-startup, not live. It covers window size, fullscreen, monitor, vsync, letterbox
+Press F4 (or Start+Select together on a pad) for the in-game settings
+overlay: rebind controls, change display settings, and Save to config
+writes daytona.ini for you.
+
+Or edit daytona.ini next to the exe by hand, then restart - the file is read
+at startup, not live. It covers window size, fullscreen, monitor, vsync, letterbox
 and safe area under [Display]; filtering and upscaler under [Graphics]; and log
 level under [Diagnostics]. Leave game_resolution at 1280x720 for authentic
 output - it is the guest render resolution, not the window size.
