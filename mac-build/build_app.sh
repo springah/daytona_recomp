@@ -12,7 +12,7 @@ SDK="${SDK:-${REXSDK_DIR:-$PROJ/rexglue-sdk}}"
 ASSETS_SRC="${ASSETS_SRC:-$PROJ/daytona_recomp/extracted}"
 APP="${APP:-$PROJ/Daytona.app}"
 ICON_SRC="${ICON_SRC:-$PROJ/daytona_recomp/src/daytona.ico}"
-VER="${VER:-1.1.2}"
+VER="${VER:-1.1.3}"
 C="$APP/Contents"
 
 # Copy a file from the first place it exists (build dir or SDK out dir).
