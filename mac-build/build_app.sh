@@ -7,8 +7,12 @@ set -euo pipefail
 PROJ="${PROJ:-$HOME/Desktop/projects}"
 # Single-config Ninja preset (mac-arm64-release) -> binaries at the build-dir root.
 BUILD="${BUILD:-$PROJ/daytona_recomp/out/build/mac-arm64-release}"
-# Shared external SDK; its runtime dylibs land in $SDK/out/mac-arm64/Release/.
-SDK="${SDK:-${REXSDK_DIR:-$PROJ/rexglue-sdk}}"
+# The VENDORED SDK -- its runtime dylibs land in $SDK/out/mac-arm64[/Release].
+# The old default was the external ~/Desktop/projects/rexglue-sdk checkout,
+# which after the 08-09 vendoring is a STALE June tree: bundling its
+# librexruntime.dylib against a current exe aborts at launch with a missing
+# cvar-storage symbol (dyld "Symbol not found", 08-11). Never default there.
+SDK="${SDK:-${REXSDK_DIR:-$PROJ/daytona_recomp/thirdparty/rexglue-sdk}}"
 ASSETS_SRC="${ASSETS_SRC:-$PROJ/daytona_recomp/extracted}"
 APP="${APP:-$PROJ/Daytona.app}"
 ICON_SRC="${ICON_SRC:-$PROJ/daytona_recomp/src/daytona.ico}"
