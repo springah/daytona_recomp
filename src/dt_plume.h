@@ -14,6 +14,13 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <memory>
+
+namespace rex::ui {
+class ImGuiDrawer;
+class ImmediateDrawer;
+}  // namespace rex::ui
 
 namespace dt_plume {
 
@@ -105,6 +112,21 @@ void OnVfetchPatch(uint32_t shader_ea, uint32_t ucode_ea, uint32_t decl_ea,
 // the game. A null handle, or never calling this, leaves the old behaviour --
 // the renderer makes its own.
 void SetHostWindow(void* native_handle);
+
+// The SDK overlay in detached mode (settings dialog, debug console, hints).
+// main.cpp hands over the SDK's ImGuiDrawer once the window exists; every
+// present then composites it over the blitted frame.
+void SetImGuiDrawer(rex::ui::ImGuiDrawer* drawer);
+
+// Factory for ReXApp::OnCreateImmediateDrawer -- the plume-backed renderer the
+// SDK's ImGui draws through. Owned by the SDK after return.
+std::unique_ptr<rex::ui::ImmediateDrawer> CreateImmediateDrawer();
+
+// Runs on the RENDER thread immediately before the overlay's ImGuiDrawer::Draw
+// each present. This is where the app mutates the dialog list (open/close the
+// settings dialog): AddDialog/RemoveDialog from the key callback's UI thread
+// would race the Draw that iterates it.
+void SetOverlayPreDraw(std::function<void()> fn);
 
 void BuildPipelines(const char* reason);
 

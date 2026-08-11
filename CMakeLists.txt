@@ -19,7 +19,12 @@ cmake_minimum_required(VERSION 3.25)
 # slots -- cap now 4096 with a guard that degrades instead of wedging), and the
 # first macOS picture (GPU plugins staged under the .so names the loader wants,
 # volk finds the bundled MoltenVK, EnsureWindow grew its Cocoa branch).
-project(daytona VERSION 1.1.2 LANGUAGES C CXX)
+#
+# 1.1.3 = beta 1.3: the settings overlay EXISTS under the native renderer (the
+# SDK never stood it up when a GPU plugin declines presentation -- no drawer,
+# no F4 bind; the app owns the stack now and dt_plume composites it), and
+# Start+Select on a pad opens it too.
+project(daytona VERSION 1.1.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,6 +76,9 @@ set(DAYTONA_SOURCES
     # and committed, so an ordinary build needs no shader compiler. It is the only
     # shader in this port that is not the guest's: the present blit.
     src/dt_blit_blobs.cpp
+    # dt_imgui_blobs.cpp likewise, from shaders/imgui.hlsl by gen_imgui_blobs.py:
+    # the SDK overlay (settings/console) drawn by the native renderer.
+    src/dt_imgui_blobs.cpp
     src/dt_plume.cpp
     src/dt_shader_patchtest.cpp
 )

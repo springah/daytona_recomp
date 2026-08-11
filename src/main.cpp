@@ -17,7 +17,20 @@
 #include <rex/input/input_system.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/imgui_drawer.h>
+#include <rex/ui/keybinds.h>
+#include <rex/ui/overlay/settings_overlay.h>
 #include <imgui.h>
+
+#include <atomic>
+
+// For the Start+Select -> settings chord: the SDK's input driver is SDL, so
+// gamepad button events already flow through SDL's queue; an event watch sees
+// them without touching the driver, and a synthetic F4 key event walks the
+// same path a keyboard press would.
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_keycode.h>
+#include <SDL3/SDL_video.h>
 
 #include <algorithm>
 #include <charconv>
@@ -424,12 +437,26 @@ public:
         return std::unique_ptr<DaytonaApp>(new DaytonaApp(ctx, "daytona", PPCImageConfig));
     }
 
+    ~DaytonaApp() override {
+        // Detach from the renderer BEFORE the overlay members destruct: it
+        // holds raw pointers to them (the drawer, and `this` inside the
+        // pre-draw hook), and its setters serialize against a present in
+        // flight, so after these two calls nothing can touch them again.
+        dt_plume::SetOverlayPreDraw(nullptr);
+        dt_plume::SetImGuiDrawer(nullptr);
+        rex::ui::UnregisterBind("bind_settings");
+    }
+
 protected:
     void OnConfigurePaths(rex::PathConfig& paths) override {
         const std::filesystem::path exe_dir = rex::filesystem::GetExecutableFolder();
         // Leave config_path at the SDK default (<exe_dir>/daytona.ini) so the
         // "Save to config" overlay and any auto-loaded cvars use .ini, matching
         // the sibling recomps (futari/gh/guwange/sdoj/sotn) -- no .toml.
+        // Remembered for the settings dialog, which is app-owned here (see the
+        // overlay block): its "Save to config" writes the same file.
+        overlay_config_path_ = paths.config_path.empty() ? exe_dir / "daytona.ini"
+                                                         : paths.config_path;
         paths.cache_root = exe_dir / "cache";
         ini_settings_ = LoadDaytonaIni(exe_dir, paths);
         // Default the game data root to an "assets" folder next to the
@@ -637,6 +664,87 @@ protected:
         if (rex::ui::Window* w = window()) {
             dt_plume::SetHostWindow(w->GetNativeWindowHandle());
         }
+
+        // The overlay. The SDK stands up its ImGui stack in exactly two modes:
+        // presenter mode (a graphics provider draws it) and fully-headless
+        // detached mode (config.graphics == nullptr). Under plume there is a
+        // THIRD state -- a GPU plugin exists for the vblank/ring bookkeeping
+        // but declines presentation -- and in that state the SDK creates
+        // NEITHER the drawer NOR the F4 bind. That is why F4 "did nothing":
+        // there was no bind registered at all. So the app owns the whole
+        // stack: its own ImGuiDrawer + the renderer's ImmediateDrawer, its own
+        // settings dialog, its own binds; dt_plume composites it every present.
+        if (imgui_drawer() == nullptr) {
+            overlay_immediate_ = dt_plume::CreateImmediateDrawer();
+            overlay_imgui_ = std::make_unique<rex::ui::ImGuiDrawer>(window(), 64);
+            overlay_imgui_->SetImmediateDrawer(overlay_immediate_.get());
+            dt_plume::SetImGuiDrawer(overlay_imgui_.get());
+            // The dialog list is mutated on the RENDER thread (pre-draw hook),
+            // never in the key callback: AddDialog/RemoveDialog from the UI
+            // thread would race the Draw that iterates the list. The bind just
+            // counts requests; parity decides open vs close, so a double-press
+            // between two presents nets out instead of desyncing.
+            dt_plume::SetOverlayPreDraw([this] {
+                const int toggles = overlay_toggle_requests_.exchange(0);
+                if ((toggles & 1) == 0) return;
+                if (overlay_settings_) {
+                    overlay_settings_.reset();
+                } else {
+                    overlay_settings_ = std::make_unique<rex::ui::SettingsDialog>(
+                        overlay_imgui_.get(), overlay_config_path_);
+                }
+            });
+            rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay",
+                                  [this] { overlay_toggle_requests_.fetch_add(1); });
+        }
+
+        // Start+Select opens settings on a pad, because a Deck in Game Mode
+        // has no F4. Gamepad button events are already in SDL's queue (the
+        // SDK's input driver is SDL); the watch synthesizes an F4 key press
+        // down the normal event path, so the SDK's own keybind does the rest.
+        // An event watch, not a hook: watches see events without eating them,
+        // so the guest still gets Start and Select as normal buttons.
+        SDL_AddEventWatch(
+            [](void*, SDL_Event* e) -> bool {
+                static bool start_down = false;
+                static bool back_down = false;
+                static bool fired = false;
+                if (e->type != SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+                    e->type != SDL_EVENT_GAMEPAD_BUTTON_UP) {
+                    return true;
+                }
+                const bool down = (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+                if (e->gbutton.button == SDL_GAMEPAD_BUTTON_START) start_down = down;
+                if (e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK) back_down = down;
+                if (start_down && back_down) {
+                    if (!fired) {
+                        fired = true;   // edge-trigger: once per chord press
+                        SDL_Event key = {};
+                        key.key.scancode = SDL_SCANCODE_F4;
+                        key.key.key = SDLK_F4;
+                        if (SDL_Window* const* w = SDL_GetWindows(nullptr)) {
+                            if (w[0] != nullptr) key.key.windowID = SDL_GetWindowID(w[0]);
+                        }
+                        key.type = SDL_EVENT_KEY_DOWN;
+                        key.key.down = true;
+                        SDL_PushEvent(&key);
+                        key.type = SDL_EVENT_KEY_UP;
+                        key.key.down = false;
+                        SDL_PushEvent(&key);
+                    }
+                } else {
+                    fired = false;
+                }
+                return true;
+            },
+            nullptr);
+    }
+
+    std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
+        // Detached-overlay mode: the plume plugin declines presentation, so the
+        // SDK asks the app for a renderer for its own UI. See dt_plume's
+        // overlay pass.
+        return dt_plume::CreateImmediateDrawer();
     }
 
     void OnPreLaunchModule() override {
@@ -675,6 +783,16 @@ protected:
 
 private:
     DaytonaIniSettings ini_settings_;
+
+    // The app-owned overlay stack (see the block in the setup hook). Member
+    // order IS teardown order in reverse: the dialog goes before the drawer it
+    // registered with, the drawer before the window it listens to (a base
+    // member, so destroyed after all of these).
+    std::unique_ptr<rex::ui::ImmediateDrawer> overlay_immediate_;
+    std::unique_ptr<rex::ui::ImGuiDrawer> overlay_imgui_;
+    std::unique_ptr<rex::ui::SettingsDialog> overlay_settings_;
+    std::atomic<int> overlay_toggle_requests_{0};
+    std::filesystem::path overlay_config_path_;
     std::unique_ptr<DaytonaDebugDialog> debug_dialog_;
 };
 

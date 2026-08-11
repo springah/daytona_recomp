@@ -30,6 +30,15 @@
 // Vulkan path cannot hand it straight to the device.
 #include "smolv.h"
 
+// The SDK overlay (settings / console / hints), drawn HERE in detached mode:
+// the plume plugin declines presentation, so the SDK has no renderer for its
+// own UI and hands the draw lists to this file instead. See rex_app.h's
+// OnCreateImmediateDrawer contract and the overlay pass below the blit.
+#include "dt_imgui_blobs.h"
+#include <rex/ui/imgui_drawer.h>
+#include <rex/ui/immediate_drawer.h>
+#include <rex/ui/presenter.h>
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -2322,6 +2331,28 @@ std::unique_ptr<plume::RenderSampler> g_blit_sampler;
 // One per swapchain image. Rebuilt whenever the swapchain is.
 std::vector<std::unique_ptr<plume::RenderFramebuffer>> g_blit_fbs;
 
+// ── The overlay pass ────────────────────────────────────────────────────────
+// The SDK's ImGui (settings dialog, debug console, hint toast) drawn onto the
+// backbuffer right after the present blit, while the framebuffer is still
+// bound and the backbuffer still in COLOR_WRITE. The SDK builds the draw
+// lists (ImGuiDrawer::Draw); PlumeImmediateDrawer below turns them into
+// plume draws. Nothing here runs until main.cpp hands over the drawer.
+std::unique_ptr<plume::RenderPipelineLayout> g_imgui_layout;
+std::unique_ptr<plume::RenderPipeline> g_imgui_pipeline;
+std::unique_ptr<plume::RenderShader> g_imgui_vs_shader;
+std::unique_ptr<plume::RenderShader> g_imgui_ps_shader;
+std::unique_ptr<plume::RenderSampler> g_imgui_sampler_linear;
+std::unique_ptr<plume::RenderSampler> g_imgui_sampler_nearest;
+std::unique_ptr<plume::RenderDescriptorSet> g_imgui_smp_linear;
+std::unique_ptr<plume::RenderDescriptorSet> g_imgui_smp_nearest;
+rex::ui::ImGuiDrawer* g_imgui_drawer = nullptr;
+// App hook run on the render thread before each Draw; see SetOverlayPreDraw.
+std::function<void()> g_imgui_predraw;
+// Valid only while the overlay pass records (set around ImGuiDrawer::Draw).
+plume::RenderCommandList* g_imgui_cmd = nullptr;
+uint32_t g_imgui_rt_w = 0;
+uint32_t g_imgui_rt_h = 0;
+
 // The window we present into. plume::RenderWindow IS an HWND on Windows and an
 // X11 {Display*, Window} on Linux, so this one declaration serves both and the
 // swapchain call below needs no platform branch.
@@ -3402,6 +3433,295 @@ bool BuildBlit() {
     return true;
 }
 
+// Build the overlay pass's pipeline. Lazily, on the first present with a
+// drawer attached -- the device exists by then by construction.
+bool BuildImGuiPass() {
+    if (g_imgui_pipeline != nullptr) return true;
+    if (g_device == nullptr) return false;
+
+    const bool spirv = (g_shader_format == plume::RenderShaderFormat::SPIRV);
+    const void* vs_blob = spirv ? static_cast<const void*>(dt_imgui_blobs::kImGuiVsSpirv)
+                                : static_cast<const void*>(dt_imgui_blobs::kImGuiVs);
+    const size_t vs_size = spirv ? dt_imgui_blobs::kImGuiVsSpirv_size
+                                 : dt_imgui_blobs::kImGuiVs_size;
+    const void* ps_blob = spirv ? static_cast<const void*>(dt_imgui_blobs::kImGuiPsSpirv)
+                                : static_cast<const void*>(dt_imgui_blobs::kImGuiPs);
+    const size_t ps_size = spirv ? dt_imgui_blobs::kImGuiPsSpirv_size
+                                 : dt_imgui_blobs::kImGuiPs_size;
+    g_imgui_vs_shader = g_device->createShader(vs_blob, vs_size, "main_vs", g_shader_format);
+    g_imgui_ps_shader = g_device->createShader(ps_blob, ps_size, "main_ps", g_shader_format);
+    if (g_imgui_vs_shader == nullptr || g_imgui_ps_shader == nullptr) {
+        REXLOG_WARN("plume: overlay shaders failed to load as {}", spirv ? "SPIR-V" : "DXIL");
+        return false;
+    }
+
+    plume::RenderPipelineLayoutBuilder lb;
+    // begin(isLocal, allowInputLayout): isLocal means a raytracing LOCAL root
+    // signature and rejects the pipeline outright -- push constants need no
+    // flag here, only the addPushConstant below. (The blit's "no push
+    // constants" comment on its begin(false, false) is about what it ADDS,
+    // not what the first flag means.)
+    lb.begin(false, true);
+    plume::RenderDescriptorSetBuilder tex;
+    tex.begin();
+    tex.addTexture(0);
+    tex.end();
+    lb.addDescriptorSet(tex);     // space0: the texture (font atlas, usually)
+    plume::RenderDescriptorSetBuilder smp;
+    smp.begin();
+    smp.addSampler(0);
+    smp.end();
+    lb.addDescriptorSet(smp);     // space1: how to filter it
+    // b0 space2 / the Vulkan push-constant block: scale.xy + translate.xy.
+    lb.addPushConstant(0, 2, 4 * sizeof(float), plume::RenderShaderStageFlag::VERTEX);
+    lb.end();
+    g_imgui_layout = lb.create(g_device.get());
+
+    g_imgui_smp_linear = smp.create(g_device.get());
+    g_imgui_smp_nearest = smp.create(g_device.get());
+    plume::RenderSamplerDesc sd;
+    sd.minFilter = plume::RenderFilter::LINEAR;
+    sd.magFilter = plume::RenderFilter::LINEAR;
+    sd.addressU = plume::RenderTextureAddressMode::CLAMP;
+    sd.addressV = plume::RenderTextureAddressMode::CLAMP;
+    sd.addressW = plume::RenderTextureAddressMode::CLAMP;
+    g_imgui_sampler_linear = g_device->createSampler(sd);
+    sd.minFilter = plume::RenderFilter::NEAREST;
+    sd.magFilter = plume::RenderFilter::NEAREST;
+    g_imgui_sampler_nearest = g_device->createSampler(sd);
+    if (g_imgui_layout == nullptr || g_imgui_smp_linear == nullptr ||
+        g_imgui_smp_nearest == nullptr || g_imgui_sampler_linear == nullptr ||
+        g_imgui_sampler_nearest == nullptr) {
+        REXLOG_WARN("plume: overlay layout/samplers failed");
+        return false;
+    }
+    g_imgui_smp_linear->setSampler(0, g_imgui_sampler_linear.get());
+    g_imgui_smp_nearest->setSampler(0, g_imgui_sampler_nearest.get());
+
+    // rex::ui::ImmediateVertex: x,y,u,v float; color RGBA8. Matches ImDrawVert.
+    static const plume::RenderInputSlot kSlot(0, sizeof(rex::ui::ImmediateVertex));
+    static const plume::RenderInputElement kElements[] = {
+        {"POSITION", 0, 0, plume::RenderFormat::R32G32_FLOAT, 0, 0},
+        {"TEXCOORD", 0, 1, plume::RenderFormat::R32G32_FLOAT, 0, 8},
+        {"COLOR", 0, 2, plume::RenderFormat::R8G8B8A8_UNORM, 0, 16},
+    };
+
+    plume::RenderGraphicsPipelineDesc pd;
+    pd.pipelineLayout = g_imgui_layout.get();
+    pd.vertexShader = g_imgui_vs_shader.get();
+    pd.pixelShader = g_imgui_ps_shader.get();
+    pd.renderTargetFormat[0] = kRenderTargetFormat;
+    pd.renderTargetCount = 1;
+    pd.renderTargetBlend[0] = plume::RenderBlendDesc::AlphaBlend();
+    pd.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    pd.inputSlots = &kSlot;
+    pd.inputSlotsCount = 1;
+    pd.inputElements = kElements;
+    pd.inputElementsCount = 3;
+    g_imgui_pipeline = g_device->createGraphicsPipeline(pd);
+    if (g_imgui_pipeline == nullptr) {
+        REXLOG_WARN("plume: overlay pipeline creation failed");
+        return false;
+    }
+    REXLOG_WARN("plume: overlay pass ready -- the SDK's ImGui (settings/console) draws through "
+                "the native renderer");
+    return true;
+}
+
+// A texture the overlay can bind: the plume texture plus its own one-slot
+// descriptor set, so binding is one setGraphicsDescriptorSet per draw.
+class PlumeImGuiTexture : public rex::ui::ImmediateTexture {
+ public:
+    PlumeImGuiTexture(uint32_t width, uint32_t height) : ImmediateTexture(width, height) {}
+    std::unique_ptr<plume::RenderTexture> texture;
+    std::unique_ptr<plume::RenderDescriptorSet> set;
+    rex::ui::ImmediateTextureFilter filter = rex::ui::ImmediateTextureFilter::kLinear;
+};
+
+// The detached-mode renderer for the SDK's ImGui. Owned by ReXApp (returned
+// from DaytonaApp::OnCreateImmediateDrawer); records into whatever command
+// list the overlay pass is running on (g_imgui_cmd, set in RecordPresentBlit).
+class PlumeImmediateDrawer : public rex::ui::ImmediateDrawer {
+ public:
+    std::unique_ptr<rex::ui::ImmediateTexture> CreateTexture(uint32_t width, uint32_t height,
+                                                             rex::ui::ImmediateTextureFilter filter,
+                                                             bool is_repeated,
+                                                             const uint8_t* data) override {
+        // REQUIRED CONTRACT (rex_app.h): nullptr, never a crash, while the
+        // device is not up -- the SDK retries the font atlas lazily.
+        if (g_device == nullptr || data == nullptr) return nullptr;
+        (void)is_repeated;   // Everything the overlay draws is CLAMP-friendly.
+
+        auto tex = std::make_unique<PlumeImGuiTexture>(width, height);
+        tex->filter = filter;
+        tex->texture = g_device->createTexture(plume::RenderTextureDesc::Texture2D(
+            width, height, 1, plume::RenderFormat::R8G8B8A8_UNORM));
+        if (tex->texture == nullptr) return nullptr;
+
+        // Same staging discipline as the guest texture path: rows padded to
+        // 256 bytes for D3D12's copy alignment.
+        const uint32_t row_bytes = width * 4;
+        const uint32_t padded = (row_bytes + 255u) & ~255u;
+        auto staging = g_device->createBuffer(
+            plume::RenderBufferDesc::UploadBuffer(uint64_t(padded) * height));
+        if (staging == nullptr) return nullptr;
+        auto* dst = static_cast<uint8_t*>(staging->map());
+        if (dst == nullptr) return nullptr;
+        for (uint32_t y = 0; y < height; ++y) {
+            std::memcpy(dst + size_t(y) * padded, data + size_t(y) * row_bytes, row_bytes);
+        }
+        staging->unmap();
+
+        g_upload_cmd->begin();
+        const plume::RenderTextureBarrier to_dst(tex->texture.get(),
+                                                 plume::RenderTextureLayout::COPY_DEST);
+        g_upload_cmd->barriers(plume::RenderBarrierStage::COPY, nullptr, 0, &to_dst, 1);
+        g_upload_cmd->copyTextureRegion(
+            plume::RenderTextureCopyLocation::Subresource(tex->texture.get()),
+            plume::RenderTextureCopyLocation::PlacedFootprint(
+                staging.get(), plume::RenderFormat::R8G8B8A8_UNORM, width, height, 1, padded / 4));
+        const plume::RenderTextureBarrier to_read(tex->texture.get(),
+                                                  plume::RenderTextureLayout::SHADER_READ);
+        g_upload_cmd->barriers(plume::RenderBarrierStage::GRAPHICS, nullptr, 0, &to_read, 1);
+        g_upload_cmd->end();
+        const plume::RenderCommandList* lists[] = {g_upload_cmd.get()};
+        g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, g_upload_fence.get());
+        g_queue->waitForCommandFence(g_upload_fence.get());
+
+        plume::RenderDescriptorSetBuilder tb;
+        tb.begin();
+        tb.addTexture(0);
+        tb.end();
+        tex->set = tb.create(g_device.get());
+        if (tex->set == nullptr) return nullptr;
+        tex->set->setTexture(0, tex->texture.get(), plume::RenderTextureLayout::SHADER_READ);
+        REXLOG_WARN("plume: overlay texture {}x{} ({})", width, height,
+                    filter == rex::ui::ImmediateTextureFilter::kLinear ? "linear" : "nearest");
+        return tex;
+    }
+
+    void Begin(rex::ui::UIDrawContext& ui_draw_context, float coordinate_space_width,
+               float coordinate_space_height) override {
+        ImmediateDrawer::Begin(ui_draw_context, coordinate_space_width, coordinate_space_height);
+        plume::RenderCommandList* cmd = g_imgui_cmd;
+        if (cmd == nullptr) return;
+
+        cmd->setPipeline(g_imgui_pipeline.get());
+        cmd->setGraphicsPipelineLayout(g_imgui_layout.get());
+        // Full render target, NOT the blit's letterboxed viewport: the overlay
+        // owns the whole window.
+        const plume::RenderViewport vp(0.0f, 0.0f, float(g_imgui_rt_w), float(g_imgui_rt_h));
+        cmd->setViewports(&vp, 1);
+        const plume::RenderRect full(0, 0, int32_t(g_imgui_rt_w), int32_t(g_imgui_rt_h));
+        cmd->setScissors(&full, 1);
+        // Display coords -> clip. NO negative-viewport trick here, unlike the
+        // blit: scissor rects do not flip with the viewport, and the overlay
+        // actually uses scissors. The flip lives in the projection instead, so
+        // scissors stay in top-left-origin framebuffer coords on both backends.
+        const bool vk = (g_shader_format == plume::RenderShaderFormat::SPIRV);
+        const float xform[4] = {
+            2.0f / coordinate_space_width,
+            (vk ? 2.0f : -2.0f) / coordinate_space_height,
+            -1.0f,
+            vk ? -1.0f : 1.0f,
+        };
+        cmd->setGraphicsPushConstants(0, xform);
+    }
+
+    void BeginDrawBatch(const rex::ui::ImmediateDrawBatch& batch) override {
+        plume::RenderCommandList* cmd = g_imgui_cmd;
+        if (cmd == nullptr) return;
+        batch_indexed_ = false;
+
+        const uint32_t vsize = uint32_t(batch.vertex_count) * sizeof(rex::ui::ImmediateVertex);
+        auto vbuf = g_device->createBuffer(
+            plume::RenderBufferDesc::UploadBuffer(vsize, plume::RenderBufferFlag::VERTEX));
+        if (vbuf == nullptr) return;
+        void* vdst = vbuf->map();
+        if (vdst == nullptr) return;
+        std::memcpy(vdst, batch.vertices, vsize);
+        vbuf->unmap();
+        static const plume::RenderInputSlot kSlot(0, sizeof(rex::ui::ImmediateVertex));
+        const plume::RenderVertexBufferView vview(vbuf.get(), vsize);
+        cmd->setVertexBuffers(0, &vview, 1, &kSlot);
+        // Alive until this frame's fence retires its slot; see g_frame_buffers.
+        g_frame_buffers.push_back(std::move(vbuf));
+
+        if (batch.indices != nullptr && batch.index_count > 0) {
+            const uint32_t isize = uint32_t(batch.index_count) * sizeof(uint16_t);
+            auto ibuf = g_device->createBuffer(
+                plume::RenderBufferDesc::UploadBuffer(isize, plume::RenderBufferFlag::INDEX));
+            if (ibuf == nullptr) return;
+            void* idst = ibuf->map();
+            if (idst == nullptr) return;
+            std::memcpy(idst, batch.indices, isize);
+            ibuf->unmap();
+            const plume::RenderIndexBufferView iview(ibuf.get(), isize,
+                                                     plume::RenderFormat::R16_UINT);
+            cmd->setIndexBuffer(&iview);
+            g_frame_buffers.push_back(std::move(ibuf));
+            batch_indexed_ = true;
+        }
+    }
+
+    void Draw(const rex::ui::ImmediateDraw& draw) override {
+        plume::RenderCommandList* cmd = g_imgui_cmd;
+        if (cmd == nullptr) return;
+        if (draw.primitive_type != rex::ui::ImmediatePrimitiveType::kTriangles) {
+            // ImGui core emits triangles only; say it once if that changes.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                REXLOG_WARN("plume: overlay line draw skipped (no line pipeline)");
+            }
+            return;
+        }
+
+        auto* tex = static_cast<PlumeImGuiTexture*>(draw.texture);
+        if (tex == nullptr || tex->set == nullptr) {
+            if (EnsureWhiteTexture() == nullptr) return;
+            tex = white_.get();
+        }
+        cmd->setGraphicsDescriptorSet(tex->set.get(), 0);
+        cmd->setGraphicsDescriptorSet(
+            tex->filter == rex::ui::ImmediateTextureFilter::kNearest ? g_imgui_smp_nearest.get()
+                                                                     : g_imgui_smp_linear.get(),
+            1);
+
+        if (draw.scissor) {
+            uint32_t left, top, width, height;
+            if (!ScissorToRenderTarget(draw, left, top, width, height)) return;
+            const plume::RenderRect sc(int32_t(left), int32_t(top), int32_t(left + width),
+                                       int32_t(top + height));
+            cmd->setScissors(&sc, 1);
+        } else {
+            const plume::RenderRect full(0, 0, int32_t(g_imgui_rt_w), int32_t(g_imgui_rt_h));
+            cmd->setScissors(&full, 1);
+        }
+
+        if (batch_indexed_) {
+            cmd->drawIndexedInstanced(uint32_t(draw.count), 1, uint32_t(draw.index_offset),
+                                      draw.base_vertex, 0);
+        } else {
+            cmd->drawInstanced(uint32_t(draw.count), 1, uint32_t(draw.base_vertex), 0);
+        }
+    }
+
+    void EndDrawBatch() override {}
+
+ private:
+    PlumeImGuiTexture* EnsureWhiteTexture() {
+        if (white_ != nullptr) return white_.get();
+        const uint8_t white[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+        auto tex = CreateTexture(1, 1, rex::ui::ImmediateTextureFilter::kNearest, false, white);
+        white_.reset(static_cast<PlumeImGuiTexture*>(tex.release()));
+        return white_.get();
+    }
+
+    std::unique_ptr<PlumeImGuiTexture> white_;
+    bool batch_indexed_ = false;
+};
+
 // Resize the swapchain if the window changed shape. Returns false if there is
 // nothing presentable.
 //
@@ -3548,6 +3868,23 @@ bool RecordPresentBlit(plume::RenderCommandList* cmd, plume::RenderTexture* back
     cmd->setViewports(&vp, 1);
     cmd->setScissors(&sc, 1);
     cmd->drawInstanced(3, 1, 0, 0);   // one fullscreen triangle
+
+    // The overlay: the SDK's ImGui drawn over the blitted frame, full-window
+    // (not letterboxed -- a settings dialog belongs to the window, not the
+    // picture). The backbuffer is still COLOR_WRITE and the framebuffer still
+    // bound, which is exactly what the drawer's Begin assumes. ImGuiDrawer
+    // early-outs with no dialogs open, so the idle cost is a null check.
+    if (g_imgui_drawer != nullptr && BuildImGuiPass()) {
+        // The app's dialog open/close requests apply HERE, on this thread,
+        // so they cannot race the Draw below.
+        if (g_imgui_predraw) g_imgui_predraw();
+        g_imgui_cmd = cmd;
+        g_imgui_rt_w = uint32_t(dst_w);
+        g_imgui_rt_h = uint32_t(dst_h);
+        rex::ui::AppUIDrawContext ctx(g_imgui_rt_w, g_imgui_rt_h);
+        g_imgui_drawer->Draw(ctx);
+        g_imgui_cmd = nullptr;
+    }
 
     const plume::RenderTextureBarrier to_present(backbuffer,
                                                  plume::RenderTextureLayout::PRESENT);
@@ -6217,6 +6554,28 @@ void SetHostWindow(void* native_handle) {
 #endif
 }
 
+// The SDK's ImGuiDrawer, handed over by main.cpp once the window exists. From
+// then on every present composites the overlay; with no dialogs open the SDK
+// early-outs and the cost is a null check.
+void SetImGuiDrawer(rex::ui::ImGuiDrawer* drawer) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_imgui_drawer = drawer;
+    REXLOG_WARN("plume: SDK overlay {} -- settings/console will draw through the native renderer",
+                drawer != nullptr ? "attached" : "detached");
+}
+
+// Factory for ReXApp::OnCreateImmediateDrawer (detached-overlay mode). The
+// returned drawer is owned by the SDK; it records through this file's state.
+std::unique_ptr<rex::ui::ImmediateDrawer> CreateImmediateDrawer() {
+    REXLOG_WARN("plume: detached-mode ImmediateDrawer created for the SDK overlay");
+    return std::make_unique<PlumeImmediateDrawer>();
+}
+
+void SetOverlayPreDraw(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_imgui_predraw = std::move(fn);
+}
+
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
     // A frame left open holds a recording command list and the GPU may still be
@@ -6265,6 +6624,18 @@ void Shutdown() {
     g_framebuffer.reset();
     g_color_target.reset();
     g_depth_target.reset();
+    // The overlay's device objects go with the device; the drawer pointer is
+    // the SDK's object and merely dropped.
+    g_imgui_drawer = nullptr;
+    g_imgui_predraw = nullptr;
+    g_imgui_pipeline.reset();
+    g_imgui_layout.reset();
+    g_imgui_vs_shader.reset();
+    g_imgui_ps_shader.reset();
+    g_imgui_smp_linear.reset();
+    g_imgui_smp_nearest.reset();
+    g_imgui_sampler_linear.reset();
+    g_imgui_sampler_nearest.reset();
     // The swapchain must go before the queue that created it, and the window
     // before neither -- but after the swapchain that holds its HWND.
     g_swapchain.reset();
