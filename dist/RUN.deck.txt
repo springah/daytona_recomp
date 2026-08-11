@@ -1,9 +1,10 @@
-Daytona USA -- Steam Deck (native Vulkan) -- BETA 1.1
+Daytona USA -- Steam Deck (native Vulkan) -- BETA 1.2
 =====================================================
 
-First Deck build that actually draws: the title screen renders correctly on
-RADV through the native renderer. Everything past the title is UNTESTED on
-this hardware -- that is what this beta is for.
+Beta 1.2 fixes the attract-mode freeze (picture stuck, music playing out,
+no input) that beta 1.1 hit after the first attract loop. Everything past
+the title screen is still lightly tested on this hardware -- that is what
+this beta is for.
 
 TO PLAY
 
