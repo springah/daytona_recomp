@@ -2348,6 +2348,9 @@ std::unique_ptr<plume::RenderDescriptorSet> g_imgui_smp_nearest;
 rex::ui::ImGuiDrawer* g_imgui_drawer = nullptr;
 // App hook run on the render thread before each Draw; see SetOverlayPreDraw.
 std::function<void()> g_imgui_predraw;
+// True once the first overlay texture (the font atlas) uploaded -- gates the
+// EndFrame warm call. See EndFrame for why the warm exists at all.
+bool g_imgui_font_warmed = false;
 // Valid only while the overlay pass records (set around ImGuiDrawer::Draw).
 plume::RenderCommandList* g_imgui_cmd = nullptr;
 uint32_t g_imgui_rt_w = 0;
@@ -3595,6 +3598,7 @@ class PlumeImmediateDrawer : public rex::ui::ImmediateDrawer {
         tex->set = tb.create(g_device.get());
         if (tex->set == nullptr) return nullptr;
         tex->set->setTexture(0, tex->texture.get(), plume::RenderTextureLayout::SHADER_READ);
+        g_imgui_font_warmed = true;
         REXLOG_WARN("plume: overlay texture {}x{} ({})", width, height,
                     filter == rex::ui::ImmediateTextureFilter::kLinear ? "linear" : "nearest");
         return tex;
@@ -4753,6 +4757,19 @@ void EndFrame(bool present) {
     if (!g_frame_open) return;
     ScopedMs timer(g_ms_endframe);
     g_frame_open = false;
+
+    // Warm the overlay's font atlas HERE, under the same conditions as any
+    // guest texture upload -- NOT inside the present recording. The SDK
+    // uploads it lazily on the first ImGuiDrawer::Draw, and doing that after
+    // acquireTexture (where the overlay pass runs) segfaults RADV inside the
+    // first barrier of the upload (Deck, 08-11; D3D12 tolerates it). With no
+    // dialogs open Draw IS just the font setup: it returns before touching
+    // any ImGui frame state, and the dialog list cannot be non-empty before
+    // the first warm because open/close only happens in the pre-draw hook.
+    if (g_imgui_drawer != nullptr && !g_imgui_font_warmed && BuildImGuiPass()) {
+        rex::ui::AppUIDrawContext warm(kFrameW, kFrameH);
+        g_imgui_drawer->Draw(warm);
+    }
     ++g_frame_index;
     // The mesh dump's file covers exactly the draws of the frame that just
     // closed, so it closes with the frame -- and the BMP it asked for is
