@@ -48,6 +48,18 @@
 #include <SDL3/SDL_properties.h>
 #endif
 
+#ifdef __APPLE__
+// Same story as Linux, but plume wants {NSWindow*, CAMetalLayer*}: the NSWindow
+// comes off the SDL window's properties, the layer from SDL's metal-view
+// helpers -- all plain C, no Objective-C in this TU. SDL_init.h is for
+// SDL_RunOnMainThread: AppKit is main-thread-strict and this is the render
+// thread (the Deck's Xlib shared-connection bug, one platform over).
+#include <SDL3/SDL_video.h>
+#include <SDL3/SDL_properties.h>
+#include <SDL3/SDL_metal.h>
+#include <SDL3/SDL_init.h>
+#endif
+
 namespace plume {
 // Defined in plume_d3d12.cpp / plume_vulkan.cpp; plume declares neither in a
 // public header, so the example does the same thing.
@@ -883,7 +895,7 @@ uint32_t VulkanLocation(uint8_t usage, uint8_t index) {
 // Daytona's shaders declare is ALPHA_TEST. See the note at the pick site.
 constexpr uint32_t kSpecConstants = 0;
 
-constexpr uint32_t kTextureDescriptorSize = 1024;
+constexpr uint32_t kTextureDescriptorSize = 4096;
 constexpr uint32_t kSamplerDescriptorSize = 64;
 
 constexpr plume::RenderFormat kRenderTargetFormat = plume::RenderFormat::B8G8R8A8_UNORM;
@@ -2889,6 +2901,22 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
         reuse_slot = c.slot;
     }
 
+    // A full heap degrades to a wrong-texture draw (the shader samples heap
+    // slot 0), never past-the-end: setTexture at kTextureDescriptorSize wedged
+    // the render thread on the Deck -- slot 1023, then silence, two runs in a
+    // row. The mirror path already guards this way; this is the same rule for
+    // fresh uploads.
+    if (reuse_slot == UINT32_MAX && g_textures.size() >= kTextureDescriptorSize) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            REXLOG_WARN("plume: texture heap FULL ({} slots) -- new textures will draw wrong "
+                        "until eviction exists",
+                        kTextureDescriptorSize);
+        }
+        return UINT32_MAX;
+    }
+
     // Say it out loud when one address is bound two ways -- that is the case
     // the key above exists for, and if it never happens the extra key bits are
     // free rather than load-bearing.
@@ -3206,6 +3234,73 @@ bool EnsureWindow() {
     g_window_borrowed = true;
     REXLOG_WARN("plume: presenting into the application's X11 window ({:#x}), not a second one",
                 uint64_t(xwindow));
+    return true;
+#elif defined(__APPLE__)
+    if (g_window.window != nullptr) return true;
+
+    // Not-found does not latch, same reasoning as Linux: the SDK's window may
+    // simply not exist yet at the first frame. Only the opt-out is permanent.
+    const char* opt = std::getenv("DT_PLUME_WINDOW");
+    if (opt != nullptr && opt[0] == '0') {
+        if (!g_window_tried) {
+            g_window_tried = true;
+            REXLOG_WARN("plume: DT_PLUME_WINDOW=0 -- composing headless, no window");
+        }
+        return false;
+    }
+
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    if (windows == nullptr || count < 1) {
+        if (!g_window_tried) {
+            g_window_tried = true;   // say it once; the caller retries
+            REXLOG_WARN("plume: no SDL window to present into yet (count {}) -- composing headless "
+                        "and retrying", count);
+        }
+        return false;
+    }
+    if (count > 1) {
+        REXLOG_WARN("plume: {} SDL windows exist -- presenting into the first. If the picture is "
+                    "in the wrong place, this line is why.", count);
+    }
+
+    // plume's Apple RenderWindow is {NSWindow*, CAMetalLayer*}: the layer goes
+    // straight into vkCreateMetalSurfaceEXT, the NSWindow is only measured for
+    // sizes. Both touch AppKit, so they run on the main thread and this thread
+    // waits -- EnsureWindow is called at most once per frame, and after the
+    // first success it returns at the top without coming back here.
+    struct MainThreadWork {
+        SDL_Window* sdl_window;
+        void* nswindow;
+        void* layer;
+    } work{windows[0], nullptr, nullptr};
+    const bool ran = SDL_RunOnMainThread(
+        [](void* p) {
+            auto* w = static_cast<MainThreadWork*>(p);
+            SDL_PropertiesID props = SDL_GetWindowProperties(w->sdl_window);
+            w->nswindow =
+                SDL_GetPointerProperty(props, SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+            // Creates the metal view on first call; the layer lives as long as
+            // the view, and the view as long as the window.
+            static SDL_MetalView view = nullptr;
+            if (view == nullptr) view = SDL_Metal_CreateView(w->sdl_window);
+            if (view != nullptr) w->layer = SDL_Metal_GetLayer(view);
+        },
+        &work, /*wait_complete=*/true);
+    if (!ran || work.nswindow == nullptr || work.layer == nullptr) {
+        if (!g_window_tried) {
+            g_window_tried = true;
+            REXLOG_WARN("plume: SDL window yielded no Cocoa pair (main-thread call {}, window {}, "
+                        "layer {}) -- composing headless and retrying",
+                        ran ? "ok" : "FAILED", work.nswindow, work.layer);
+        }
+        return false;
+    }
+    g_window.window = work.nswindow;
+    g_window.view = work.layer;
+    g_window_borrowed = true;
+    REXLOG_WARN("plume: presenting into the application's Cocoa window ({}), metal layer {}",
+                work.nswindow, work.layer);
     return true;
 #else
     return false;
