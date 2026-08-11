@@ -12,7 +12,7 @@ SDK="${SDK:-${REXSDK_DIR:-$PROJ/rexglue-sdk}}"
 ASSETS_SRC="${ASSETS_SRC:-$PROJ/daytona_recomp/extracted}"
 APP="${APP:-$PROJ/Daytona.app}"
 ICON_SRC="${ICON_SRC:-$PROJ/daytona_recomp/src/daytona.ico}"
-VER="${VER:-1.0.3}"
+VER="${VER:-1.1.2}"
 C="$APP/Contents"
 
 # Copy a file from the first place it exists (build dir or SDK out dir).
@@ -32,6 +32,10 @@ echo "[2/7] executable + runtime dylibs (single-module: no guest dylibs)"
 cp "$BUILD/daytona" "$C/MacOS/"
 copy_first librexruntime.dylib "$C/MacOS/"
 copy_first libTracyClient.dylib "$C/MacOS/"
+# GPU plugins: the SDK loader dlopens librexgpu-<name>.so next to the exe on
+# every non-Windows platform -- .so, not .dylib, and dlopen does not mind.
+cp "$BUILD/librexgpu-plume.dylib" "$C/MacOS/librexgpu-plume.so"
+cp "$BUILD/librexgpu-xenos.dylib" "$C/MacOS/librexgpu-xenos.so"
 
 echo "[3/7] bundled MoltenVK (self-contained)"
 MVK="$(readlink -f /opt/homebrew/lib/libMoltenVK.dylib)"

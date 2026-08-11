@@ -14,7 +14,12 @@ cmake_minimum_required(VERSION 3.25)
 # before-park), the swapchain retries from the Swap hook (the Deck headless
 # boot), --gpu_plugin=xenos alone no longer crashes, first-launch note in the
 # READMEs.
-project(daytona VERSION 1.1.1 LANGUAGES C CXX)
+#
+# 1.1.2 = beta 1.2: the attract-loop freeze (texture heap exhaustion at 1024
+# slots -- cap now 4096 with a guard that degrades instead of wedging), and the
+# first macOS picture (GPU plugins staged under the .so names the loader wants,
+# volk finds the bundled MoltenVK, EnsureWindow grew its Cocoa branch).
+project(daytona VERSION 1.1.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
