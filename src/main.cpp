@@ -21,8 +21,12 @@
 #include <rex/ui/keybinds.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <imgui.h>
+// For the overlay-scale workaround in the pre-draw hook: walking the ImGui
+// window list needs the internal header. See the lambda for why.
+#include <imgui_internal.h>
 
 #include <atomic>
+#include <cstring>
 
 // For the Start+Select -> settings chord: the SDK's input driver is SDL, so
 // gamepad button events already flow through SDL's queue; an event watch sees
@@ -685,6 +689,25 @@ protected:
             // counts requests; parity decides open vs close, so a double-press
             // between two presents nets out instead of desyncing.
             dt_plume::SetOverlayPreDraw([this] {
+                // SDK bug workaround: SettingsDialog applies overlay_scale via
+                // SetWindowFontScale on its OUTER window only -- the BeginChild
+                // panes (category tree, settings list) never get it, so their
+                // layout scales but their text stays tiny. FontWindowScale
+                // persists per ImGui window, and the drawer's context is
+                // current on this thread from the previous Draw, so stamping
+                // the dialog's child windows here fixes the panes without
+                // touching the pinned SDK. One frame of pop-in on first open.
+                if (overlay_settings_ != nullptr) {
+                    if (ImGuiContext* ctx = ImGui::GetCurrentContext()) {
+                        const float scale = float(rex::cvar::Query<double>("overlay_scale"));
+                        for (ImGuiWindow* w : ctx->Windows) {
+                            if (w->Name != nullptr &&
+                                std::strncmp(w->Name, "Settings##rex/", 14) == 0) {
+                                w->FontWindowScale = scale;
+                            }
+                        }
+                    }
+                }
                 const int toggles = overlay_toggle_requests_.exchange(0);
                 if ((toggles & 1) == 0) return;
                 if (overlay_settings_) {
@@ -696,6 +719,13 @@ protected:
             });
             rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay",
                                   [this] { overlay_toggle_requests_.fetch_add(1); });
+            // DT_OVERLAY_OPEN=1: open the settings dialog at boot. Unattended
+            // drills verify the overlay from a screenshot without injecting a
+            // keypress -- focus-stealing is exactly what modern Windows (and
+            // this project's own input-injection rules) refuse.
+            if (const char* open = std::getenv("DT_OVERLAY_OPEN"); open && open[0] == '1') {
+                overlay_toggle_requests_.fetch_add(1);
+            }
         }
 
         // Start+Select opens settings on a pad, because a Deck in Game Mode
