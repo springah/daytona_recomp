@@ -1,11 +1,14 @@
-Daytona USA -- Steam Deck (native Vulkan) -- BETA 1.3
+Daytona USA -- Steam Deck (native Vulkan) -- BETA 1.4
 =====================================================
 
-Beta 1.3 adds the settings overlay: press START+SELECT together (or F4 on
-a keyboard) to open and close it. Rebind controls, change resolution, save
-to config. Beta 1.2 fixed the attract-mode freeze (picture stuck, music
-playing out, no input). Everything past the title screen is still lightly
-tested on this hardware -- that is what this beta is for.
+Beta 1.4 makes the attract-freeze fix permanent: the texture memory that
+beta 1.2's fix only enlarged now recycles itself, so sessions of any length
+stay safe. It also closes the last menu entries that could hang the menu the
+way Achievements once did. Beta 1.3 added the settings overlay: press
+START+SELECT together (or F4 on a keyboard) to open and close it. Rebind
+controls, change resolution, save to config. Everything past the title
+screen is still lightly tested on this hardware -- that is what this beta
+is for.
 
 TO PLAY
 

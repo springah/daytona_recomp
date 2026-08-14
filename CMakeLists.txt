@@ -24,7 +24,12 @@ cmake_minimum_required(VERSION 3.25)
 # SDK never stood it up when a GPU plugin declines presentation -- no drawer,
 # no F4 bind; the app owns the stack now and dt_plume composites it), and
 # Start+Select on a pad opens it too.
-project(daytona VERSION 1.1.3 LANGUAGES C CXX)
+#
+# 1.1.4 = beta 1.4: the texture heap recycles (LRU eviction and a free list
+# behind the 4096 guard, so long sessions can no longer degrade for good), and
+# the three remaining Live blades (QuickChat, PlayerReview, GameInvite) get the
+# open/close notification handshake instead of the SDK's silent-success stub.
+project(daytona VERSION 1.1.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
