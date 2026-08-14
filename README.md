@@ -11,10 +11,10 @@ execution, built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)
 
 This branch (`native-renderer`) is the shipping product: the game's D3D9 calls
 are intercepted app-side and drawn through a **native renderer** ([plume](https://github.com/springah/plume)
-RHI -- D3D12 on Windows, Vulkan on Linux/Steam Deck) instead of Xenos GPU
-emulation. The whole game renders this way -- boot, menus, attract, races --
-referee-verified against the emulated renderer screen by screen. The `main`
-branch is the stock ReXGlue port it grew out of.
+RHI -- D3D12 on Windows, Vulkan on Linux/Steam Deck, Vulkan-over-MoltenVK on
+macOS) instead of Xenos GPU emulation. The whole game renders this way -- boot,
+menus, attract, races -- referee-verified against the emulated renderer screen
+by screen. The `main` branch is the stock ReXGlue port it grew out of.
 
 No copyrighted game files are included. This tree excludes the extracted game
 directory, `default.xex`, media archives, audio, images, and build outputs — you
@@ -161,11 +161,12 @@ thirdparty/plume        plume rendering abstraction submodule
 | Feature | Status |
 |---------|--------|
 | Native rendering (D3D12/Vulkan through plume, replacing GPU emulation) | **Done** -- the default on this branch |
-| Arbitrary window size / resolution scaling | **Done** (aspect-fit blit; `resolution` in daytona.ini) |
+| Arbitrary window size / resolution scaling | **Done** (aspect-fit blit; `resolution` in daytona.ini; F11 fullscreen) |
+| In-game settings overlay (rebinding, resolution, save-to-config) | **Done** (F4, or Start+Select on a pad) |
 | Windows build | **Done** (beta) |
 | Linux / Steam Deck build (native Vulkan, no Proton) | **Done** (beta) |
+| macOS build (arm64, Vulkan via MoltenVK) | **Done** (beta; see `mac-build/build_app.sh`) |
 | Keyboard control mapping | Basic (WASD + Return/Space/Shift) |
-| macOS port | Planned |
 | Android port | Maybe |
 
 ## Acknowledgements
