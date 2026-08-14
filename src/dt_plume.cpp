@@ -906,6 +906,11 @@ constexpr uint32_t kSpecConstants = 0;
 
 constexpr uint32_t kTextureDescriptorSize = 4096;
 constexpr uint32_t kSamplerDescriptorSize = 64;
+// How many of those descriptors the cache may actually occupy before it evicts.
+// The physical heap stays kTextureDescriptorSize; DT_PLUME_TEXCAP shrinks only
+// this logical ceiling, which is how the eviction path gets exercised on demand
+// instead of waiting for a session long enough to stream 4096 textures.
+uint32_t g_tex_cap = kTextureDescriptorSize;
 
 constexpr plume::RenderFormat kRenderTargetFormat = plume::RenderFormat::B8G8R8A8_UNORM;
 constexpr plume::RenderFormat kDepthTargetFormat = plume::RenderFormat::D32_FLOAT;
@@ -981,6 +986,14 @@ bool Init() {
     // clearing at the top of every frame, which is the A/B for this.
     if (const char* p = std::getenv("DT_PLUME_PERSIST")) g_persist = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_TEXPROBE")) g_texprobe = std::atoi(p) != 0;
+    if (const char* p = std::getenv("DT_PLUME_TEXCAP")) {
+        // Floor of 8: slot 0 is the checker and the mirror path wants a couple.
+        // The title screen's own working set is ~13 slots, so a drill has to be
+        // able to go below that to exercise the full-and-hot degrade path; 8 is
+        // as low as that experiment needs.
+        g_tex_cap = std::clamp(uint32_t(std::atoi(p)), 8u, kTextureDescriptorSize);
+        REXLOG_WARN("plume: DT_PLUME_TEXCAP -- texture heap capped at {} slots", g_tex_cap);
+    }
     if (const char* p = std::getenv("DT_PLUME_GPULOOP")) g_gpuloop = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_RESOLVECLEAR")) g_resolveclear = std::atoi(p) != 0;
     if (const char* p = std::getenv("DT_PLUME_PROF")) g_prof = std::atoi(p) != 0;
@@ -2590,6 +2603,9 @@ struct TexCache {
     // costs nothing to check: one bool on the cache-hit path.
     bool dirty = false;
     uint32_t phys = 0;         // base_address & 0x1FFFFFFF, for range compares
+    // g_frame_index + 1 of the last frame that bound this entry (0 = never),
+    // the same bias as probe_frame. What eviction orders by.
+    uint32_t last_used = 0;
 };
 // Cache key -> entry. Keyed on the base address AND on the format and
 // swizzle, not on the address alone: the upload bakes the swizzle in (k_8_8 is
@@ -2680,6 +2696,82 @@ uint32_t g_mirror_stale = 0;     // ... of those, from the generation after
 uint32_t g_texture_reuploads = 0;
 uint64_t TextureCacheKey(const DecodedTexture& t) {
     return uint64_t(t.base_address) | (uint64_t(t.format) << 32) | (uint64_t(t.swizzle) << 40);
+}
+
+// ── Eviction ─────────────────────────────────────────────────────────────────
+// The heap used to be a bump allocator, and the Deck showed what that costs: an
+// attract cycle streams enough textures to hit the ceiling, and before the
+// ceiling had a guard it wedged the render thread (slot 1023, then silence).
+// The guard turned the wedge into wrong-texture draws; this turns the pressure
+// into recycling. Slots freed by eviction wait in g_free_slots; when none are
+// free and the heap is at capacity, the least-recently-bound entries go.
+std::vector<uint32_t> g_free_slots;
+uint32_t g_tex_evictions = 0;
+
+// Evict up to `want` least-recently-bound cache entries and return how many
+// slots that freed. Eligible = not bound this frame or the one before, so no
+// command list the GPU could still be executing references the slot: the ring
+// is two frames deep, and anything older has had its fence waited on. That is
+// what makes the descriptor rewrite below safe. The texture object still goes
+// through the graveyard rather than being destroyed here -- same rule as a
+// re-upload, and it costs nothing.
+uint32_t EvictTextures(uint32_t want) {
+    const uint32_t now = g_frame_index + 1u;   // the bias TexCache stamps carry
+    std::vector<std::pair<uint32_t, uint64_t>> eligible;   // (last_used, key)
+    eligible.reserve(g_texture_index.size());
+    for (const auto& [key, c] : g_texture_index) {
+        if (now - c.last_used >= 3u) eligible.emplace_back(c.last_used, key);
+    }
+    if (eligible.empty()) return 0;
+    if (eligible.size() > want) {
+        std::nth_element(eligible.begin(), eligible.begin() + want, eligible.end());
+        eligible.resize(want);
+    }
+    for (const auto& [stamp, key] : eligible) {
+        const uint32_t slot = g_texture_index[key].slot;
+        if (g_textures[slot] != nullptr) {
+            g_texture_graveyard.push_back(std::move(g_textures[slot]));
+            g_textures[slot] = nullptr;
+        }
+        // A stale reference -- eligibility says there are none in flight --
+        // draws the loud checker rather than sampling a freed texture. (The
+        // checker can fail to build at Init; then the slot just stays bound to
+        // the dead descriptor until a fresh upload takes it, which eligibility
+        // also makes safe.)
+        if (g_textures[0] != nullptr) {
+            g_texture_set->setTexture(slot, g_textures[0].get(),
+                                      plume::RenderTextureLayout::SHADER_READ);
+        }
+        g_texture_index.erase(key);
+        g_free_slots.push_back(slot);
+    }
+    g_tex_evictions += uint32_t(eligible.size());
+    REXLOG_WARN("plume: texture heap at capacity ({}) -- evicted {} least-recently-bound "
+                "({} evictions total, {} entries remain)",
+                g_tex_cap, eligible.size(), g_tex_evictions, g_texture_index.size());
+    return uint32_t(eligible.size());
+}
+
+// A heap slot for a new binding: recycled if one is free, fresh growth below
+// the capacity, otherwise whatever eviction can make room for. UINT32_MAX only
+// when the heap is full of entries bound within the last two frames -- a
+// genuinely hot working set larger than the heap, which no policy fixes.
+uint32_t AllocTextureSlot() {
+    if (g_free_slots.empty() && uint32_t(g_textures.size()) >= g_tex_cap) {
+        // A batch, not one: the scan is linear in the cache and pressure that
+        // found the ceiling once will find it again next frame.
+        EvictTextures(std::max(1u, g_tex_cap / 64u));
+    }
+    if (!g_free_slots.empty()) {
+        const uint32_t slot = g_free_slots.back();
+        g_free_slots.pop_back();
+        return slot;
+    }
+    if (uint32_t(g_textures.size()) < g_tex_cap) {
+        g_textures.push_back(nullptr);
+        return uint32_t(g_textures.size() - 1u);
+    }
+    return UINT32_MAX;
 }
 // DT_PLUME_TEXCONTROL: the whole heap is the control checker, so guest textures
 // must not be uploaded over it.
@@ -2833,7 +2925,6 @@ plume::RenderComponentMapping MirrorComponentMap(uint32_t swizzle) {
 uint32_t EnsureMirrorSlot(uint64_t key, const DecodedTexture& t) {
     auto it = g_mirror_slots.find(key);
     if (it != g_mirror_slots.end()) return it->second;
-    if (g_textures.size() + 1 >= kTextureDescriptorSize) return UINT32_MAX;
 
     auto view = g_resolve_mirror->createTextureView(
         [&] {
@@ -2844,8 +2935,10 @@ uint32_t EnsureMirrorSlot(uint64_t key, const DecodedTexture& t) {
         }());
     if (view == nullptr) return UINT32_MAX;
 
-    const uint32_t slot = uint32_t(g_textures.size());
-    g_textures.push_back(nullptr);   // the slot owns no texture; the mirror does
+    // Mirror slots are permanent: they are not in g_texture_index, so eviction
+    // never sees them, and the slot owns no texture -- the mirror does.
+    const uint32_t slot = AllocTextureSlot();
+    if (slot == UINT32_MAX) return UINT32_MAX;
     g_texture_set->setTexture(slot, g_resolve_mirror.get(),
                               plume::RenderTextureLayout::SHADER_READ, view.get());
     g_mirror_views.push_back(std::move(view));
@@ -2903,6 +2996,7 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
             rw != g_resolve_written.end()) {
             stamp = rw->second;
         }
+        c.last_used = g_frame_index + 1u;
         const char* why = nullptr;
         if (stamp != c.resolve_stamp) {
             why = "resolved into";
@@ -2935,18 +3029,21 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
         reuse_slot = c.slot;
     }
 
-    // A full heap degrades to a wrong-texture draw (the shader samples heap
-    // slot 0), never past-the-end: setTexture at kTextureDescriptorSize wedged
-    // the render thread on the Deck -- slot 1023, then silence, two runs in a
-    // row. The mirror path already guards this way; this is the same rule for
-    // fresh uploads.
-    if (reuse_slot == UINT32_MAX && g_textures.size() >= kTextureDescriptorSize) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            REXLOG_WARN("plume: texture heap FULL ({} slots) -- new textures will draw wrong "
-                        "until eviction exists",
-                        kTextureDescriptorSize);
+    // A full heap evicts its least-recently-bound entries (AllocTextureSlot,
+    // below); this early check exists so the untile and upload work is not done
+    // for a texture that will have nowhere to go. When even eviction cannot
+    // free a slot -- every entry bound within the last two frames -- degrade to
+    // a wrong-texture draw (the shader samples heap slot 0), never past-the-end:
+    // setTexture at the heap size wedged the render thread on the Deck -- slot
+    // 1023, then silence, two runs in a row.
+    if (reuse_slot == UINT32_MAX && g_free_slots.empty() &&
+        uint32_t(g_textures.size()) >= g_tex_cap &&
+        EvictTextures(std::max(1u, g_tex_cap / 64u)) == 0) {
+        static uint32_t reports = 0;
+        if ((reports++ % 600) == 0) {
+            REXLOG_WARN("plume: texture heap FULL ({} slots, all bound within two frames) -- "
+                        "new textures will draw wrong until pressure eases",
+                        g_tex_cap);
         }
         return UINT32_MAX;
     }
@@ -3070,8 +3167,8 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
 
     uint32_t slot = reuse_slot;
     if (slot == UINT32_MAX) {
-        slot = uint32_t(g_textures.size());
-        g_textures.push_back(nullptr);
+        slot = AllocTextureSlot();
+        if (slot == UINT32_MAX) return UINT32_MAX;
     }
     if (fresh != nullptr) {
         // The slot's previous texture (if any) outlives this call: draws already
@@ -3086,6 +3183,7 @@ uint32_t EnsureTexture(uint32_t sampler, const uint8_t* base, DecodedTexture& t)
 
     TexCache& c = g_texture_index[key];
     c.slot = slot;
+    c.last_used = g_frame_index + 1u;
     c.width = t.width;
     c.height = t.height;
     c.format = up.format;
@@ -6625,6 +6723,7 @@ void Shutdown() {
     g_index_state = IndexState::kNone;
     g_textures.clear();
     g_texture_index.clear();
+    g_free_slots.clear();
     g_tex_phys_lo = UINT32_MAX;
     g_tex_phys_hi = 0;
     // The views go before the texture they view, and both before the heap they
