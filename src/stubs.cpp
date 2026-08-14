@@ -75,6 +75,13 @@ DT_STUB_BLADE(__imp__XamShowGamerCardUI)
 DT_STUB_BLADE(__imp__XamShowMarketplaceUI)
 DT_STUB_BLADE(__imp__XamShowFriendsUI)
 DT_STUB_BLADE(__imp__XamShowMessageComposeUI)
+// The game has wrappers for these three as well (daytona_symbols.h, the
+// UiShow* table). Without an override here they resolve to the SDK's
+// REX_EXPORT_STUB -- success with no notification, the Achievements freeze by
+// another name -- for any menu path that reaches them.
+DT_STUB_BLADE(__imp__XamShowQuickChatUI)
+DT_STUB_BLADE(__imp__XamShowPlayerReviewUI)
+DT_STUB_BLADE(__imp__XamShowGameInviteUI)
 
 // ── Network stubs (offline — XNetConnect/GetConnectStatus no-op) ─────────────
 // Wrappers: NetXNetConnect, NetGetConnectStatus
