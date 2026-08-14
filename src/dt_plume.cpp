@@ -67,6 +67,9 @@
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_metal.h>
 #include <SDL3/SDL_init.h>
+// objc_msgSend, for reading and stamping the CAMetalLayer's drawableSize from
+// this C++ TU -- see DtSyncLayerDrawableSize.
+#include <objc/message.h>
 #endif
 
 namespace plume {
@@ -3898,9 +3901,51 @@ bool TrySwapchain(const char* reason) {
     return true;
 }
 
+#ifdef __APPLE__
+// The layer's drawableSize is the size of the drawables MoltenVK actually
+// hands back -- NOT the swapchain create-info extent. MoltenVK stamps the
+// layer once at swapchain creation, which is why windowed mode looks right;
+// but SDL's metal view re-stamps drawableSize to bounds x contentsScale on
+// every layout, and the SDK's window is created without
+// SDL_WINDOW_HIGH_PIXEL_DENSITY, so that stamp is the window size in POINTS.
+// A fullscreen transition is exactly a layout storm, so entering fullscreen
+// on a Retina display left the drawable at half the size the swapchain (and
+// the blit viewport) believed -- the window showed the top-left quarter of
+// the letterboxed frame, magnified 2x (user screenshot, beta 1.4).
+//
+// Re-stamping before every acquire makes ours the steady state: SDL only
+// writes on layout events, we write on every present. The log line doubles
+// as the diagnostic that confirmed the mechanism.
+struct DtCGSize { double w, h; };
+void DtSyncLayerDrawableSize() {
+    if (g_window.view == nullptr || g_swapchain == nullptr) return;
+    if (g_swapchain->getWidth() == 0 || g_swapchain->getHeight() == 0) return;
+    using GetSize = DtCGSize (*)(void*, SEL);
+    using SetSize = void (*)(void*, SEL, DtCGSize);
+    const auto get = reinterpret_cast<GetSize>(objc_msgSend);
+    const auto set = reinterpret_cast<SetSize>(objc_msgSend);
+    const DtCGSize want{double(g_swapchain->getWidth()), double(g_swapchain->getHeight())};
+    const DtCGSize have = get(g_window.view, sel_registerName("drawableSize"));
+    if (have.w == want.w && have.h == want.h) return;
+    set(g_window.view, sel_registerName("setDrawableSize:"), want);
+    static uint32_t logged = 0;
+    if (logged++ < 8) {
+        REXLOG_WARN("plume: metal layer drawableSize {:.0f}x{:.0f} != swapchain {:.0f}x{:.0f} "
+                    "-- re-stamped (SDL lays the layer out in points; MoltenVK sizes drawables "
+                    "from the layer)",
+                    have.w, have.h, want.w, want.h);
+    }
+}
+#endif
+
 bool EnsureSwapchainSized() {
     if (g_swapchain == nullptr) return false;
-    if (!g_swapchain->needsResize()) return true;
+    if (!g_swapchain->needsResize()) {
+#ifdef __APPLE__
+        DtSyncLayerDrawableSize();
+#endif
+        return true;
+    }
     // Nothing may still be executing against the old backbuffers. Only fences
     // that actually have a pending signal -- see WaitFence.
     WaitFence(g_fence, g_fence_pending);
@@ -3910,6 +3955,11 @@ bool EnsureSwapchainSized() {
     RebuildSwapchainTargets();
     REXLOG_WARN("plume: swapchain resized to {}x{} (frame is {}x{})",
                 g_swapchain->getWidth(), g_swapchain->getHeight(), kFrameW, kFrameH);
+#ifdef __APPLE__
+    // The acquire that follows this call must see the fresh extent on the
+    // layer, not whatever a layout event left there.
+    DtSyncLayerDrawableSize();
+#endif
     return !g_swapchain->needsResize();
 }
 
