@@ -7,13 +7,14 @@ live in the [README](README.md); version history is in [CHANGELOG.md](CHANGELOG.
 
 | OS | Build | Status |
 |----|-------|--------|
-| Windows (x64) | `win-amd64-release` preset (clang++ GNU driver, MSVC ABI) → `out/build/win-amd64-release` | ✅ v1.1.4 (SDK v0.9.2, D3D12) |
+| Windows (x64) | `build.ps1` (one shot: tools, SDK CLI, extract, regen, build), or by hand the `win-amd64-release` preset (clang++ GNU driver, MSVC ABI) → `out/build/win-amd64-release` | ✅ v1.1.4 (SDK v0.9.2, D3D12) |
 | Steam Deck / Linux (x64) | `linux-amd64-release` preset (any x64 Linux, WSL included) | ✅ v1.1.4 (Vulkan; boot-verified on device at beta 1.3) |
 | macOS (arm64) | `mac-arm64-release` preset on an Apple Silicon Mac, bundled by `mac-build/build_app.sh` | ✅ v1.1.4 (Vulkan over MoltenVK) |
 
 The `win-amd64-*` presets name `clang`/`clang++` with `-march=x86-64-v3` and
 target `x86_64-pc-windows-msvc`, so configure from a VS developer shell (MSVC
-headers and libs on `INCLUDE`/`LIB`, `rc.exe` on PATH). The `win-amd64-vulkan`
+headers and libs on `INCLUDE`/`LIB`, `rc.exe` on PATH); `build.ps1` enters one
+itself and puts the standalone LLVM first on PATH. The `win-amd64-vulkan`
 preset builds the Vulkan backend on Windows for debugging; it is not shipped.
 The `*-arm64` presets are untested.
 

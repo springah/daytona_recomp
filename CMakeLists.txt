@@ -29,7 +29,10 @@ cmake_minimum_required(VERSION 3.25)
 # behind the 4096 guard, so long sessions can no longer degrade for good), and
 # the three remaining Live blades (QuickChat, PlayerReview, GameInvite) get the
 # open/close notification handshake instead of the SDK's silent-success stub.
-project(daytona VERSION 1.1.4 LANGUAGES C CXX)
+# 1.1.5: build.ps1 / build.bat -- one command takes a fresh Windows clone to a
+# built daytona.exe (tools via winget, VS dev shell, SDK CLI, extractor, regen,
+# preset build); no runtime change.
+project(daytona VERSION 1.1.5 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

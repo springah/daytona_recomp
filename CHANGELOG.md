@@ -6,6 +6,25 @@ private download share). The `v1.1.x` line is the native-renderer port; `v1.0.x`
 was the stock SDK-renderer port it grew out of. See [PORTS.md](PORTS.md) for the
 per-platform build and packaging notes.
 
+## v1.1.5 — unreleased
+
+- **`build.ps1` / `build.bat` — one command from a fresh Windows clone to a
+  built `daytona.exe`.** The script does the README's Build section in order:
+  checks out the SDK and plume submodules if they are missing and repairs
+  libmspack's symlinks if they came out as text stubs, installs any missing
+  tool through winget (Git, Python 3, CMake, Ninja, LLVM 20+, VS 2022 Build
+  Tools with the C++ workload), enters the x64 developer environment the
+  clang++ build needs for the MSVC headers and `rc.exe`, builds the ReXGlue
+  CLI from the vendored SDK, extracts your content package with
+  `scripts/extract_game.py` (`-GameSource <package>`, or the only file in
+  `game/`; skipped when `assets/default.xex` and `extracted/` already exist),
+  runs `scripts/regen.sh`, then configures and builds the `win-amd64-<Config>`
+  preset. The two long compiles log to `out/build/*.log` instead of the
+  terminal and are summarised; `-Run` launches the result against
+  `extracted/`. `build.bat` is the double-clickable wrapper. Ported from the
+  sibling futari port's script; the renderer and runtime are unchanged from
+  v1.1.4.
+
 ## v1.1.4 — beta 1.4 — built 2026-08-14, published 2026-10-29
 
 The first release with prebuilt bundles attached, for Windows, Steam Deck /

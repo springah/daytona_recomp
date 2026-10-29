@@ -79,6 +79,26 @@ The package this tree was prepared against: title/media `XA-2845`, media ID
 
 ## Build
 
+### The short road (Windows): `build.ps1`
+
+```powershell
+git clone -c core.symlinks=true --recurse-submodules https://github.com/springah/daytona_recomp
+cd daytona_recomp
+.\build.ps1 -GameSource "D:\path\to\your\content\package" -Run
+```
+
+`build.ps1` (or a double-click on `build.bat`) does steps 1–4 below in one go:
+it fetches missing submodules and repairs libmspack's symlinks, installs any
+missing tool through winget (Git, Python 3, CMake, Ninja, LLVM, VS 2022 Build
+Tools with the C++ workload), enters the x64 developer environment, builds the
+ReXGlue CLI, extracts your package into `extracted/` + `assets/default.xex`
+(skipped when both already exist, so a bare `.\build.ps1` is a rebuild), runs
+`scripts/regen.sh`, and builds the `win-amd64-release` preset. `-Config Debug`
+or `RelWithDebInfo` picks another preset; `-NoInstall` reports missing tools
+instead of installing them. The compiler output goes to `out/build/*.log`
+rather than the terminal. The manual steps follow for Linux, macOS, and anyone
+who wants to see what the script does.
+
 ### 1. Clone (SDK included)
 
 ```sh
