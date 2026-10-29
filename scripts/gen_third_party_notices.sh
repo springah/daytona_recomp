@@ -130,4 +130,4 @@ emit() {
 }
 
 # Some vendored licence files are CRLF; ship one line ending.
-emit | tr -d ''
+emit | tr -d '\r'
