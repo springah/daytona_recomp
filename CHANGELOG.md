@@ -6,7 +6,7 @@ private download share). The `v1.1.x` line is the native-renderer port; `v1.0.x`
 was the stock SDK-renderer port it grew out of. See [PORTS.md](PORTS.md) for the
 per-platform build and packaging notes.
 
-## v1.1.5 — unreleased
+## v1.1.5 — 2026-10-29
 
 - **`build.ps1` / `build.bat` — one command from a fresh Windows clone to a
   built `daytona.exe`.** The script does the README's Build section in order:
