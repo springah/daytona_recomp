@@ -5,6 +5,9 @@ name: Guards
 #  - enforce springah/noreply commit identity (the repos were identity-scrubbed)
 on: [pull_request, push]
 
+permissions:
+  contents: read
+
 jobs:
   no-game-data:
     name: No copyrighted game data tracked
@@ -13,8 +16,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: Reject tracked game assets / dumps
         run: |
-          # Game data must live only in the gitignored assets/ + generated/ trees.
-          bad="$(git ls-files | grep -iE '(^|/)assets/|\.(xex|xexp|iso|wmv|xma|mrg|mrgc|bik)$' || true)"
+          # Game data must live only in the gitignored game/, extracted/, assets/ + generated/ trees.
+          bad="$(git ls-files | grep -iE '(^|/)(assets|game|extracted)/|\.(xex|xexp|iso|god|xwb|xsb|wmv|xma|mrg|mrgc|bik)$' || true)"
           if [ -n "$bad" ]; then
             echo "::error::game-data-like files are tracked (must stay gitignored):"
             echo "$bad"
@@ -40,16 +43,32 @@ jobs:
 
   identity:
     name: Commit identity (springah/noreply)
+    # Maintainer pushes only. Outside contributors have their own identities and
+    # must not be failed for it -- this guard exists to catch a local git config
+    # slip leaking a real address into a public repo, not to gate contributions.
+    if: github.event_name == 'push' && github.repository_owner == 'springah'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Reject non-springah author/committer on HEAD
+        with:
+          fetch-depth: 0
+      - name: Reject non-springah author/committer on pushed commits
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
         run: |
           ok="321120+springah@users.noreply.github.com"
+          # New-branch pushes report an all-zero "before"; fall back to HEAD only.
+          if [ -z "${BEFORE//0/}" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="-1 $AFTER"
+          else
+            range="$BEFORE..$AFTER"
+          fi
           fail=0
-          for role in ae ce; do
-            e="$(git log -1 --format="%${role}")"
-            if [ "$e" != "$ok" ]; then echo "::error::HEAD ${role} '$e' != $ok"; fail=1; fi
-          done
+          while read -r sha ae ce; do
+            [ -n "$sha" ] || continue
+            if [ "$ae" != "$ok" ]; then echo "::error::$sha author '$ae' != $ok"; fail=1; fi
+            if [ "$ce" != "$ok" ]; then echo "::error::$sha committer '$ce' != $ok"; fail=1; fi
+          done <<< "$(git log --format='%H %ae %ce' $range)"
           [ "$fail" -eq 0 ] && echo "identity OK"
           exit $fail

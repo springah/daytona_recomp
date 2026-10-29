@@ -5,9 +5,9 @@
 # to (re)generate it together with the recompiled sources under generated/.
 
 cmake_minimum_required(VERSION 3.25)
-# 1.1.x on this branch: the native renderer replaced the Xenos GPU plugin as the
-# default, which is a different product from the 1.0.x line that `main` still
-# builds. The two ship side by side from separate worktrees, so the version has
+# 1.1.x: the native renderer replaced the Xenos GPU plugin as the default,
+# which is a different product from the 1.0.x line (tags v1.0.0-v1.0.2, the
+# stock SDK-renderer port; `main` now tracks this branch). The version has
 # to say which one you are holding.
 #
 # 1.1.1 = beta 1.1: boot no longer serializes behind the swap guard (publish-

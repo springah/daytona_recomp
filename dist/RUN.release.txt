@@ -1,88 +1,113 @@
 Daytona USA (recompiled) - public build
-=======================================
-
-A statically recompiled PC build of the Xbox 360 XBLA release of Daytona USA.
-No game files are included. You must own the game and supply your own copy.
-
+Xbox 360 / XBLA (2011) statically recompiled for PC, Steam Deck and macOS. No
+game data is included - no content package, no game executable, no textures,
+no audio; you must own the game and supply your own copy. This build does
+contain the game's own program code, recompiled, so it is only for people who
+own the game: do not redistribute it.
+Releases, source and bug reports: https://github.com/springah/daytona_recomp
 
 ADD YOUR GAME
--------------
+  Daytona USA is an XBLA title, so there is no disc. What you need is the
+  LIVE / STFS content package for the game, copied off your OWN Xbox 360's
+  storage (it is a file with no extension and a long hexadecimal name; its
+  first four bytes are the letters LIVE). Then, with Python 3 installed:
 
-This is an XBLA title, so there is no disc image. What you need is the LIVE /
-STFS content package for Daytona USA, copied off your own Xbox 360 (the file
-usually has no extension and a long hexadecimal name; its first four bytes are
-the letters LIVE).
+    Windows:  drag the package onto extract_game.bat
+              (or copy it into this folder and double-click extract_game.bat)
+    Others:   python3 extract_game.py "<path to your package>"
 
-With Python 3 installed, from this folder:
+  That unpacks the package into assets\ next to the game executable - the
+  whole package, not just default.xex, because the game streams its data from
+  that folder. If the extractor says the file "is not an Xbox 360 LIVE/STFS
+  package", you pointed it at the wrong file: most likely an already-extracted
+  default.xex rather than the package that contains it.
 
-    python extract_game.py "<path to your STFS package>" --assets assets --out extracted
-
-That writes assets\default.xex, which is the only file the game needs to start.
-The extracted\ folder it also creates is just the unpacked contents of the
-package; you can delete it afterwards.
-
-If the extractor reports "is not an Xbox 360 LIVE/STFS package", you have
-pointed it at the wrong file - most likely an already-extracted default.xex
-rather than the package that contains it.
-
+  Already have the package extracted? Put its contents in assets\ so that
+  assets\default.xex and the rest of the files sit directly inside it.
 
 TO PLAY
--------
+  Once assets\ is populated, double-click daytona.exe. It auto-loads the
+  .\assets folder next to it - no launcher and nothing to configure first.
 
-Once assets\default.xex exists, double-click daytona.exe. It loads the .\assets
-folder next to it, so there is no launcher and no configuration to do first.
-
-The FIRST launch after a reboot is the slow one -- expect up to a minute before
-the title screen while Windows reads the game's files for the first time. After
-that it is roughly twenty seconds. Not frozen, just loading.
-
+  The FIRST launch after a reboot is the slow one: expect up to a minute
+  before the SEGA logo while the game's files are read for the first time.
+  After that it is roughly twenty seconds. Not frozen, just loading.
 
 REQUIREMENTS
-------------
+  - Windows 10/11 x64 with a Direct3D 12 GPU
+  - Microsoft Visual C++ Redistributable (x64):
+      https://aka.ms/vs/17/release/vc_redist.x64.exe
 
-Windows 10/11 x64, a Direct3D 12 capable GPU, and the Microsoft Visual C++
-Redistributable (x64):  https://aka.ms/vs/17/release/vc_redist.x64.exe
+macOS AND STEAM DECK / LINUX
+  The sections above are written for the Windows zip; the other bundles work
+  the same way with these differences:
+  - There is no extract_game.bat. Run the extractor from a terminal:
+      python3 extract_game.py "<path to your package>"
+    (python3 comes with macOS and every Linux distribution, SteamOS included).
+  - macOS: the bundle is Daytona.app. The game looks for assets/ next to its
+    executable INSIDE the app: right-click Daytona.app -> Show Package
+    Contents, and put assets/ in Contents/MacOS/ (or run the extractor with
+      --out Daytona.app/Contents/MacOS/assets --assets Daytona.app/Contents/MacOS/assets
+    from the folder that holds the app). Logs land there too. The app is
+    ad-hoc signed, not notarized: if macOS refuses to open it, right-click ->
+    Open once, or allow it under System Settings -> Privacy & Security.
+    Settings are in daytona.ini next to the executable, as on Windows.
+  - Steam Deck / Linux: unpack the tarball, put assets/ next to the daytona
+    binary, and start ./run.sh beside it (Desktop Mode: Konsole, or
+    double-click and choose Execute). It resolves its own directory, so the
+    folder can live anywhere. Needs a Vulkan driver and X11/XWayland (the
+    renderer presents into an X11 window). On the Deck, add run.sh to Steam
+    as a non-Steam game to run it from Game Mode. Needs glibc 2.38+ (any
+    2025 or later SteamOS). If it will not start, run.sh writes
+    deck-report.txt next to itself - send that with your report.
 
-
-THIS IS A BETA
---------------
-
-Known, and you do not need to report them:
-
-* Save Data and Records have had the least testing of any screens. If either
-  looks wrong, that is worth telling me about in detail.
-* Leaderboards correctly says you must connect to Xbox LIVE. There is no Xbox
-  LIVE; the game handles being offline on its own and this is what it does.
-* Achievements opens and closes immediately. There is no achievements blade in
-  this port, so it reports one that opened and closed rather than waiting for a
-  blade that will never appear.
-* The game runs at a fixed 60Hz internally. The `refresh_rate` setting in
-  daytona.ini is ignored on purpose -- honouring it would change GAME SPEED
-  rather than smoothness.
-
-Worth reporting, with as much detail as you can:
-
-* Anything that freezes, or stops updating while the window stays open.
-* Anything that looks wrong on screen: missing geometry, wrong colours, flicker,
-  HUD over the wrong thing, text that should not be there.
-* Sound that cuts out, distorts, or plays the wrong thing.
-* Please say what you were doing, which course, and attach the newest file from
-  the logs\ folder -- it records far more than the screen shows.
-
+CONTROLS
+  An Xbox controller works out of the box. Keyboard is basic: WASD = steer /
+  menus, Return = Start / A, Space = accelerate, Shift = brake. The settings
+  overlay (below) can rebind.
 
 SETTINGS AND LOGS
------------------
+  Press F4 (or Start+Select together on a pad) for the in-game settings
+  overlay: rebind controls, change display settings, and "Save to config"
+  writes daytona.ini for you.
 
-Press F4 (or Start+Select together on a pad) for the in-game settings
-overlay: rebind controls, change display settings, and Save to config
-writes daytona.ini for you.
+  Or edit daytona.ini next to the executable by hand, then restart - the file
+  is read at startup, not live. It covers window size, fullscreen, monitor,
+  vsync, letterbox and safe area under [Display]; filtering and upscaler under
+  [Graphics]; and log level under [Diagnostics]. Leave game_resolution at
+  1280x720 for authentic output - it is the guest render resolution, not the
+  window size. The game runs at a fixed 60 Hz internally; refresh_rate is
+  ignored on purpose, because honouring it would change GAME SPEED rather
+  than smoothness.
 
-Or edit daytona.ini next to the exe by hand, then restart - the file is read
-at startup, not live. It covers window size, fullscreen, monitor, vsync, letterbox
-and safe area under [Display]; filtering and upscaler under [Graphics]; and log
-level under [Diagnostics]. Leave game_resolution at 1280x720 for authentic
-output - it is the guest render resolution, not the window size.
+  Logs are written to logs/daytona_NNN.log next to the executable. If the
+  game fails to start, that file is the first thing to look at, and the most
+  useful thing to attach to a bug report.
 
-Logs are written to logs\daytona_NNN.log next to the exe. If the game fails to
-start, that file is the first thing to look at - and the most useful thing to
-attach to a bug report.
+STATUS - THIS IS A BETA
+  Boot, menus, attract and races all draw through the native renderer and
+  have been checked screen by screen against the emulated one. Known, and you
+  do not need to report:
+  * Save Data and Records have had the least testing of any screens. If
+    either looks wrong, that IS worth telling me about, in detail.
+  * Leaderboards says you must connect to Xbox LIVE. There is no Xbox LIVE;
+    the game handles being offline on its own and this is what it does.
+  * Achievements opens and closes immediately. There is no achievements blade
+    in this port, so it reports one that opened and closed rather than
+    waiting for a blade that will never appear.
+  * Steam Deck: boot is slower than the Windows build on the same content,
+    and everything past the title screen has had little testing on that
+    hardware.
+  Worth reporting, with as much detail as you can: anything that freezes or
+  stops updating while the window stays open; anything that looks wrong on
+  screen (missing geometry, wrong colours, flicker, HUD over the wrong thing);
+  sound that cuts out or distorts. Say what you were doing and which course,
+  and attach the newest file from logs/.
+
+LICENCES
+  This build links third-party open-source components (including FFmpeg and
+  libmspack under the LGPL-2.1). Their licences, and the LGPL's written offer
+  of source, are in THIRD-PARTY-NOTICES.txt beside this file.
+
+Built with heavy use of AI tooling. Hobby project, no warranty. SEGA owns all
+rights to Daytona USA.

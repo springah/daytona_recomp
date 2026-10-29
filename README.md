@@ -9,20 +9,35 @@ A static recompilation of **Daytona USA** (Xbox 360 / XBLA, 2011) for native PC
 execution, built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)
 (a Xenia-derived runtime + PPC→C++ recompiler).
 
-This branch (`native-renderer`) is the shipping product: the game's D3D9 calls
-are intercepted app-side and drawn through a **native renderer** ([plume](https://github.com/springah/plume)
-RHI -- D3D12 on Windows, Vulkan on Linux/Steam Deck, Vulkan-over-MoltenVK on
-macOS) instead of Xenos GPU emulation. The whole game renders this way -- boot,
-menus, attract, races -- referee-verified against the emulated renderer screen
-by screen. The `main` branch is the stock ReXGlue port it grew out of.
+The game's D3D9 calls are intercepted app-side and drawn through a **native
+renderer** ([plume](https://github.com/springah/plume) RHI -- D3D12 on Windows,
+Vulkan on Linux/Steam Deck, Vulkan-over-MoltenVK on macOS) instead of Xenos GPU
+emulation. The whole game renders this way -- boot, menus, attract, races --
+referee-verified against the emulated renderer screen by screen. The emulated
+renderer is still built (`--gpu_plugin=xenos`) and serves as the reference. The
+`native-renderer` branch is the product and the default; `main` tracks it. The
+stock SDK-renderer port this grew out of is the `v1.0.x` tag line.
 
 No copyrighted game files are included. This tree excludes the extracted game
 directory, `default.xex`, media archives, audio, images, and build outputs — you
-supply your own legally obtained Daytona USA XBLA package.
+supply your own legally obtained Daytona USA XBLA package. See
+[Legal](#legal) below for what the release bundles do and do not contain.
 
 This is one of a family of Xbox 360 recomps built on the ReXGlue SDK; daytona
 pins a tagged SDK release as a submodule, like its sibling ports (futari, gh,
-guwange, sdoj, sotn).
+guwange, sdoj, sotn). Version history is in [CHANGELOG.md](CHANGELOG.md);
+per-OS build and packaging notes are in [PORTS.md](PORTS.md).
+
+## Just want to play?
+
+Each [GitHub Release](https://github.com/springah/daytona_recomp/releases)
+carries a prebuilt bundle per platform: a Windows zip, a Steam Deck / Linux
+tarball and a macOS app. They contain the port and the game's own program code
+recompiled, so they are **for people who own the game only**, and they contain
+no game *data*: you add your own XBLA content package after unpacking. The
+`RUN.txt` inside each bundle walks through it (on Windows: drag your package
+onto `extract_game.bat`, then double-click `daytona.exe`). Everything below is
+for building from source.
 
 ## Prerequisites
 
@@ -52,7 +67,11 @@ python3 scripts/extract_game.py
 
 This unpacks the package into `extracted/` (the runtime game data, passed via
 `--game_data_root`) and copies the shell executable to `assets/default.xex` (the
-codegen input). `game/`, `extracted/`, and `assets/` are gitignored.
+codegen input). `game/`, `extracted/`, and `assets/` are gitignored. On Windows,
+dragging the package onto `extract_game.bat` does the same, except that it
+unpacks everything into `assets/` beside the executable, which is the layout a
+release bundle runs from (the same script, flattened next to `daytona.exe`,
+defaults to that layout).
 
 The package this tree was prepared against: title/media `XA-2845`, media ID
 `3CA562D4`, 240058368 bytes, sha256
@@ -147,13 +166,19 @@ CMakeLists.txt          links rex::runtime via generated/rexglue.cmake
 CMakePresets.json       win-amd64 / linux-amd64 presets (SDK from the submodule)
 daytona_manifest.toml   ReXGlue codegen manifest
 daytona_functions.toml  function-entry seeds + analysis tuning
-src/                    host sources (main.cpp, stubs.cpp, keyboard_driver, debug)
+src/                    host sources (main.cpp, stubs.cpp, dt_plume.cpp native renderer,
+                        dt_d3d9_hooks.cpp hook layer, gpu_plume/ ring-drain GPU plugin)
 ppc/                    local PPC detail headers (PPC_INCLUDE_DETAIL)
+shaders/                native-renderer shader sources
 scripts/regen.sh        codegen driver
-scripts/extract_game.py STFS package extractor
+scripts/extract_game.py STFS package extractor (extract_game.bat wraps it on Windows)
+scripts/gen_third_party_notices.sh  regenerates THIRD-PARTY-NOTICES.txt from the submodules
+dist/                   files that ship in a bundle: RUN.release.txt, run.sh (Deck launcher)
+mac-build/build_app.sh  assembles Daytona.app from the mac-arm64 build
 generated/              codegen output (gitignored, regenerate via regen.sh)
 thirdparty/rexglue-sdk  ReXGlue SDK submodule, pinned at a tagged release
 thirdparty/plume        plume rendering abstraction submodule
+thirdparty/smol-v       SPIR-V compression (Vulkan path)
 ```
 
 ## Roadmap
@@ -173,4 +198,41 @@ thirdparty/plume        plume rendering abstraction submodule
 
 - [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) — Xbox 360 runtime + recompiler (Xenia-derived)
 - [Xenia](https://github.com/xenia-project) — the emulator ReXGlue's runtime is rooted in
+- [plume](https://github.com/renderbag/plume) — the render interface the native renderer is written against
 - Original Daytona USA recompilation work by Subarasheese
+
+## Legal
+
+Daytona USA, and all of its code, data, audio, and artwork, are the property of
+SEGA. This project is not affiliated with, endorsed by, or connected to SEGA in
+any way.
+
+Nothing here is a substitute for owning the game:
+
+- **No game data is distributed.** No content package, no game executable, no
+  textures, no audio, no artwork off the console — not here and not in the
+  release bundles. The port is inert without a package you provide. The only
+  game-derived file in this repository is the application icon, for
+  identification; see [NOTICE.md](NOTICE.md).
+- **The recompiled C++ is produced on your machine, from your own package.** It
+  is a translation of SEGA's executable code, so it belongs to you no more than
+  the game does. Don't redistribute it. The release bundles necessarily contain
+  it, compiled, and are inert without a package you provide. They are published
+  on the same footing as other recompilation projects: for people who already
+  own the game. If you don't own it, don't download them.
+- **Do not ask for game files.** Requests for packages, links, or "where do I
+  get default.xex" will be closed. The only supported route is the game's
+  content package copied off your own console.
+
+## Licence
+
+The contents of this repository — the host app and native renderer, the
+tooling, the codegen inputs, the build files, and the docs — are under the
+[BSD 3-Clause licence](LICENSE), matching the SDK's own licence and the Xenia
+lineage behind it. That licence covers **this repository only**; it grants no
+rights whatsoever to the game, or to the recompiled code generated from it.
+[NOTICE.md](NOTICE.md) spells out exactly what is and is not covered, and
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) carries the licences of
+everything a binary bundle links.
+
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).

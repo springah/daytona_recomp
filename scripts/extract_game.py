@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 
 
@@ -149,8 +150,28 @@ def extract_file(package: Path, entry: Entry, destination: Path) -> None:
                 logical_block = next_block(source, logical_block)
 
 
-def find_default_package(repo_root: Path) -> Path:
-    game_dir = repo_root / "game"
+def is_live_package(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            return f.read(4) == b"LIVE"
+    except OSError:
+        return False
+
+
+def find_default_package(root: Path, in_bundle: bool) -> Path:
+    if in_bundle:
+        # Release bundle: the package was dropped into this folder. Identify it
+        # by content, since it usually has no extension.
+        candidates = sorted(p for p in root.iterdir() if p.is_file() and is_live_package(p))
+        if not candidates:
+            raise RuntimeError(
+                "no LIVE/STFS package found in this folder; drop your Daytona USA "
+                "content package here or pass its path"
+            )
+        if len(candidates) > 1:
+            raise RuntimeError("several LIVE/STFS packages found here; pass the package path explicitly")
+        return candidates[0]
+    game_dir = root / "game"
     if not game_dir.is_dir():
         raise RuntimeError("no game/ directory found; place the XBLA package there first")
     candidates = sorted(path for path in game_dir.iterdir() if path.is_file())
@@ -162,29 +183,38 @@ def find_default_package(repo_root: Path) -> Path:
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parents[1]
+    # Two layouts. In the repository this file lives in scripts/ and the
+    # defaults point at the repo root: game/ in, extracted/ + assets/ out
+    # (extracted/ is the game data root for a build-dir run, assets/ holds the
+    # codegen input). In a release bundle it sits flat beside the executable,
+    # and everything goes into assets/ next to it: the package contents ARE the
+    # game data root the executable loads by default, default.xex included.
+    script_dir = Path(__file__).resolve().parent
+    in_bundle = script_dir.name != "scripts"
+    root = script_dir if in_bundle else script_dir.parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "package",
         nargs="?",
         type=Path,
-        help="Path to the local XBLA LIVE/STFS package. Defaults to the only file in game/.",
+        help="Path to the local XBLA LIVE/STFS package. Defaults to the only file in game/ "
+        "(repository) or the only LIVE package in this folder (release bundle).",
     )
     parser.add_argument(
         "--out",
         type=Path,
-        default=repo_root / "extracted",
-        help="Directory for extracted package contents.",
+        default=root / ("assets" if in_bundle else "extracted"),
+        help="Directory for extracted package contents (the game data root).",
     )
     parser.add_argument(
         "--assets",
         type=Path,
-        default=repo_root / "assets",
+        default=root / "assets",
         help="Directory that receives default.xex for ReXGlue.",
     )
     args = parser.parse_args()
 
-    package = (args.package or find_default_package(repo_root)).resolve()
+    package = (args.package or find_default_package(root, in_bundle)).resolve()
     with package.open("rb") as f:
         if f.read(4) != b"LIVE":
             raise RuntimeError(f"{package} is not an Xbox 360 LIVE/STFS package")
@@ -209,12 +239,21 @@ def main() -> int:
 
     args.assets.mkdir(parents=True, exist_ok=True)
     asset_xex = args.assets / "default.xex"
-    asset_xex.write_bytes(default_xex.read_bytes())
+    if asset_xex.resolve() != default_xex.resolve():
+        asset_xex.write_bytes(default_xex.read_bytes())
 
     print(f"Extracted {extracted} files to {args.out}")
     print(f"Wrote {asset_xex}")
+    if in_bundle:
+        print("Done. Start the game from this folder (daytona.exe, run.sh or Daytona.app).")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        # The people running this from a release bundle are not here to read a
+        # traceback; the message says what to do.
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
