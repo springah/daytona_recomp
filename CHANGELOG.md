@@ -6,9 +6,7 @@ private download share). The `v1.1.x` line is the native-renderer port; `v1.0.x`
 was the stock SDK-renderer port it grew out of. See [PORTS.md](PORTS.md) for the
 per-platform build and packaging notes.
 
-## Unreleased
-
-On the source tree, not in a release bundle yet.
+## v1.1.6 — 2026-11-20
 
 - **No more crash after a failed launch.** Starting the game without its files
   shows the "Entrypoint XEX not found" box; pressing OK then crashed with heap
@@ -19,7 +17,7 @@ On the source tree, not in a release bundle yet.
   at the upstream repository, which does not contain the pinned commit, so a
   fresh `git clone --recurse-submodules` failed. It now points at the public
   [springah/rexglue-sdk](https://github.com/springah/rexglue-sdk) fork. Tags up
-  to v1.1.5 keep the old pointer and cannot fetch the SDK; build from `main`.
+  to v1.1.5 keep the old pointer and cannot fetch the SDK; build v1.1.6 or later.
 
 ## v1.1.5 — 2026-10-29
 

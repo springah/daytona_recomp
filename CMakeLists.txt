@@ -32,7 +32,10 @@ cmake_minimum_required(VERSION 3.25)
 # 1.1.5: build.ps1 / build.bat -- one command takes a fresh Windows clone to a
 # built daytona.exe (tools via winget, VS dev shell, SDK CLI, extractor, regen,
 # preset build); no runtime change.
-project(daytona VERSION 1.1.5 LANGUAGES C CXX)
+# 1.1.6: the SDK no longer crashes on the way out after a failed launch (the
+# "Entrypoint XEX not found" box), and the SDK submodule points at the public
+# springah/rexglue-sdk fork so a fresh recursive clone can fetch it.
+project(daytona VERSION 1.1.6 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
