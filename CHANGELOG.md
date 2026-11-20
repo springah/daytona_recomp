@@ -6,6 +6,21 @@ private download share). The `v1.1.x` line is the native-renderer port; `v1.0.x`
 was the stock SDK-renderer port it grew out of. See [PORTS.md](PORTS.md) for the
 per-platform build and packaging notes.
 
+## Unreleased
+
+On the source tree, not in a release bundle yet.
+
+- **No more crash after a failed launch.** Starting the game without its files
+  shows the "Entrypoint XEX not found" box; pressing OK then crashed with heap
+  corruption (0xC0000374), because the SDK destroyed the window before the
+  input drivers that still pointed at it. It now exits cleanly. v1.1.5 and
+  earlier have the crash. SDK fork commit ee8448e.
+- **Building from source works for everyone again.** The SDK submodule pointed
+  at the upstream repository, which does not contain the pinned commit, so a
+  fresh `git clone --recurse-submodules` failed. It now points at the public
+  [springah/rexglue-sdk](https://github.com/springah/rexglue-sdk) fork. Tags up
+  to v1.1.5 keep the old pointer and cannot fetch the SDK; build from `main`.
+
 ## v1.1.5 — 2026-10-29
 
 - **`build.ps1` / `build.bat` — one command from a fresh Windows clone to a

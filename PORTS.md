@@ -20,10 +20,12 @@ The `*-arm64` presets are untested.
 
 ## SDK and renderer pins
 
-All builds link the `thirdparty/rexglue-sdk` submodule, **pinned at a tagged
-upstream release** (currently v0.9.2 of
-[rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk)); binaries stamp
-`rexglue-v0.9.2-Release`. `cmake --preset win-amd64-release` resolves it with no
+All builds link the `thirdparty/rexglue-sdk` submodule, **pinned at a recorded
+commit** of the [springah/rexglue-sdk](https://github.com/springah/rexglue-sdk)
+fork of [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk): its
+v0.9.2 tag plus one fix (branch `daytona/exit-fix`, `ee8448e` plus a CI-only commit: a clean exit
+instead of a crash after a failed launch). Binaries stamp the SDK version they
+were built from. `cmake --preset win-amd64-release` resolves it with no
 flags or env vars; `-DREXSDK_DIR=<path>` overrides it with a live checkout.
 
 The native renderer is written against `thirdparty/plume`, pinned at a commit on

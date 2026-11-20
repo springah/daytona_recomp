@@ -106,8 +106,9 @@ git clone -c core.symlinks=true --recurse-submodules <repo-url> daytona_recomp
 ```
 
 The [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) is a submodule at
-`thirdparty/rexglue-sdk`, **pinned at a tagged release** (currently v0.9.2) so
-every build links a recorded SDK SHA. To develop against a live SDK checkout
+`thirdparty/rexglue-sdk`, **pinned at a recorded commit** of the
+[springah/rexglue-sdk](https://github.com/springah/rexglue-sdk) fork (currently
+v0.9.2 plus one fix) so every build links a recorded SDK SHA. To develop against a live SDK checkout
 instead, set `REXSDK_DIR` to it at configure time (step 4) — when unset, the
 build uses the submodule.
 
