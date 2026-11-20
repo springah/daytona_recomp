@@ -35,7 +35,10 @@ cmake_minimum_required(VERSION 3.25)
 # 1.1.6: the SDK no longer crashes on the way out after a failed launch (the
 # "Entrypoint XEX not found" box), and the SDK submodule points at the public
 # springah/rexglue-sdk fork so a fresh recursive clone can fetch it.
-project(daytona VERSION 1.1.6 LANGUAGES C CXX)
+# 1.1.7: a failed launch could still hang on the way out (about one run in
+# ten); it now exits at once. The binaries no longer record the build
+# machine's source paths or library run-paths.
+project(daytona VERSION 1.1.7 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,6 +50,24 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT REXSDK_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/rexglue-sdk/CMakeLists.txt")
     set(REXSDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/rexglue-sdk"
         CACHE PATH "Path to rexglue-sdk source tree" FORCE)
+endif()
+
+# Keep the build machine's directory names out of the binaries. Assertions, log
+# calls and debug info record source paths; map the tree's root to "." so they
+# read "./src/main.cpp" rather than the full path of whoever built it. This has
+# to come before the SDK is added below, so that its targets get the flag too.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    set(_path_maps "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.")
+    cmake_path(IS_PREFIX CMAKE_SOURCE_DIR "${REXSDK_DIR}" NORMALIZE _sdk_in_tree)
+    if(REXSDK_DIR AND NOT _sdk_in_tree)
+        list(APPEND _path_maps "-ffile-prefix-map=${REXSDK_DIR}=./rexglue-sdk")
+    endif()
+    foreach(_map IN LISTS _path_maps)
+        if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            set(_map "/clang:${_map}")  # clang-cl spelling
+        endif()
+        add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:${_map}>")
+    endforeach()
 endif()
 
 # generated/ is derived and gitignored, so a fresh clone configures against a
@@ -152,6 +173,26 @@ set_target_properties(rexgpu-plume PROPERTIES
 target_link_libraries(rexgpu-plume PRIVATE rexruntime)
 
 rexglue_setup_target(daytona GPU_PLUGINS xenos plume)
+
+# Same idea for the run-paths the linker records in the shared libraries. The
+# SDK's libraries are built outside this build tree, so CMake would write their
+# absolute directory into every library that links them. They are only ever
+# loaded from beside the executable, so point them there instead.
+if(UNIX)
+    if(APPLE)
+        set(_self_rpath "@loader_path")
+    else()
+        set(_self_rpath "$ORIGIN")
+    endif()
+    foreach(_lib rexruntime rexgpu-xenos rexgpu-plume)
+        if(TARGET ${_lib})
+            set_target_properties(${_lib} PROPERTIES
+                BUILD_WITH_INSTALL_RPATH ON
+                INSTALL_RPATH "${_self_rpath}"
+                INSTALL_RPATH_USE_LINK_PATH OFF)
+        endif()
+    endforeach()
+endif()
 
 # Version for the window title (see main.cpp OnPreLaunchModule). Passed unquoted
 # and stringized in-source so it survives both the clang-cl and clang++ drivers.

@@ -7,9 +7,9 @@ live in the [README](README.md); version history is in [CHANGELOG.md](CHANGELOG.
 
 | OS | Build | Status |
 |----|-------|--------|
-| Windows (x64) | `build.ps1` (one shot: tools, SDK CLI, extract, regen, build), or by hand the `win-amd64-release` preset (clang++ GNU driver, MSVC ABI) → `out/build/win-amd64-release` | ✅ v1.1.6 (SDK v0.9.2 + 1 fix, D3D12) |
-| Steam Deck / Linux (x64) | `linux-amd64-release` preset (any x64 Linux, WSL included) | ✅ v1.1.6 (Vulkan; this tarball was not booted on a Deck, the v1.1.5 one was) |
-| macOS (arm64) | `mac-arm64-release` preset on an Apple Silicon Mac, bundled by `mac-build/build_app.sh` | ✅ v1.1.6 (Vulkan over MoltenVK) |
+| Windows (x64) | `build.ps1` (one shot: tools, SDK CLI, extract, regen, build), or by hand the `win-amd64-release` preset (clang++ GNU driver, MSVC ABI) → `out/build/win-amd64-release` | ✅ v1.1.7 (SDK v0.9.2 + 2 fixes, D3D12) |
+| Steam Deck / Linux (x64) | `linux-amd64-release` preset (any x64 Linux, WSL included) | ✅ v1.1.7 (Vulkan; this tarball was run under WSL only, not booted on a Deck; the v1.1.5 one was) |
+| macOS (arm64) | `mac-arm64-release` preset on an Apple Silicon Mac, bundled by `mac-build/build_app.sh` | ✅ v1.1.7 (Vulkan over MoltenVK) |
 
 The `win-amd64-*` presets name `clang`/`clang++` with `-march=x86-64-v3` and
 target `x86_64-pc-windows-msvc`, so configure from a VS developer shell (MSVC
@@ -23,8 +23,10 @@ The `*-arm64` presets are untested.
 All builds link the `thirdparty/rexglue-sdk` submodule, **pinned at a recorded
 commit** of the [springah/rexglue-sdk](https://github.com/springah/rexglue-sdk)
 fork of [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk): its
-v0.9.2 tag plus one fix (branch `daytona/exit-fix`, `ee8448e` plus a CI-only commit: a clean exit
-instead of a crash after a failed launch). Binaries stamp the SDK version they
+v0.9.2 tag plus two fixes and a CI-only commit (branch `daytona/exit-fix`):
+`ee8448e`, no crash on the way out after a failed launch, and `c45b097`, a
+failed launch ends the process directly instead of going through a teardown
+that could hang. Binaries stamp the SDK version they
 were built from. `cmake --preset win-amd64-release` resolves it with no
 flags or env vars; `-DREXSDK_DIR=<path>` overrides it with a live checkout.
 
@@ -123,7 +125,11 @@ sibling futari port):
    from Windows, so the Unix mode bits survive and `run.sh` and `daytona`
    arrive executable.
 6. **No absolute paths in anything that ships.** `run.sh` resolves its own
-   location; `daytona.ini` has none.
+   location; `daytona.ini` has none. Since v1.1.7 that covers the binaries too:
+   the build maps the source tree to `.` (`-ffile-prefix-map`) and gives the
+   shared libraries a run-path beside themselves. Search the staged binaries
+   for the build machine's home directory before zipping; there should be no
+   hit.
 7. **Check what a bundle actually contains, not what you meant to put in it.**
    `strings <binary> | grep rexglue-v` reports the SDK each component was built
    against, and `Daytona USA v` the port version; every component in a bundle

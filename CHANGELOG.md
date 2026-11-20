@@ -6,6 +6,23 @@ private download share). The `v1.1.x` line is the native-renderer port; `v1.0.x`
 was the stock SDK-renderer port it grew out of. See [PORTS.md](PORTS.md) for the
 per-platform build and packaging notes.
 
+## v1.1.7 — 2026-11-20
+
+- **A failed launch no longer hangs on the way out.** v1.1.6 stopped the crash
+  after the "Entrypoint XEX not found" box, but about one time in ten the
+  process then stayed behind as a window that had stopped responding: the SDK's
+  shutdown force-ended its audio thread, and when that thread happened to hold
+  a lock the shutdown waited on it forever. A failed launch now ends the
+  process directly, as closing the window already does. Checked on Windows
+  with 38 failed launches in a row (v1.1.6: 2 hangs in 10). SDK fork commit
+  c45b097.
+- **The binaries no longer record where they were built.** The executable and
+  the runtime carried the full source paths of the build machine (the compiler
+  writes them for log and assertion messages), and the Linux and macOS
+  libraries also carried that machine's library directory as a run-path. Source
+  paths now read `./src/...` and the libraries look beside themselves. Nothing
+  changes in how the game runs.
+
 ## v1.1.6 — 2026-11-20
 
 - **No more crash after a failed launch.** Starting the game without its files
