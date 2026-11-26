@@ -7,9 +7,9 @@ live in the [README](README.md); version history is in [CHANGELOG.md](CHANGELOG.
 
 | OS | Build | Status |
 |----|-------|--------|
-| Windows (x64) | `build.ps1` (one shot: tools, SDK CLI, extract, regen, build), or by hand the `win-amd64-release` preset (clang++ GNU driver, MSVC ABI) → `out/build/win-amd64-release` | ✅ v1.1.7 (SDK v0.9.2 + 2 fixes, D3D12) |
-| Steam Deck / Linux (x64) | `linux-amd64-release` preset (any x64 Linux, WSL included) | ✅ v1.1.7 (Vulkan; this tarball was run under WSL only, not booted on a Deck; the v1.1.5 one was) |
-| macOS (arm64) | `mac-arm64-release` preset on an Apple Silicon Mac, bundled by `mac-build/build_app.sh` | ✅ v1.1.7 (Vulkan over MoltenVK) |
+| Windows (x64) | `build.ps1` (one shot: tools, SDK CLI, extract, regen, build), or by hand the `win-amd64-release` preset (clang++ GNU driver, MSVC ABI) → `out/build/win-amd64-release` | ✅ v1.1.8 (SDK v0.9.2 + 3 changes, D3D12) |
+| Steam Deck / Linux (x64) | `linux-amd64-release` preset (any x64 Linux, WSL included) | ✅ v1.1.7 (Vulkan; this tarball was run under WSL only, not booted on a Deck; the v1.1.5 one was). v1.1.8 is not built or bundled for Linux yet |
+| macOS (arm64) | `mac-arm64-release` preset on an Apple Silicon Mac, bundled by `mac-build/build_app.sh` | ✅ v1.1.7 (Vulkan over MoltenVK). v1.1.8 is not built or bundled for macOS yet |
 
 The `win-amd64-*` presets name `clang`/`clang++` with `-march=x86-64-v3` and
 target `x86_64-pc-windows-msvc`, so configure from a VS developer shell (MSVC
@@ -23,10 +23,12 @@ The `*-arm64` presets are untested.
 All builds link the `thirdparty/rexglue-sdk` submodule, **pinned at a recorded
 commit** of the [springah/rexglue-sdk](https://github.com/springah/rexglue-sdk)
 fork of [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk): its
-v0.9.2 tag plus two fixes and a CI-only commit (branch `daytona/exit-fix`):
-`ee8448e`, no crash on the way out after a failed launch, and `c45b097`, a
+v0.9.2 tag plus three changes and a CI-only commit (branch `daytona/exit-fix`):
+`ee8448e`, no crash on the way out after a failed launch; `c45b097`, a
 failed launch ends the process directly instead of going through a teardown
-that could hang. Binaries stamp the SDK version they
+that could hang; and `0a99596`, the app can own the settings overlay's "Save
+to config" and set a GPU plugin's setting before the plugin is loaded.
+Binaries stamp the SDK version they
 were built from. `cmake --preset win-amd64-release` resolves it with no
 flags or env vars; `-DREXSDK_DIR=<path>` overrides it with a live checkout.
 

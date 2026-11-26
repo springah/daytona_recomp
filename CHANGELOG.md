@@ -6,6 +6,31 @@ private download share). The `v1.1.x` line is the native-renderer port; `v1.0.x`
 was the stock SDK-renderer port it grew out of. See [PORTS.md](PORTS.md) for the
 per-platform build and packaging notes.
 
+## v1.1.8 — 2026-11-27
+
+- **"Save to config" no longer wipes daytona.ini** (issue #4). The settings
+  overlay's save replaced the whole file with a flat list of the changed
+  settings, so every section and comment was lost. It now writes each setting
+  back into its own section and keeps the rest of the file. A file that an
+  earlier save flattened is repaired by the next save.
+- **Settings the native renderer ignores now say so** (issue #4). `vsync`,
+  `internal_resolution_scale` and `anisotropic_filtering` belong to the emulated
+  renderer (`--gpu_plugin=xenos`). The default native renderer draws a 1280x720
+  frame and scales it to the window, so those three do nothing there; the log
+  and the comments in daytona.ini now say that. On the emulated renderer they
+  were read and then dropped; they now apply.
+- **A way to quit without Alt+F4** (issue #5). The settings overlay (F4, or
+  Start+Select on a pad) has a "Quit game" button with a confirm step, and
+  holding Start+Select for 3 seconds quits from a pad. Both take the same path
+  as closing the window.
+- How it was checked: by scripted runs on Windows only. The save was run at
+  boot against the real settings (`DT_SAVE_INI=1`) and read back on the next
+  start; the quit path was run on a timer (`DT_QUIT_AFTER=<seconds>`). Nobody
+  has clicked the two buttons or held the pad chord yet. SDK fork commit
+  0a99596.
+- Windows bundle only for now. The Steam Deck and macOS bundles of v1.1.7
+  remain the latest for those platforms.
+
 ## v1.1.7 — 2026-11-20
 
 - **A failed launch no longer hangs on the way out.** v1.1.6 stopped the crash

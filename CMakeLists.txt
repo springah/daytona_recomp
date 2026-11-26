@@ -38,7 +38,10 @@ cmake_minimum_required(VERSION 3.25)
 # 1.1.7: a failed launch could still hang on the way out (about one run in
 # ten); it now exits at once. The binaries no longer record the build
 # machine's source paths or library run-paths.
-project(daytona VERSION 1.1.7 LANGUAGES C CXX)
+# 1.1.8: the overlay's "Save to config" keeps daytona.ini's sections and
+# comments instead of flattening the file; ini keys the native renderer
+# ignores say so; "Quit game" in the overlay and a Start+Select hold on a pad.
+project(daytona VERSION 1.1.8 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
