@@ -69,7 +69,8 @@ CONTROLS
 SETTINGS AND LOGS
   Press F4 (or Start+Select together on a pad) for the in-game settings
   overlay: rebind controls, change display settings, and "Save to config"
-  writes daytona.ini for you.
+  writes daytona.ini for you. The overlay also has a "Quit game" button; on a
+  pad, hold Start+Select for 3 seconds to quit.
 
   Or edit daytona.ini next to the executable by hand, then restart - the file
   is read at startup, not live. It covers window size, fullscreen, monitor,

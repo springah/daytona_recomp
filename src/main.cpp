@@ -34,6 +34,7 @@
 // same path a keyboard press would.
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keycode.h>
+#include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 
 #include <algorithm>
@@ -42,6 +43,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <map>
+#include <set>
+#include <vector>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -153,6 +158,30 @@ void SetCvarBool(std::string_view name, bool value) {
     SetCvar(name, value ? "true" : "false");
 }
 
+// Ini settings whose cvar is owned by the Xenos GPU plugin (vsync,
+// resolution_scale, anisotropic_override). That DLL is only loaded for
+// --gpu_plugin=xenos, so under the default plume renderer the cvar does not
+// exist and a plain SetFlagByName fails without a word -- which is how these
+// keys used to be "read" and then dropped. They are deferred instead (applied
+// if the plugin registers them), and the ones that ask for something other than
+// the shipped default are noted for OnPreSetup to report.
+struct GpuPluginIniSetting {
+    std::string text;   // "key = value" as the ini has it
+    std::string cvar;
+};
+std::vector<GpuPluginIniSetting> g_ini_gpu_plugin_only;
+
+void SetGpuPluginCvar(std::string_view ini_key, std::string_view ini_value, std::string_view name,
+                      std::string_view value, bool is_shipped_default) {
+    if (is_shipped_default) {
+        SetCvar(name, value);
+        return;
+    }
+    rex::cvar::SetFlagByNameOrDefer(name, value);
+    g_ini_gpu_plugin_only.push_back(
+        {std::string(ini_key) + " = " + Trim(ini_value), std::string(name)});
+}
+
 void WriteDefaultIni(const std::filesystem::path& path) {
     if (std::filesystem::exists(path)) {
         return;
@@ -174,6 +203,8 @@ void WriteDefaultIni(const std::filesystem::path& path) {
         << "game_resolution = 1280x720\n"
         << "fullscreen = false\n"
         << "monitor = 0\n"
+        << "# Emulated renderer only (--gpu_plugin=xenos); the default native\n"
+        << "# renderer ignores it.\n"
         << "vsync = true\n"
         << "# The game runs at a fixed 60Hz and paces its own logic off that, so\n"
         << "# this is ignored: changing it would change GAME SPEED, not smoothness.\n"
@@ -184,6 +215,9 @@ void WriteDefaultIni(const std::filesystem::path& path) {
         << "safe_area_y = 100\n"
         << "\n"
         << "[Graphics]\n"
+        << "# internal_resolution_scale and anisotropic_filtering apply to the\n"
+        << "# emulated renderer only (--gpu_plugin=xenos). The default native\n"
+        << "# renderer draws a 1280x720 frame and scales it to the window.\n"
         << "internal_resolution_scale = 1\n"
         << "# off, app, 1, 2, 4, 8, 16\n"
         << "anisotropic_filtering = app\n"
@@ -300,7 +334,9 @@ DaytonaIniSettings LoadDaytonaIni(const std::filesystem::path& exe_dir,
         if (auto value = ParseInt(it->second)) SetCvarInt("monitor", ClampInt(*value, 0, 16));
     }
     if (auto it = values.find("display.vsync"); it != values.end()) {
-        if (auto value = ParseBool(it->second)) SetCvarBool("vsync", *value);
+        if (auto value = ParseBool(it->second)) {
+            SetGpuPluginCvar("vsync", it->second, "vsync", *value ? "true" : "false", *value);
+        }
     }
     // display.refresh_rate is deliberately NOT wired to video_mode_refresh_rate
     // any more. That cvar is the GUEST's video mode -- a console property -- and
@@ -338,11 +374,15 @@ DaytonaIniSettings LoadDaytonaIni(const std::filesystem::path& exe_dir,
 
     if (auto it = values.find("graphics.internal_resolution_scale"); it != values.end()) {
         if (auto value = ParseInt(it->second)) {
-            SetCvarInt("resolution_scale", ClampInt(*value, 1, 8));
+            const int32_t scale = ClampInt(*value, 1, 8);
+            SetGpuPluginCvar("internal_resolution_scale", it->second, "resolution_scale",
+                             std::to_string(scale), scale == 1);
         }
     }
     if (auto it = values.find("graphics.anisotropic_filtering"); it != values.end()) {
-        SetCvarInt("anisotropic_override", ParseAnisotropic(it->second));
+        const int32_t level = ParseAnisotropic(it->second);
+        SetGpuPluginCvar("anisotropic_filtering", it->second, "anisotropic_override",
+                         std::to_string(level), level == -1);
     }
     if (auto it = values.find("graphics.upscaler"); it != values.end()) {
         SetCvar("present_effect", Lower(Trim(it->second)));
@@ -388,6 +428,172 @@ DaytonaIniSettings LoadDaytonaIni(const std::filesystem::path& exe_dir,
     return settings;
 }
 
+// Settings-overlay "Save to config". The SDK's own SaveConfig rewrites the
+// whole file as flat `cvar = value` lines, which erased every [Section] of the
+// hand-edited ini, and the flat names are not the ones LoadDaytonaIni reads.
+// This writes each ini-backed setting back into its own [Section] key (comments
+// and everything else in the file kept), and any other changed cvar as a flat
+// line above the first section, which the SDK's LoadConfig reads at startup.
+struct IniBinding {
+    const char* section;   // lower case, as ReadIni keys it
+    const char* key;
+    const char* cvar;
+    const char* cvar2;     // the height of the two WxH settings
+};
+constexpr IniBinding kIniBindings[] = {
+    {"display", "resolution", "window_width", "window_height"},
+    {"display", "game_resolution", "video_mode_width", "video_mode_height"},
+    {"display", "fullscreen", "fullscreen", nullptr},
+    {"display", "vsync", "vsync", nullptr},
+    {"display", "letterbox", "present_letterbox", nullptr},
+    {"display", "safe_area_x", "present_safe_area_x", nullptr},
+    {"display", "safe_area_y", "present_safe_area_y", nullptr},
+    {"graphics", "internal_resolution_scale", "resolution_scale", nullptr},
+    {"graphics", "anisotropic_filtering", "anisotropic_override", nullptr},
+    {"graphics", "upscaler", "present_effect", nullptr},
+    {"graphics", "cas_sharpness", "present_cas_additional_sharpness", nullptr},
+    {"graphics", "fsr_quality", "present_fsr_quality_mode", nullptr},
+    {"graphics", "dither", "present_dither", nullptr},
+    {"diagnostics", "log_level", "log_level", nullptr},
+    {"diagnostics", "log_max_files", "log_max_files", nullptr},
+    {"diagnostics", "log_max_file_size_mb", "log_max_file_size_mb", nullptr},
+};
+
+// The ini text for a binding's current cvar value; nullopt when the cvar is not
+// registered in this run (a plugin's cvar) or has no usable value, in which
+// case that ini line is left exactly as it is.
+std::optional<std::string> IniValueFromCvars(const IniBinding& b) {
+    if (rex::cvar::GetFlagInfo(b.cvar) == nullptr) return std::nullopt;
+    const std::string value = rex::cvar::GetFlagByName(b.cvar);
+    if (b.cvar2 != nullptr) {
+        if (rex::cvar::GetFlagInfo(b.cvar2) == nullptr) return std::nullopt;
+        const std::string second = rex::cvar::GetFlagByName(b.cvar2);
+        if (value.empty() || value == "0" || second.empty() || second == "0") return std::nullopt;
+        return value + "x" + second;
+    }
+    if (std::string_view(b.key) == "anisotropic_filtering") {
+        static constexpr const char* kNames[] = {"off", "1", "2", "4", "8", "16"};
+        const auto level = ParseInt(value);
+        if (!level) return std::nullopt;
+        if (*level < 0) return std::string("app");
+        if (*level > 5) return std::nullopt;
+        return std::string(kNames[*level]);
+    }
+    if (value.empty()) return std::nullopt;
+    return value;
+}
+
+constexpr const char* kFlatMarker = "# Changed in the in-game settings overlay (read at startup)";
+
+void SaveDaytonaIni(const std::filesystem::path& path) {
+    std::vector<std::string> lines;
+    bool crlf = false;
+    {
+        std::ifstream in(path, std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                crlf = true;
+                line.pop_back();
+            }
+            lines.push_back(std::move(line));
+        }
+    }
+
+    // "section.key" -> text to write; erased as the file is walked, so what is
+    // left at the end is a setting the file did not have yet.
+    std::map<std::string, std::string> wanted;
+    std::set<std::string> bound_cvars;
+    for (const IniBinding& b : kIniBindings) {
+        bound_cvars.insert(b.cvar);
+        if (b.cvar2 != nullptr) bound_cvars.insert(b.cvar2);
+        if (auto value = IniValueFromCvars(b)) {
+            wanted[std::string(b.section) + "." + b.key] = std::move(*value);
+        }
+    }
+
+    std::vector<std::string> out;
+    std::string section;
+    size_t first_section = std::string::npos;
+    bool drop_blank = false;
+    for (const std::string& raw : lines) {
+        const std::string text = Trim(raw);
+        if (text == kFlatMarker) {   // the flat block of an earlier save, regenerated below
+            drop_blank = true;
+            continue;
+        }
+        if (drop_blank && text.empty()) {
+            drop_blank = false;
+            continue;
+        }
+        const bool in_flat_block = drop_blank;
+        drop_blank = false;
+        if (text.size() >= 2 && text.front() == '[' && text.back() == ']') {
+            section = Lower(Trim(std::string_view(text).substr(1, text.size() - 2)));
+            if (first_section == std::string::npos) first_section = out.size();
+            out.push_back(raw);
+            continue;
+        }
+        const size_t eq = raw.find('=');
+        const bool is_setting = !text.empty() && text.front() != '#' && text.front() != ';' &&
+                                eq != std::string::npos;
+        if (is_setting && section.empty()) {
+            drop_blank = in_flat_block;   // a blank line closing that block goes too
+            continue;   // a flat cvar line from an earlier save: regenerated below
+        }
+        if (is_setting) {
+            const std::string id = section + "." + Lower(Trim(raw.substr(0, eq)));
+            if (auto it = wanted.find(id); it != wanted.end()) {
+                const size_t comment = raw.find_first_of("#;", eq + 1);
+                std::string line = raw.substr(0, eq + 1) + " " + it->second;
+                if (comment != std::string::npos) line += "  " + raw.substr(comment);
+                out.push_back(std::move(line));
+                wanted.erase(it);
+                continue;
+            }
+        }
+        out.push_back(raw);
+    }
+
+    // Every other changed cvar goes above the first section.
+    std::vector<std::string> flat;
+    for (const std::string& name : rex::cvar::ListModifiedFlags()) {
+        if (bound_cvars.count(name) != 0) continue;
+        flat.push_back(name + " = " + rex::cvar::GetFlagByName(name));
+    }
+    if (!flat.empty()) {
+        flat.insert(flat.begin(), kFlatMarker);
+        flat.push_back("");
+    }
+    out.insert(out.begin() + (first_section == std::string::npos ? out.size() : first_section),
+               flat.begin(), flat.end());
+
+    // Settings the file lacked: added only if they are not at their default.
+    for (const auto& [id, value] : wanted) {
+        const size_t dot = id.find('.');
+        const std::string sec = id.substr(0, dot);
+        const std::string key = id.substr(dot + 1);
+        bool changed = false;
+        for (const IniBinding& b : kIniBindings) {
+            if (sec == b.section && key == b.key && rex::cvar::HasNonDefaultValue(b.cvar)) {
+                changed = true;
+            }
+        }
+        if (!changed) continue;
+        out.push_back("");
+        out.push_back("[" + sec + "]");
+        out.push_back(key + " = " + value);
+    }
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        REXLOG_ERROR("daytona.ini: could not write {}", path.string());
+        return;
+    }
+    for (const std::string& line : out) file << line << (crlf ? "\r\n" : "\n");
+    REXLOG_WARN("daytona.ini: settings saved to {}", path.string());
+}
+
 class DaytonaDebugDialog : public rex::ui::ImGuiDialog {
 public:
     explicit DaytonaDebugDialog(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
@@ -429,6 +635,51 @@ private:
     uint32_t prev_vd_swap_count_ = 0;
     float vd_swap_rate_ = 0.0f;
     float rate_accumulator_ = 0.0f;
+};
+
+// The settings overlay plus a "Quit game" button (GitHub issue #5: fullscreen
+// had no obvious way out but Alt+F4). A small second window pinned to the top
+// right, with a confirm step, because the overlay is opened mid-race too. A
+// subclass, so the SDK's dialog is untouched.
+class DaytonaSettingsDialog : public rex::ui::SettingsDialog {
+public:
+    DaytonaSettingsDialog(rex::ui::ImGuiDrawer* drawer, std::filesystem::path config_path,
+                          std::function<void()> quit)
+        : SettingsDialog(drawer, std::move(config_path)), quit_(std::move(quit)) {}
+
+protected:
+    void OnDraw(ImGuiIO& io) override {
+        SettingsDialog::OnDraw(io);
+
+        const float scale = float(rex::cvar::Query<double>("overlay_scale"));
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - 8.0f * scale,
+                                       viewport->WorkPos.y + 8.0f * scale),
+                                ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.85f);
+        if (!ImGui::Begin("Quit##daytona", nullptr,
+                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
+                              ImGuiWindowFlags_AlwaysAutoResize |
+                              ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::End();
+            return;
+        }
+        ImGui::SetWindowFontScale(scale);
+        if (!confirm_) {
+            if (ImGui::Button("Quit game")) confirm_ = true;
+            ImGui::TextDisabled("Pad: hold Start+Back for 3 s");
+        } else {
+            ImGui::TextUnformatted("Quit Daytona USA?");
+            if (ImGui::Button("Quit")) quit_();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) confirm_ = false;
+        }
+        ImGui::End();
+    }
+
+private:
+    std::function<void()> quit_;
+    bool confirm_ = false;
 };
 
 }  // namespace
@@ -512,6 +763,13 @@ protected:
                             "expected to hang before the first draw");
             } else {
                 config.gpu_plugin = "plume";
+            }
+        }
+
+        if (config.gpu_plugin == "plume") {
+            for (const GpuPluginIniSetting& setting : g_ini_gpu_plugin_only) {
+                REXLOG_WARN("daytona.ini: {} has no effect on the native renderer (it belongs "
+                            "to the Xenos GPU plugin, --gpu_plugin=xenos only)", setting.text);
             }
         }
 
@@ -645,6 +903,21 @@ protected:
         }
     }
 
+    bool OnSaveSettings() override {
+        SaveDaytonaIni(overlay_config_path_);
+        return true;
+    }
+
+    // Quit the way the title-bar close button does (OnClosing). Callable from
+    // any thread: the overlay button runs on the render thread, the pad hold
+    // and DT_QUIT_AFTER on SDL's timer thread.
+    void RequestQuit(const char* source) {
+        REXLOG_WARN("Quit requested ({})", source);
+        app_context().CallInUIThread([this] {
+            if (rex::ui::Window* w = window()) w->RequestClose();
+        });
+    }
+
     void OnPostSetup() override {
         daytona_debug::SetStage(daytona_debug::AppStage::kPostSetup);
         // Keyboard input is handled by the SDK's built-in MnK driver: WASD = left
@@ -667,6 +940,22 @@ protected:
         // swapchain is built from whatever handle the renderer has by then.
         if (rex::ui::Window* w = window()) {
             dt_plume::SetHostWindow(w->GetNativeWindowHandle());
+        }
+
+        // The GPU plugin is loaded by now, so its cvars exist if it has them.
+        // Under plume OnPreSetup has already said these keys do nothing.
+        for (const GpuPluginIniSetting& setting : g_ini_gpu_plugin_only) {
+            if (rex::cvar::GetFlagInfo(setting.cvar) != nullptr) {
+                REXLOG_WARN("daytona.ini: {} applied ({} = {})", setting.text, setting.cvar,
+                            rex::cvar::GetFlagByName(setting.cvar));
+            }
+        }
+
+        // DT_SAVE_INI=1: do what the overlay "Save to config" button does, once,
+        // at boot. Lets an unattended run prove the save round trip against the
+        // real cvars without a click (see DT_OVERLAY_OPEN below).
+        if (const char* save = std::getenv("DT_SAVE_INI"); save && save[0] == '1') {
+            SaveDaytonaIni(overlay_config_path_);
         }
 
         // The overlay. The SDK stands up its ImGui stack in exactly two modes:
@@ -713,8 +1002,11 @@ protected:
                 if (overlay_settings_) {
                     overlay_settings_.reset();
                 } else {
-                    overlay_settings_ = std::make_unique<rex::ui::SettingsDialog>(
-                        overlay_imgui_.get(), overlay_config_path_);
+                    overlay_settings_ = std::make_unique<DaytonaSettingsDialog>(
+                        overlay_imgui_.get(), overlay_config_path_,
+                        [this] { RequestQuit("overlay button"); });
+                    overlay_settings_->SetSaveHandler(
+                        [path = overlay_config_path_] { SaveDaytonaIni(path); });
                 }
             });
             rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay",
@@ -734,11 +1026,27 @@ protected:
         // down the normal event path, so the SDK's own keybind does the rest.
         // An event watch, not a hook: watches see events without eating them,
         // so the guest still gets Start and Select as normal buttons.
+        //
+        // Holding the chord for kQuitHoldMs quits (GitHub issue #5): the
+        // overlay has no gamepad navigation, so a pad cannot press its "Quit
+        // game" button. A one-shot SDL timer measures the hold, because no
+        // event arrives while two buttons are simply held; releasing either
+        // button (or losing the pad) cancels it.
         SDL_AddEventWatch(
-            [](void*, SDL_Event* e) -> bool {
+            [](void* userdata, SDL_Event* e) -> bool {
+                static constexpr Uint32 kQuitHoldMs = 3000;
                 static bool start_down = false;
                 static bool back_down = false;
                 static bool fired = false;
+                static SDL_TimerID quit_timer = 0;
+                if (e->type == SDL_EVENT_GAMEPAD_REMOVED) {
+                    start_down = back_down = fired = false;
+                    if (quit_timer != 0) {
+                        SDL_RemoveTimer(quit_timer);
+                        quit_timer = 0;
+                    }
+                    return true;
+                }
                 if (e->type != SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
                     e->type != SDL_EVENT_GAMEPAD_BUTTON_UP) {
                     return true;
@@ -761,13 +1069,39 @@ protected:
                         key.type = SDL_EVENT_KEY_UP;
                         key.key.down = false;
                         SDL_PushEvent(&key);
+                        quit_timer = SDL_AddTimer(
+                            kQuitHoldMs,
+                            [](void* app, SDL_TimerID, Uint32) -> Uint32 {
+                                static_cast<DaytonaApp*>(app)->RequestQuit("Start+Back held");
+                                return 0;   // one shot
+                            },
+                            userdata);
                     }
                 } else {
                     fired = false;
+                    if (quit_timer != 0) {
+                        SDL_RemoveTimer(quit_timer);
+                        quit_timer = 0;
+                    }
                 }
                 return true;
             },
-            nullptr);
+            this);
+
+        // DT_QUIT_AFTER=<seconds>: quit through RequestQuit after that long.
+        // An unattended run ends by the real quit path instead of being killed,
+        // which is also how that path is checked without a click or a pad.
+        if (const char* after = std::getenv("DT_QUIT_AFTER")) {
+            if (const int seconds = std::atoi(after); seconds > 0) {
+                SDL_AddTimer(
+                    static_cast<Uint32>(seconds) * 1000u,
+                    [](void* app, SDL_TimerID, Uint32) -> Uint32 {
+                        static_cast<DaytonaApp*>(app)->RequestQuit("DT_QUIT_AFTER");
+                        return 0;
+                    },
+                    this);
+            }
+        }
     }
 
     std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
