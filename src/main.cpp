@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -51,6 +52,14 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+
+// One folder for everything the game writes, for launchers that keep a game's
+// data with it (RecompLauncher passes its {data} folder). Empty, the default,
+// changes nothing: daytona.ini, logs/ and cache/ stay beside the executable,
+// saves in the platform folder, the game in assets/.
+REXCVAR_DEFINE_STRING(data_root, "", "Daytona",
+                      "Keep settings, saves, cache and logs here, and play the game from its "
+                      "game/ folder");
 
 namespace {
 
@@ -306,6 +315,26 @@ struct DaytonaIniSettings {
 // Set while parsing the ini, reported once logging exists. 0 = nothing to say.
 double g_ini_refresh_rate_ignored = 0.0;
 
+// Set when --data_root chose the log file (see OnConfigurePaths), so the
+// overlay's "Save to config" does not pin this run's file name in the ini.
+bool g_log_file_from_data_root = false;
+
+// The next logs/daytona_NNN.log in a folder, named as the SDK names the ones
+// it writes beside the executable.
+std::filesystem::path NextLogPath(const std::filesystem::path& logs_dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(logs_dir, ec);
+    int last = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(logs_dir, ec)) {
+        const std::string stem = entry.path().stem().string();
+        if (!entry.is_regular_file(ec) || !stem.starts_with("daytona_")) continue;
+        if (auto number = ParseInt(std::string_view(stem).substr(8))) last = std::max(last, *number);
+    }
+    char name[32];
+    std::snprintf(name, sizeof(name), "daytona_%03d.log", last + 1);
+    return logs_dir / name;
+}
+
 DaytonaIniSettings LoadDaytonaIni(const std::filesystem::path& exe_dir,
                                   rex::PathConfig& paths) {
     const std::filesystem::path ini_path = exe_dir / "daytona.ini";
@@ -559,6 +588,8 @@ void SaveDaytonaIni(const std::filesystem::path& path) {
     std::vector<std::string> flat;
     for (const std::string& name : rex::cvar::ListModifiedFlags()) {
         if (bound_cvars.count(name) != 0) continue;
+        // Where this run keeps its files comes from the command line every time.
+        if (name == "data_root" || (name == "log_file" && g_log_file_from_data_root)) continue;
         flat.push_back(name + " = " + rex::cvar::GetFlagByName(name));
     }
     if (!flat.empty()) {
@@ -705,22 +736,46 @@ public:
 protected:
     void OnConfigurePaths(rex::PathConfig& paths) override {
         const std::filesystem::path exe_dir = rex::filesystem::GetExecutableFolder();
+        // --data_root moves everything below from beside the executable into
+        // that folder: daytona.ini, cache/, logs/, the saves (saves/) and the
+        // game (game/). Explicit --game_data_root, --user_data_root and
+        // --log_file still win. Without it, nothing here changes.
+        const std::filesystem::path data_root = rex::to_path(REXCVAR_GET(data_root));
+        const std::filesystem::path base_dir = data_root.empty() ? exe_dir : data_root;
+        if (!data_root.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(data_root, ec);
+            paths.config_path = data_root / "daytona.ini";
+            if (rex::cvar::GetFlagByName("user_data_root").empty()) {
+                paths.user_data_root = data_root / "saves";
+            }
+            if (rex::cvar::GetFlagByName("log_file").empty()) {
+                // The SDK opens log_file by its narrow name, as it does the
+                // ones it names itself; a folder the code page cannot spell
+                // keeps the logs beside the executable instead.
+                try {
+                    SetCvar("log_file", NextLogPath(data_root / "logs").string());
+                    g_log_file_from_data_root = true;
+                } catch (const std::exception&) {
+                }
+            }
+        }
         // Leave config_path at the SDK default (<exe_dir>/daytona.ini) so the
         // "Save to config" overlay and any auto-loaded cvars use .ini, matching
         // the sibling recomps (futari/gh/guwange/sdoj/sotn) -- no .toml.
         // Remembered for the settings dialog, which is app-owned here (see the
         // overlay block): its "Save to config" writes the same file.
-        overlay_config_path_ = paths.config_path.empty() ? exe_dir / "daytona.ini"
+        overlay_config_path_ = paths.config_path.empty() ? base_dir / "daytona.ini"
                                                          : paths.config_path;
-        paths.cache_root = exe_dir / "cache";
-        ini_settings_ = LoadDaytonaIni(exe_dir, paths);
+        paths.cache_root = base_dir / "cache";
+        ini_settings_ = LoadDaytonaIni(base_dir, paths);
         // Default the game data root to an "assets" folder next to the
         // executable when no --game_data_root was provided, so the game runs on
         // a plain double-click (no launcher .bat needed), matching the sibling
         // recomps (futari/gh/guwange/sotn). An explicit --game_data_root (cvar
         // non-empty) still takes precedence.
         if (paths.game_data_root.empty()) {
-            paths.game_data_root = exe_dir / "assets";
+            paths.game_data_root = data_root.empty() ? exe_dir / "assets" : data_root / "game";
         }
     }
 
