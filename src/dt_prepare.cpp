@@ -411,6 +411,7 @@ size_t UnpackInto(const fs::path& package, const fs::path& out) {
 int Unpack(const fs::path& package, const fs::path& data_root) {
     const fs::path game = data_root / "game";
     const fs::path partial = data_root / "game.partial";
+    const fs::path old = data_root / "game.old";
 
     std::error_code ec;
     fs::create_directories(data_root, ec);
@@ -421,7 +422,12 @@ int Unpack(const fs::path& package, const fs::path& data_root) {
                                   : "Could not write to " + Utf8(data_root) + ".");
     }
     // What a run that was cut short left behind. Only a run holding the lock
-    // gets here, so no other one is still writing it.
+    // gets here, so no other one is still writing it. A run stopped while it
+    // swapped the finished game.partial in for game/ is finished here.
+    fs::remove_all(old);
+    if (!fs::exists(game) && ReadMarker(partial)) {
+        fs::rename(partial, game);
+    }
     fs::remove_all(partial);
 
     Progress(0.0, "Checking your package");
@@ -454,8 +460,11 @@ int Unpack(const fs::path& package, const fs::path& data_root) {
         fs::remove_all(partial, ignored);   // a failed unpack leaves nothing behind
         throw;
     }
-    fs::remove_all(game);
+    // Two renames, so game/ is always either the old unpack or the new one in
+    // full, never half deleted with its marker still there.
+    if (fs::exists(game)) fs::rename(game, old);
     fs::rename(partial, game);
+    fs::remove_all(old);
     std::printf("Extracted %zu files to %s\n", extracted, Utf8(game).c_str());
     Progress(1.0, "Ready to play");
     return 0;
