@@ -6,6 +6,29 @@ private download share). The `v1.1.x` line is the native-renderer port; `v1.0.x`
 was the stock SDK-renderer port it grew out of. See [PORTS.md](PORTS.md) for the
 per-platform build and packaging notes.
 
+## v1.1.9 — 2026-11-27
+
+Bundles for all three platforms. It carries everything in v1.1.8, which was
+published for Windows only, plus two fixes found while building v1.1.8 for
+macOS and the Steam Deck.
+
+- **No more crash a few seconds into boot.** A new game thread and the thread
+  that created it could both set its name at the same moment, and one freed a
+  string the other had already freed. On macOS the v1.1.8 build died that way
+  in 4 of 33 starts (the published v1.1.7 build: 0 of 25); with the fix, 60 of
+  60 start. The same code runs on Windows and Linux, where it has not been
+  seen to crash. SDK fork commit d60ae68.
+- **Linux no longer leaves guest memory behind.** Every run left a file under
+  `/dev/shm` that stayed until a reboot; after about twenty runs a Steam Deck's
+  shared memory was full and the next start died. The game now removes the
+  name as soon as it has created the memory. v1.1.7 and earlier have this. If
+  you ran those a lot without rebooting, `rm /dev/shm/xenia_memory_*` (with the
+  game closed) frees the space. The same change is in the macOS build. SDK
+  fork commit 86d04f7.
+- The Steam Deck bundle is now built on Ubuntu 26.04 and needs glibc 2.43 or
+  newer, which current SteamOS has. On an older SteamOS it will not start; use
+  v1.1.7 there.
+
 ## v1.1.8 — 2026-11-27
 
 - **"Save to config" no longer wipes daytona.ini** (issue #4). The settings
@@ -28,8 +51,8 @@ per-platform build and packaging notes.
   start; the quit path was run on a timer (`DT_QUIT_AFTER=<seconds>`). Nobody
   has clicked the two buttons or held the pad chord yet. SDK fork commit
   0a99596.
-- Windows bundle only for now. The Steam Deck and macOS bundles of v1.1.7
-  remain the latest for those platforms.
+- Windows bundle only. The Steam Deck and macOS bundles of this code are in
+  v1.1.9.
 
 ## v1.1.7 — 2026-11-20
 

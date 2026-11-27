@@ -41,7 +41,10 @@ cmake_minimum_required(VERSION 3.25)
 # 1.1.8: the overlay's "Save to config" keeps daytona.ini's sections and
 # comments instead of flattening the file; ini keys the native renderer
 # ignores say so; "Quit game" in the overlay and a Start+Select hold on a pad.
-project(daytona VERSION 1.1.8 LANGUAGES C CXX)
+# 1.1.9: two SDK fixes found while building 1.1.8 for macOS and the Deck: a
+# crash a few seconds into boot (two threads naming a new thread at once) and
+# guest memory left behind in /dev/shm by every run on Linux.
+project(daytona VERSION 1.1.9 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
