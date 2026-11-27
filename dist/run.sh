@@ -11,4 +11,8 @@ cd "$(dirname "$0")"
 } > "${RECOMPLAUNCHER_DATA:-.}/deck-report.txt" 2>&1
 export LD_LIBRARY_PATH=.
 export SDL_VIDEODRIVER=x11
+# The setup step (--prepare) opens no window, so it must not need a display.
+for arg in "$@"; do
+  case "$arg" in --prepare | --prepare=true) export SDL_VIDEODRIVER=offscreen ;; esac
+done
 exec ./daytona "$@"
