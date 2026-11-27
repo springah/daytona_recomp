@@ -75,6 +75,13 @@ unpacks everything into `assets/` beside the executable, which is the layout a
 release bundle runs from (the same script, flattened next to `daytona.exe`,
 defaults to that layout).
 
+The game can also unpack the package itself, with no Python:
+`daytona --prepare --game=<package> --data_root=<folder>` unpacks it into
+`<folder>/game` (the same files the script writes) and prints `progress` lines
+without opening a window; `daytona --data_root=<folder>` then plays from there.
+This is RecompLauncher's setup step. Run again, it sees the game is already
+unpacked and stops, even without `--game`.
+
 The package this tree was prepared against: title/media `XA-2845`, media ID
 `3CA562D4`, 240058368 bytes, sha256
 `db2381451a15a4e537154712213a0309e9ddc33d20bdc03421d80c9939893cef`.

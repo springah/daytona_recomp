@@ -96,6 +96,8 @@ include(generated/rexglue.cmake)
 # by rexglue_setup_target below).
 set(DAYTONA_SOURCES
     src/main.cpp
+    # --prepare: unpacks the player's XBLA package (extract_game.py's reader).
+    src/dt_prepare.cpp
     src/stubs.cpp
     src/daytona_debug.cpp
     # spike/d3d9-hook-trace phase 0: pass-through D3D9 call tracer (generated).

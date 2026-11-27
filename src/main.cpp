@@ -6,6 +6,7 @@
 #include "dt_d3d9_trace.h"
 #include "dt_null_audio.h"
 #include "dt_plume.h"
+#include "dt_prepare.h"
 #include "dt_shader_dump.h"
 
 #include <rex/cvar.h>
@@ -13,6 +14,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/logging/api.h>
 #include <rex/platform.h>
+#include <rex/platform/env.h>
 #include <rex/rex_app.h>
 #include <rex/input/input_system.h>
 #include <rex/system/xthread.h>
@@ -60,6 +62,13 @@
 REXCVAR_DEFINE_STRING(data_root, "", "Daytona",
                       "Keep settings, saves, cache and logs here, and play the game from its "
                       "game/ folder");
+
+// The setup step: `daytona --prepare --game=<package> --data_root=<folder>`
+// unpacks the player's XBLA package into <folder>/game and exits, with no
+// window. See dt_prepare.h.
+REXCVAR_DEFINE_BOOL(prepare, false, "Daytona",
+                    "Unpack --game into --data_root's game/ folder without a window, then exit");
+REXCVAR_DEFINE_STRING(game, "", "Daytona", "Your Daytona USA XBLA package, for --prepare");
 
 namespace {
 
@@ -720,6 +729,20 @@ public:
     using rex::ReXApp::ReXApp;
 
     static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
+        // --prepare runs here, before any window or runtime exists, and never
+        // returns. RecompLauncher passes --data_root; RECOMPLAUNCHER_DATA is
+        // the same folder.
+        if (REXCVAR_GET(prepare)) {
+            std::filesystem::path data_root = rex::to_path(REXCVAR_GET(data_root));
+            if (data_root.empty()) {
+                data_root = rex::to_path(rex::platform::env::get("RECOMPLAUNCHER_DATA").value_or(""));
+            }
+            const int code = dt_prepare::Run(rex::to_path(REXCVAR_GET(game)), data_root);
+            if (code == 0) WriteDefaultIni(data_root / "daytona.ini");
+            std::fflush(stdout);
+            std::fflush(stderr);
+            std::_Exit(code);
+        }
         return std::unique_ptr<DaytonaApp>(new DaytonaApp(ctx, "daytona", PPCImageConfig));
     }
 
