@@ -175,6 +175,11 @@ LD_LIBRARY_PATH="$PWD/thirdparty/rexglue-sdk/out/linux-amd64/Release" \
 If neither an `assets/` folder beside the exe nor `--game_data_root` is present,
 startup exits with `[ERROR] --game_data_root was not provided.`
 
+`--data_root=<folder>` keeps everything in one folder instead, for launchers
+that keep a game's files with it (RecompLauncher passes its own): `daytona.ini`,
+`cache/`, `logs/` and the saves (`saves/`) go there, and the game is read from
+`<folder>/game`. Without it, nothing moves.
+
 During a healthy run the log prints repeated
 `NtQueryInformationFile(XFileXctdCompressionInformation) unimplemented` messages
 (the game streams XCTD-compressed assets; the query is a non-fatal stub).
