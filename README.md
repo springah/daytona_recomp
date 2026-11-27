@@ -1,5 +1,7 @@
 # Daytona USA ReXGlue Recompilation
 
+<a href="https://recomplauncher.com/game/daytona-recomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 > ⚠️ **Disclaimer — built with heavy use of AI.** The recompilation, port code,
 > tooling, and documentation in this repo were developed largely with the assistance
 > of AI coding tools (large language models). It's a hobby project: verify things
