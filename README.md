@@ -5,6 +5,15 @@
 > of AI coding tools (large language models). It's a hobby project: verify things
 > yourself before relying on them, and expect rough edges. No warranty.
 
+> 📣 **Looking for a new maintainer.** This port is a hobby, and I would like
+> to hand it on to someone who wants to carry it: Windows, Steam Deck / Linux
+> and macOS, or any one of them. The port is in working order (v1.1.9 on all
+> three), and the build and release steps are written down in
+> [PORTS.md](PORTS.md). If you would like to take it over, as a maintainer here
+> or in a fork of your own, please reply on
+> [#11](https://github.com/springah/daytona_recomp/issues/11). Pull requests
+> stay welcome in the meantime.
+
 A static recompilation of **Daytona USA** (Xbox 360 / XBLA, 2011) for native PC
 execution, built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)
 (a Xenia-derived runtime + PPC→C++ recompiler).
