@@ -1,5 +1,7 @@
 # Daytona USA ReXGlue Recompilation
 
+<a href="https://recomplauncher.com/game/daytona-recomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 > ⚠️ **Disclaimer — built with heavy use of AI.** The recompilation, port code,
 > tooling, and documentation in this repo were developed largely with the assistance
 > of AI coding tools (large language models). It's a hobby project: verify things
@@ -81,6 +83,13 @@ dragging the package onto `extract_game.bat` does the same, except that it
 unpacks everything into `assets/` beside the executable, which is the layout a
 release bundle runs from (the same script, flattened next to `daytona.exe`,
 defaults to that layout).
+
+The game can also unpack the package itself, with no Python:
+`daytona --prepare --game=<package> --data_root=<folder>` unpacks it into
+`<folder>/game` (the same files the script writes) and prints `progress` lines
+without opening a window; `daytona --data_root=<folder>` then plays from there.
+This is RecompLauncher's setup step. Run again, it sees the game is already
+unpacked and stops, even without `--game`.
 
 The package this tree was prepared against: title/media `XA-2845`, media ID
 `3CA562D4`, 240058368 bytes, sha256
@@ -183,6 +192,11 @@ LD_LIBRARY_PATH="$PWD/thirdparty/rexglue-sdk/out/linux-amd64/Release" \
 
 If neither an `assets/` folder beside the exe nor `--game_data_root` is present,
 startup exits with `[ERROR] --game_data_root was not provided.`
+
+`--data_root=<folder>` keeps everything in one folder instead, for launchers
+that keep a game's files with it (RecompLauncher passes its own): `daytona.ini`,
+`cache/`, `logs/` and the saves (`saves/`) go there, and the game is read from
+`<folder>/game`. Without it, nothing moves.
 
 During a healthy run the log prints repeated
 `NtQueryInformationFile(XFileXctdCompressionInformation) unimplemented` messages

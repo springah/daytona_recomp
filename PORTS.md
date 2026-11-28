@@ -90,7 +90,12 @@ sibling futari port):
    from the repo root, `extract_game.py` flattened beside the executable (plus
    `extract_game.bat` on Windows), `RUN.txt` copied from
    [`dist/RUN.release.txt`](dist/RUN.release.txt), an empty `assets/` holding a
-   `PUT_GAME_FILES_HERE.txt`, and [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt).
+   `PUT_GAME_FILES_HERE.txt`, [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt),
+   and [`recomplauncher.json`](recomplauncher.json) from the repo root at the
+   top of the bundle folder: beside `daytona.exe` on Windows, beside `daytona`
+   and `run.sh` on Linux, and beside `Daytona.app` on macOS (never inside the
+   app). RecompLauncher reads it from there to set the game up; a copy that is
+   only in the repo does nothing for players.
    Linux adds [`dist/run.sh`](dist/run.sh) and `libTracyClient.so` (the runtime
    links it). Everything on that list is in this repo or produced by the build,
    so the rule can be executed from a clean clone. The executable carries its

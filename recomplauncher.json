@@ -1,0 +1,84 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Daytona USA",
+  "repo": "springah/daytona_recomp",
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your Daytona USA Xbox Live Arcade package (title ID 58410B1D), copied off your own Xbox 360: a file with no extension and a long hexadecimal name.",
+      "formats": [{ "type": "file" }],
+      "check": { "ids": ["58410B1D"] }
+    }
+  ],
+  "start": {
+    "program": ["daytona.exe", "run.sh", "Daytona.app"],
+    "args": ["--data_root={data}"]
+  },
+  "prepare": {
+    "program": ["daytona.exe", "run.sh", "Daytona.app"],
+    "args": ["--prepare", "--game={input:game}", "--data_root={data}"],
+    "label": "Unpacking your Daytona USA package",
+    "done": ["{data}/game/default.xex", "{data}/game/daytona-prepared.txt"],
+    "keeps_copy": true
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [{ "path": "{data}/daytona.ini" }]
+    }
+  ],
+  "saves": ["{data}/saves"],
+  "folders": {
+    "game": [{ "path": "{data}/game" }],
+    "saves": [{ "path": "{data}/saves" }],
+    "logs": [{ "path": "{data}/logs" }]
+  },
+  "settings": [
+    {
+      "id": "window",
+      "label": "Window",
+      "help": "Fullscreen fills your screen. F11 switches while you play.",
+      "choices": [
+        { "label": "Windowed", "set": { "Display/fullscreen": "false" } },
+        { "label": "Fullscreen", "set": { "Display/fullscreen": "true" } }
+      ],
+      "defaults": { "Display/fullscreen": "false" }
+    },
+    {
+      "id": "window_size",
+      "label": "Window size",
+      "help": "The size of the window when it isn't fullscreen. The game is drawn at 720p, as on the console, and scaled to fit.",
+      "choices": [
+        { "label": "1280 x 720", "set": { "Display/resolution": "1280x720" } },
+        { "label": "1600 x 900", "set": { "Display/resolution": "1600x900" } },
+        { "label": "1920 x 1080", "set": { "Display/resolution": "1920x1080" } },
+        { "label": "2560 x 1440", "set": { "Display/resolution": "2560x1440" } }
+      ],
+      "defaults": { "Display/resolution": "1920x1080", "Display/fullscreen": "false" },
+      "when": { "Display/fullscreen": "false" }
+    },
+    {
+      "id": "log_level",
+      "label": "Log detail",
+      "help": "How much goes in the log. More detail helps a bug report, but makes the log bigger.",
+      "group": "Advanced",
+      "choices": [
+        { "label": "Warnings", "set": { "Diagnostics/log_level": "warn" } },
+        { "label": "Everything", "set": { "Diagnostics/log_level": "info" } }
+      ],
+      "defaults": { "Diagnostics/log_level": "warn" }
+    }
+  ],
+  "groups": [{ "id": "Advanced", "advanced": true }],
+  "actions": [
+    { "id": "saves", "label": "Saves", "help": "Your records and settings saved by the game.", "open": "saves" },
+    { "id": "logs", "label": "Logs", "help": "A log of every run. Send the newest with a bug report.", "open": "logs" }
+  ],
+  "system": {
+    "windows": { "version": "10" },
+    "linux": { "glibc": "2.43" },
+    "macos": { "version": "13" }
+  }
+}
